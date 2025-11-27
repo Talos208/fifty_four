@@ -1,0 +1,52 @@
+= fifty_four - LSP サーバ
+:toc:
+:icons: font
+
+tower-lspクレートを使用して実装されたLanguage Server Protocol (LSP)サーバです。
+
+== プロジェクト概要
+
+このプロジェクトは、Rustのtower-lspフレームワークを使用した基本的なLSPサーバの実装です。現在は初期化とシャットダウンのみの機能を持つ最小限の実装となっています。
+
+== 必要な環境
+
+* Rust 1.70以上
+* Cargo
+
+== 依存関係
+
+* `tokio`: 非同期ランタイム
+* `tower-lsp`: LSPサーバフレームワーク
+* `serde`, `serde_json`: JSONシリアライゼーション
+
+== ビルド方法
+
+[source,bash]
+----
+cargo build
+----
+
+== 実行方法
+
+[source,bash]
+----
+cargo run
+----
+
+サーバは標準入出力を使用してLSPクライアントと通信します。
+
+== 実装状況
+
+=== 実装済み機能
+
+* サーバ初期化対応（`initialize`）
+* 初期化完了通知受信（`initialized`）
+* シャットダウン対応（`shutdown`）
+
+=== 今後の拡張予定
+
+* テキスト編集ドキュメント対応
+* ホバー情報の実装
+* コード補完機能
+* ジャンプ機能
+* その他LSP機能の実装
