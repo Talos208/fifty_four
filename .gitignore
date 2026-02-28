@@ -1,7 +1,9 @@
 # Rust
-/target
+target/
 Cargo.lock
+.cargo/
 **/*.rs.bk
+extension\target
 
 # IDE
 .idea/
@@ -15,3 +17,5 @@ Cargo.lock
 Thumbs.db
 .env
 .env.local
+
+**/extension.wasm

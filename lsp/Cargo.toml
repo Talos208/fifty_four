@@ -1,0 +1,27 @@
+[package]
+name = "fifty_four_lsp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.49.0", features = ["full"] }
+tower-lsp = "0.20"
+lindera = { version = "2.2.0", features = ["embed-ipadic"] }
+log = "0.4.29"
+env_logger = "0.11.9"
+dashmap = "6.1"
+dotenv = "0.15.0"
+
+genai = "0.5.3"
+indoc = "2.0.7"
+
+
+opentelemetry = "0.31.0"
+opentelemetry_sdk = { version = "0.31.0", features = ["trace", "metrics", "logs"] }
+opentelemetry-stdout = { version = "0.31.0", features = ["trace", "metrics", "logs"] }
+opentelemetry-otlp = { version = "0.31.0", features = ["trace", "metrics", "logs", "grpc-tonic"] }
+opentelemetry-appender-tracing = { version = "0.31.1" }
+opentelemetry-appender-log = { version = "0.31" }
+tracing = { version = "0.1.44", features = ["std"] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "registry", "std", "fmt"] }
+logging-subscriber = { version = "0.2.0" }

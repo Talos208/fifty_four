@@ -1,0 +1,10 @@
+name = "FiftyFour"
+# glammer = "plaintext"
+path_suffixes = ["txt", "md"]
+brackets = [
+    { start = "「", end = "」", close = true, newline = true },
+    { start = "『", end = "』", close = true, newline = false },
+    { start = "《", end = "》", close = true, newline = false },
+    { start = "｜《", end = "》", close = true, newline = false },
+    { start = "（", end = "）", close = true, newline = false },
+]

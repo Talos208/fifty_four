@@ -1,0 +1,10 @@
+id = "fifty-four"
+name = "Fifty Four"
+description = "A language server for Fifty Four"
+version = "0.0.1"
+schema_version = 1
+authors = ["Talos208 <talos208@gmail.com>"]
+
+[language_servers.fifty-four]
+name = "Fifty Four LSP"
+languages = ["FiftyFour"]
