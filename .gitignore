@@ -19,3 +19,5 @@ Thumbs.db
 .env.local
 
 **/extension.wasm
+data/*.db
+data/*.db.wal

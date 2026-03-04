@@ -11,11 +11,15 @@ use crate::logging::Logger;
 use dashmap::DashMap;
 mod llm;
 use crate::llm::{GenericLlmClient, LlmClient};
-use indoc::indoc;
+use rusqlite;
 use std::io::Read;
 use std::path::PathBuf;
-use tokio::io::ErrorKind;
-use tokio::sync::{Mutex, MutexGuard};
+mod migrations {
+    use refinery::embed_migrations;
+    embed_migrations!("migrations");
+}
+use indoc::{formatdoc, indoc};
+use std::ops::{Deref, DerefMut};
 
 /// `Backend` はサーバの状態を保持する構造体です。
 ///
@@ -26,8 +30,9 @@ struct Backend {
     client: Client,
     text: DashMap<String, Vec<String>>,
     // llm: Option<Mutex<Box<dyn LlmClient>>>,
-    llm: Option<Mutex<Box<GenericLlmClient>>>,
+    llm: Option<tokio::sync::Mutex<Box<GenericLlmClient>>>,
     data_path: PathBuf,
+    conn: std::sync::Mutex<rusqlite::Connection>,
 }
 
 /// `LanguageServer` トレイトの実装。
@@ -270,74 +275,106 @@ impl LanguageServer for Backend {
             }
         }
 
-        let text = self
-            .text
-            .get(params.text_document_position.text_document.uri.as_str())
-            .unwrap();
-
+        let uri = params.text_document_position.text_document.uri.as_str();
+        let text = self.text.get(uri).unwrap();
         let line_no = params.text_document_position.position.line as usize;
-        let before = if line_no > 0 {
-            text.iter()
-                .take(line_no)
-                .map(|s| s.as_str())
-                .collect::<Vec<&str>>()
-                .join("\n")
-        } else {
-            String::from("")
-        };
+        let offset = params.text_document_position.position.character as usize;
 
-        let line: &str = text[line_no].as_ref();
-        let offset = params.text_document_position.position.character;
-
-        let left = if offset > 0 {
-            line.char_indices()
-                .take(offset as usize)
-                .fold(String::from(""), |mut acc, (_i, c)| {
-                    acc.push(c);
-                    acc
-                })
-        } else {
-            String::from("")
-        };
+        let before = text
+            .iter()
+            .take(line_no)
+            .map(|s| s.as_str())
+            .collect::<Vec<&str>>()
+            .join("\n");
 
         self.client
             .log_message(MessageType::LOG, before.as_str())
             .await;
+
+        let line: &str = text[line_no].as_ref();
+        let left: String = line.chars().take(offset).collect();
 
         self.client
             .log_message(MessageType::LOG, left.as_str())
             .await;
 
         let mut prompt = String::from("");
-        let f = std::fs::File::open(self.data_path.join("prompt_completion.md"));
-        if let Ok(mut f) = f {
+        if let Ok(mut f) = std::fs::File::open(self.data_path.join("prompt_completion.md")) {
             f.read_to_string(&mut prompt).ok();
-            drop(f);
         }
 
         if offset > 0 || !before.is_empty() {
+            let mut completion_id = 0u32;
             let raw = self
-                .use_llm(async |mut l: MutexGuard<Box<GenericLlmClient>>| {
-                    l.add(prompt);
-                    l.add(before);
-                    l.add(left);
+                .use_llm(
+                    async |mut l: tokio::sync::MutexGuard<Box<GenericLlmClient>>| {
+                        l.add(prompt);
+                        l.add(before);
+                        l.add(left);
 
-                    l.chat().await
-                })
+                        {
+                            let db = self.conn.lock().unwrap();
+                            let prompt = l.build_content();
+                            match db.query_row(
+                                indoc!(
+                                    "INSERT INTO completions
+                                    (document_uri, cursor_line, cursor_character, model_name, prompt)
+                                    VALUES (?,?,?,?,?) RETURNING id;"
+                                ),
+                                rusqlite::params![
+                                    uri,
+                                    line_no.to_string().as_str(),
+                                    offset.to_string().as_str(),
+                                    l.get_model(),
+                                    prompt.as_str(),
+                                ],
+                                |row| row.get(0),
+                            ) {
+                                Ok(r) => {
+                                    completion_id = r;
+                                }
+                                Err(e) => eprintln!("Failed to insert completion: {}", e),
+                            };
+                        }
+
+                        l.chat().await
+                    },
+                )
                 .await;
 
             match raw {
                 Ok(response) => {
+                    let items = response.split("\n").collect::<Vec<_>>();
+
+                    for i in items.clone() {
+                        let db = self.conn.lock().unwrap();
+                        let result = db.execute(
+                            indoc!(
+                                "INSERT INTO completion_candidates
+                                (completion_id, rank, candidate)
+                                VALUES (?,?,?);"
+                            ),
+                            rusqlite::params![completion_id, 0, i],
+                        );
+                        match result {
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("Failed to insert completion_candidate: {}", e);
+                            }
+                        };
+                    }
+
+                    let items = items
+                        .iter()
+                        .map(|r| CompletionItem {
+                            label: r.to_string(),
+                            kind: Some(CompletionItemKind::TEXT),
+                            ..Default::default()
+                        })
+                        .collect();
                     let list = CompletionList {
                         is_incomplete: false,
-                        items: response
-                            .split("\n")
-                            .map(|r| CompletionItem {
-                                label: r.to_string(),
-                                kind: Some(CompletionItemKind::TEXT),
-                                ..Default::default()
-                            })
-                            .collect(),
+                        items,
                     };
 
                     Ok(Some(CompletionResponse::List(list)))
@@ -448,7 +485,7 @@ impl Backend {
     async fn use_llm<F>(&self, proc: F) -> core::result::Result<String, Box<dyn core::error::Error>>
     where
         F: AsyncFnOnce(
-            MutexGuard<Box<GenericLlmClient>>,
+            tokio::sync::MutexGuard<Box<GenericLlmClient>>,
         ) -> core::result::Result<String, Box<dyn core::error::Error>>,
     {
         if let Some(llm) = self.llm.as_ref() {
@@ -499,20 +536,38 @@ async fn main() {
         return;
     }
 
+    // DBマイグレーション
+    let conn = std::sync::Mutex::new(
+        rusqlite::Connection::open(path.join("data").join("fifty_four.db")).unwrap(),
+    );
+    {
+        let mut c = conn.lock().unwrap();
+        match migrations::migrations::runner().run(c.deref_mut()) {
+            Ok(_) => {}
+            Err(e) => {
+                panic!("Fail to migrate: {:?}", e);
+            }
+        }
+    }
+
     // LspService を構築し、`Backend` をクライアントハンドルで初期化する
     info!("initialize lsp service");
     let (service, socket) = tower_lsp::LspService::build(|client| Backend {
         client,
         text: DashMap::new(),
-        // llm: Arc::new(Mutex::new(GenericLlmClient::new(
-        //     llm::Provider::LMStudio,
-        //     "lfm2.5-1.2b-jp",
-        //     Some("http://localhost:1234/v1/"),
-        // ))),
-        llm: Some(Mutex::new(Box::new(GenericLlmClient::from_name(
-            "anthropic/claude-sonnet-4-6",
-        )))),
+        llm: Some(tokio::sync::Mutex::new(Box::new(
+            GenericLlmClient::from_name(
+                // "anthropic/claude-sonnet-4-6",
+                "google/gemini-3.1-flash-lite-preview",
+            ),
+            // GenericLlmClient::new(
+            //     llm::Provider::LMStudio,
+            //     "lfm2.5-1.2b-jp",
+            //     Some("http://localhost:1234/v1/"),
+            // ),
+        ))),
         data_path: path.join("data"),
+        conn: conn,
     })
     .finish();
 
@@ -522,12 +577,14 @@ async fn main() {
     tower_lsp::Server::new(stdin, stdout, socket)
         .serve(service)
         .await;
+
     drop(logger);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
     use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 
     fn change(range: Option<Range>, text: &str) -> TextDocumentContentChangeEvent {

@@ -135,12 +135,8 @@ impl LlmClient for GenericLlmClient {
     }
 
     async fn with_model(&mut self, model: &str) -> Result<String, Box<dyn Error>> {
-        // let mut plots = self.cache.all();
-        let mut plots = vec![];
-        plots.extend_from_slice(&self.prompts);
-
         // TODO AGENTS.mdをfrom_system()で投入
-        let chat_req = ChatRequest::from_user(plots.join("\n"));
+        let chat_req = ChatRequest::from_user(self.build_content());
         let chat_opt = Some(&ChatOptions::default());
         let response = self
             .inner_client
@@ -221,7 +217,7 @@ impl GenericLlmClient {
 
         let (auth, kind) = match _provider {
             Provider::Google => (
-                AuthData::FromEnv("GOOGLE_API_KEY".to_string()),
+                AuthData::FromEnv("GEMINI_API_KEY".to_string()),
                 AdapterKind::Gemini,
             ),
             Provider::OpenAI => (
@@ -258,5 +254,12 @@ impl GenericLlmClient {
         );
 
         genai::Client::builder().with_service_target_resolver(proc)
+    }
+
+    pub fn build_content(&self) -> String {
+        self.prompts.join("\n")
+    }
+    pub fn get_model(&self) -> &str {
+        &self.model
     }
 }
