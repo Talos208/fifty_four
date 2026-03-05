@@ -10,7 +10,7 @@ mod logging;
 use crate::logging::Logger;
 use dashmap::DashMap;
 mod llm;
-use crate::llm::{GenericLlmClient, LlmClient};
+use crate::llm::{Content, GenericLlmClient, LlmClient};
 use rusqlite;
 use std::io::Read;
 use std::path::PathBuf;
@@ -19,6 +19,7 @@ mod migrations {
     embed_migrations!("migrations");
 }
 use indoc::{formatdoc, indoc};
+use regex::Regex;
 use std::ops::{Deref, DerefMut};
 
 /// `Backend` はサーバの状態を保持する構造体です。
@@ -29,8 +30,7 @@ struct Backend {
     /// LSP クライアントへのハンドル。メッセージ送信などに使用する。
     client: Client,
     text: DashMap<String, Vec<String>>,
-    // llm: Option<Mutex<Box<dyn LlmClient>>>,
-    llm: Option<tokio::sync::Mutex<Box<GenericLlmClient>>>,
+    llm: Option<tokio::sync::Mutex<Box<dyn LlmClient>>>,
     data_path: PathBuf,
     conn: std::sync::Mutex<rusqlite::Connection>,
 }
@@ -147,10 +147,9 @@ impl LanguageServer for Backend {
             .await;
 
         // 行ごとに分割しておく
-        let texts = params
-            .text_document
-            .text
-            .split('\n')
+        let cr = Regex::new(r"\r\n|\r|\n").unwrap();
+        let texts = cr
+            .split(params.text_document.text.as_str())
             .map(|s| s.to_string())
             .collect();
         self.update_all(params.text_document.uri.as_str(), 0, texts);
@@ -168,13 +167,14 @@ impl LanguageServer for Backend {
             .iter()
             .all(|c| c.range.is_none() && c.range_length.is_none())
         {
+            let cr = Regex::new(r"\r\n|\r|\n").unwrap();
             self.update_all(
                 param.text_document.uri.as_str(),
                 0,
                 param
                     .content_changes
                     .iter()
-                    .flat_map(|c| c.text.split('\n').map(|c| c.to_string()))
+                    .flat_map(|c| cr.split(c.text.as_str()).map(|s| s.to_string()))
                     .collect(),
             );
             return;
@@ -229,7 +229,7 @@ impl LanguageServer for Backend {
         s.iter().for_each(|s| {
             let tokens = tokenize_conversation(s.as_str());
 
-            let mut data: Vec<SemanticToken> = tokens
+            let mut data: Vec<SemanticToken> = tokens // .windows(2).map(|v| (v.first(), v.last()))
                 .iter()
                 .map(|token| {
                     SemanticToken {
@@ -252,7 +252,7 @@ impl LanguageServer for Backend {
         Ok(Some(SemanticTokensResult::Tokens(tokens)))
     }
 
-    #[instrument(ret, err)]
+    // #[instrument(ret, err)]
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         self.client
             .log_message(MessageType::LOG, "completion")
@@ -307,10 +307,10 @@ impl LanguageServer for Backend {
             let mut completion_id = 0u32;
             let raw = self
                 .use_llm(
-                    async |mut l: tokio::sync::MutexGuard<Box<GenericLlmClient>>| {
-                        l.add(prompt);
-                        l.add(before);
-                        l.add(left);
+                    async |l| {
+                        l.add(Content::Text(prompt));
+                        l.add(Content::Text(before));
+                        l.add(Content::Text(left));
 
                         {
                             let db = self.conn.lock().unwrap();
@@ -344,28 +344,25 @@ impl LanguageServer for Backend {
 
             match raw {
                 Ok(response) => {
-                    let items = response.split("\n").collect::<Vec<_>>();
+                    let cr = Regex::new(r"\r\n|\r|\n").unwrap();
 
-                    for i in items.clone() {
-                        let db = self.conn.lock().unwrap();
-                        let result = db.execute(
-                            indoc!(
-                                "INSERT INTO completion_candidates
-                                (completion_id, rank, candidate)
-                                VALUES (?,?,?);"
-                            ),
-                            rusqlite::params![completion_id, 0, i],
-                        );
-                        match result {
-                            Ok(_) => {}
-                            Err(e) => {
-                                eprintln!("Failed to insert completion_candidate: {}", e);
-                            }
-                        };
-                    }
-
-                    let items = items
-                        .iter()
+                    let db = self.conn.lock().unwrap();
+                    let items = cr
+                        .split(response.as_str())
+                        .inspect(|i| {
+                            db.execute(
+                                indoc!(
+                                    "INSERT INTO completion_candidates
+                                    (completion_id, rank, candidate)
+                                    VALUES (?,?,?);"
+                                ),
+                                rusqlite::params![completion_id, 0, i],
+                            )
+                            .unwrap_or_else(|err| {
+                                eprintln!("Failed to insert completion_candidate: {}", err);
+                                0
+                            });
+                        })
                         .map(|r| CompletionItem {
                             label: r.to_string(),
                             kind: Some(CompletionItemKind::TEXT),
@@ -439,9 +436,13 @@ impl LanguageServer for Backend {
 
 fn apply_changes(lines: &mut Vec<String>, changes: &[TextDocumentContentChangeEvent]) {
     for change in changes {
+        let cr = Regex::new(r"\r\n|\r|\n").unwrap();
         match change.range {
             None => {
-                *lines = change.text.split('\n').map(|s| s.to_string()).collect();
+                *lines = cr
+                    .split(change.text.as_str())
+                    .map(|s| s.to_string())
+                    .collect();
             }
             Some(range) => {
                 let start_line = range.start.line as usize;
@@ -472,7 +473,8 @@ fn apply_changes(lines: &mut Vec<String>, changes: &[TextDocumentContentChangeEv
                 new_text.push_str(&change.text);
                 new_text.push_str(&suffix);
 
-                let new_lines: Vec<String> = new_text.split('\n').map(|s| s.to_string()).collect();
+                let new_lines: Vec<String> =
+                    cr.split(new_text.as_str()).map(|s| s.to_string()).collect();
 
                 let end = end_line.min(lines.len() - 1);
                 lines.splice(start_line..=end, new_lines);
@@ -484,16 +486,18 @@ fn apply_changes(lines: &mut Vec<String>, changes: &[TextDocumentContentChangeEv
 impl Backend {
     async fn use_llm<F>(&self, proc: F) -> core::result::Result<String, Box<dyn core::error::Error>>
     where
-        F: AsyncFnOnce(
-            tokio::sync::MutexGuard<Box<GenericLlmClient>>,
-        ) -> core::result::Result<String, Box<dyn core::error::Error>>,
+        F: for<'b, 'a> AsyncFnOnce(
+            &'b mut Box<dyn LlmClient + 'a>,
+        )
+            -> core::result::Result<String, Box<dyn core::error::Error>>,
     {
-        if let Some(llm) = self.llm.as_ref() {
-            let llm = llm.lock().await;
-            let result = proc(llm).await;
-            result
+        let ref_llm = self.llm.as_ref();
+        if let Some(llm) = ref_llm {
+            let mut locked = llm.lock().await;
+            let llm = locked.deref_mut();
+            proc(llm).await
         } else {
-            Err(Box::new(tower_lsp::jsonrpc::Error {
+            core::result::Result::Err(Box::new(tower_lsp::jsonrpc::Error {
                 code: ErrorCode::ServerError(-32002),
                 message: std::borrow::Cow::Borrowed("LLM not initialized"),
                 data: None,

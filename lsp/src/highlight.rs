@@ -9,106 +9,105 @@ use tracing::{debug, instrument};
 /// ハイライト用トークンを表す型。
 ///
 /// `start`/`length` はバイト単位のオフセットを想定しています（LSP の semantic tokens 生成時に変換して使います）。
-pub mod SemanticToken {
-    pub struct Token {
-        /// 先頭バイトオフセット
-        pub start: u32,
-        /// バイト長
-        pub length: u32,
-        /// トークンの種類（例: "keyword", "string", "function" など）
-        pub token_type: u32,
-        pub modifier: u32,
+pub struct SemanticToken {
+    /// 先頭バイトオフセット
+    pub start: u32,
+    /// バイト長
+    pub length: u32,
+    /// トークンの種類（例: "keyword", "string", "function" など）
+    pub token_type: u32,
+    pub modifier: u32,
+}
+
+#[derive(Debug)]
+#[repr(u32)]
+pub enum SemanticTokenType {
+    Comment = 0,
+    String = 1,
+    Keyword = 2,
+    Number = 3,
+    Regexp = 4,
+    Operator = 5,
+    Namespace = 6,
+    Type = 7,
+    Struct = 8,
+    Class = 9,
+    Interface = 10,
+    Enum = 11,
+    TypeParameter = 12,
+    Function = 13,
+    Method = 14,
+    Member = 15,
+    Macro = 16,
+    Variable = 17,
+    Parameter = 18,
+    Property = 19,
+    Label = 20,
+
+    Undefined = u32::MAX,
+}
+
+impl SemanticToken {
+    /// 新しいトークンを作成する簡易コンストラクタ
+    pub fn new(start: u32, length: u32, token_type: u32, modifier: u32) -> Self {
+        Self {
+            start,
+            length,
+            token_type,
+            modifier,
+        }
     }
 
-    #[derive(Debug)]
-    #[repr(u32)]
-    pub enum TokenType {
-        Comment = 0,
-        String = 1,
-        Keyword = 2,
-        Number = 3,
-        Regexp = 4,
-        Operator = 5,
-        Namespace = 6,
-        Type = 7,
-        Struct = 8,
-        Class = 9,
-        Interface = 10,
-        Enum = 11,
-        TypeParameter = 12,
-        Function = 13,
-        Method = 14,
-        Member = 15,
-        Macro = 16,
-        Variable = 17,
-        Parameter = 18,
-        Property = 19,
-        Label = 20,
-
-        Undefined = u32::MAX,
+    pub fn from_kind(start: u32, length: u32, kind: &str) -> Self {
+        let (token_type, modifier) = Self::kind2token(kind);
+        Self {
+            start,
+            length,
+            token_type,
+            modifier,
+        }
     }
 
-    impl Token {
-        /// 新しいトークンを作成する簡易コンストラクタ
-        pub fn new(start: u32, length: u32, token_type: u32, modifier: u32) -> Self {
-            Self {
-                start,
-                length,
-                token_type,
-                modifier,
-            }
-        }
+    pub fn kind2token(kind: &str) -> (u32, u32) {
+        match kind {
+            "comment" => (SemanticTokenType::Comment as u32, 0),
+            "string" => (SemanticTokenType::String as u32, 0),
+            "keyword" => (SemanticTokenType::Keyword as u32, 0),
+            "number" => (SemanticTokenType::Number as u32, 0),
+            "regexp" => (SemanticTokenType::Regexp as u32, 0),
+            "operator" => (SemanticTokenType::Operator as u32, 0),
 
-        pub fn from_kind(start: u32, length: u32, kind: &str) -> Self {
-            let (token_type, modifier) = Self::kind2token(kind);
-            Self {
-                start,
-                length,
-                token_type,
-                modifier,
-            }
-        }
+            "namespace" => (SemanticTokenType::Namespace as u32, 0),
+            "type" => (SemanticTokenType::Type as u32, 0),
+            "struct" => (SemanticTokenType::Struct as u32, 0),
+            "class" => (SemanticTokenType::Class as u32, 0),
+            "interface" => (SemanticTokenType::Interface as u32, 0),
 
-        pub fn kind2token(kind: &str) -> (u32, u32) {
-            match kind {
-                "comment" => (TokenType::Comment as u32, 0),
-                "string" => (TokenType::String as u32, 0),
-                "keyword" => (TokenType::Keyword as u32, 0),
-                "number" => (TokenType::Number as u32, 0),
-                "regexp" => (TokenType::Regexp as u32, 0),
-                "operator" => (TokenType::Operator as u32, 0),
+            "enum" => (SemanticTokenType::Enum as u32, 0),
+            "typeParameter" => (SemanticTokenType::TypeParameter as u32, 0),
+            "function" => (SemanticTokenType::Function as u32, 0),
+            "method" => (SemanticTokenType::Method as u32, 0),
+            "member" => (SemanticTokenType::Member as u32, 0),
 
-                "namespace" => (TokenType::Namespace as u32, 0),
-                "type" => (TokenType::Type as u32, 0),
-                "struct" => (TokenType::Struct as u32, 0),
-                "class" => (TokenType::Class as u32, 0),
-                "interface" => (TokenType::Interface as u32, 0),
+            "macro" => (SemanticTokenType::Macro as u32, 0),
+            "variable" => (SemanticTokenType::Variable as u32, 0),
+            "parameter" => (SemanticTokenType::Parameter as u32, 0),
+            "property" => (SemanticTokenType::Property as u32, 0),
+            "label" => (SemanticTokenType::Label as u32, 0),
 
-                "enum" => (TokenType::Enum as u32, 0),
-                "typeParameter" => (TokenType::TypeParameter as u32, 0),
-                "function" => (TokenType::Function as u32, 0),
-                "method" => (TokenType::Method as u32, 0),
-                "member" => (TokenType::Member as u32, 0),
-
-                "macro" => (TokenType::Macro as u32, 0),
-                "variable" => (TokenType::Variable as u32, 0),
-                "parameter" => (TokenType::Parameter as u32, 0),
-                "property" => (TokenType::Property as u32, 0),
-                "label" => (TokenType::Label as u32, 0),
-
-                _ => (TokenType::Undefined as u32, TokenType::Undefined as u32),
-            }
+            _ => (
+                SemanticTokenType::Undefined as u32,
+                SemanticTokenType::Undefined as u32,
+            ),
         }
     }
 }
-
-use crate::highlight::SemanticToken::*;
 
 /// 会話テキストを受け取り、ハイライト用トークン列を返す。
 ///
 /// Lindera を用いて形態素解析を行い、語種に基づくトークン種別を生成します。
 #[instrument]
-pub fn tokenize_conversation(text: &str) -> Vec<Token> {
+pub fn tokenize_conversation(text: &str) -> Vec<SemanticToken> {
     // IPADIC を使用する設定でトークナイザを作成
     let tokenizer = TokenizerBuilder::new()
         .unwrap()
@@ -153,11 +152,7 @@ pub fn tokenize_conversation(text: &str) -> Vec<Token> {
             _ => "comment",
         };
 
-        tokens.push(SemanticToken::Token::from_kind(
-            start as u32,
-            length as u32,
-            kind,
-        ));
+        tokens.push(SemanticToken::from_kind(start as u32, length as u32, kind));
     }
 
     tokens
@@ -169,10 +164,10 @@ mod tests {
 
     #[test]
     fn highlight_token_new() {
-        let t = SemanticToken::Token::from_kind(5, 3, "keyword");
+        let t = SemanticToken::from_kind(5, 3, "keyword");
         assert_eq!(t.start, 5);
         assert_eq!(t.length, 3);
-        assert_eq!(t.token_type, TokenType::Keyword as u32);
+        assert_eq!(t.token_type, SemanticTokenType::Keyword as u32);
         assert_eq!(t.modifier, 0);
     }
 
@@ -193,35 +188,35 @@ mod tests {
         assert_eq!(tokens.len(), 5);
         assert_eq!(
             tokens[0].token_type,
-            TokenType::Variable as u32, //, "variable",
+            SemanticTokenType::Variable as u32, //, "variable",
             "{} <> variable @{}",
             tokens[0].token_type,
             tokens[0].start
         ); // これ
         assert_eq!(
             tokens[1].token_type,
-            TokenType::Comment as u32,
+            SemanticTokenType::Comment as u32,
             "{} <> comment @{}",
             tokens[1].token_type,
             tokens[1].start
         ); // は
         assert_eq!(
             tokens[2].token_type,
-            TokenType::Variable as u32,
+            SemanticTokenType::Variable as u32,
             "{} <> variable @{}",
             tokens[2].token_type,
             tokens[2].start
         ); // テスト
         assert_eq!(
             tokens[3].token_type,
-            TokenType::Comment as u32,
+            SemanticTokenType::Comment as u32,
             "{} <> comment @{}",
             tokens[3].token_type,
             tokens[3].start
         ); // です
         assert_eq!(
             tokens[4].token_type,
-            TokenType::Comment as u32,
+            SemanticTokenType::Comment as u32,
             "{} <> comment @{}",
             tokens[4].token_type,
             tokens[4].start
@@ -238,7 +233,7 @@ mod tests {
     fn test_tokenize_conversation_unknown_words() {
         let tokens = tokenize_conversation("がびがび");
         // "ぴえん" は名詞として扱われるはず
-        assert_eq!(tokens[0].token_type, TokenType::Comment as u32);
+        assert_eq!(tokens[0].token_type, SemanticTokenType::Comment as u32);
     }
 
     #[test]

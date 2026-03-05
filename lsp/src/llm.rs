@@ -1,11 +1,14 @@
+use farmhash;
 use genai::adapter::AdapterKind;
-use genai::chat::{ChatOptions, ChatRequest};
+use genai::chat::{ChatMessage, ChatOptions, ChatRequest};
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ClientBuilder, ModelIden, ModelName, ServiceTarget};
+use std::collections::HashMap;
 use std::error::Error;
-use std::fmt;
+use std::fmt::{self, Display, LowerHex};
 use std::sync::{Arc, Mutex};
 use tower_lsp::async_trait;
+use tower_lsp::lsp_types::CompletionOptionsCompletionItem;
 
 /// LLMプロバイダを表すenum
 #[derive(Debug, Clone)]
@@ -13,7 +16,7 @@ pub enum Provider {
     Google,
     OpenAI,
     Anthropic,
-    XAI,
+    XAi,
     LMStudio,
 
     Undefined,
@@ -26,7 +29,7 @@ impl Provider {
             "google" => Ok(Provider::Google),
             "openai" => Ok(Provider::OpenAI),
             "anthropic" => Ok(Provider::Anthropic),
-            "xai" => Ok(Provider::XAI),
+            "xai" => Ok(Provider::XAi),
             "lmstudio" => Ok(Provider::LMStudio),
             _ => Err(format!("Unsupported provider: {}", s)),
         }
@@ -39,8 +42,23 @@ impl Provider {
 /// そして新しいプロンプトの追加といった基本的な操作を定義します。
 /// これにより、具体的なLLMプロバイダ（Google, OpenAIなど）の実装を
 /// アプリケーションのコアロジックから切り離すことができます。
+#[derive(Debug, Clone)]
+pub enum Content {
+    Text(String),
+    CacheEntry(String),
+}
+
+impl Display for Content {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Content::Text(s) => write!(f, "{}", s),
+            Content::CacheEntry(s) => write!(f, "{}", s),
+        }
+    }
+}
+
 #[async_trait]
-pub trait LlmClient: Send + Sync + std::fmt::Debug + Sized + Clone {
+pub trait LlmClient: Send + Sync + std::fmt::Debug {
     /// LLMとチャットセッションを実行する
     ///
     /// 現在のプロンプトを基にLLMにリクエストを送信し、応答を文字列として返します。
@@ -48,67 +66,35 @@ pub trait LlmClient: Send + Sync + std::fmt::Debug + Sized + Clone {
 
     async fn with_model(&mut self, model: &str) -> Result<String, Box<dyn Error>>;
 
-    /// プロンプトを永続的なキャッシュに追加する
-    ///
-    /// このプロンプトは、`chat`が呼び出されるたびに再利用されます。
-    fn cache(&mut self, prompt: String);
-
     /// 一時的なプロンプトを現在のセッションに追加する
     ///
     /// このプロンプトは、次回の`chat`呼び出しでのみ使用され、その後クリアされます。
-    fn add(&mut self, prompt: String);
+    fn add(&mut self, prompt: Content);
 
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "LlmClient")
     }
+
+    fn build_content(&self) -> String;
+
+    fn get_model(&self) -> &str;
 }
 
-/// プロンプトをキャッシュするためのストレージ機能を定義するトレイト
-///
-/// `init`, `set`, `all`の3つのメソッドを通じて、キャッシュの初期化、
-/// 値の保存、そしてすべてのキャッシュ内容の取得を行います。
-trait Cache: Send + Sync + std::fmt::Debug {
+#[async_trait]
+pub trait Caching: std::fmt::Debug {
     /// キャッシュを初期化（クリア）する
-    fn init(&self);
+    fn clear(&mut self);
 
-    /// 新しい値をキャッシュに保存する
-    fn set(&self, value: String);
+    /// プロンプトを永続的なキャッシュに追加する
+    ///
+    /// このプロンプトは、`chat`が呼び出されるたびに再利用されます。
+    fn cache(&mut self, prompt: Content) -> Result<String, genai::Error>;
 
-    /// キャッシュされているすべての値を取得する
-    fn all(&self) -> Vec<String>;
-}
+    fn fetch(&self, hash: &String) -> Option<&Content>;
 
-/// `Cache`トレイトのインメモリ実装
-///
-/// `Arc<Mutex<Vec<String>>>`を使用して、スレッドセーフなオンメモリキャッシュを提供します。
-/// アプリケーションの実行中、プロンプトを保持するために使われます。
-#[derive(Clone, Debug)]
-struct PromptCache {
-    store: Arc<Mutex<Vec<String>>>,
-}
+    fn fetch_all(&self) -> Vec<Content>;
 
-impl PromptCache {
-    /// 新しい`PromptCache`インスタンスを作成する
-    fn new() -> Self {
-        Self {
-            store: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-}
-
-impl Cache for PromptCache {
-    fn init(&self) {
-        self.store.lock().unwrap().clear();
-    }
-
-    fn set(&self, value: String) {
-        let mut store = self.store.lock().unwrap();
-        store.push(value);
-    }
-
-    fn all(&self) -> Vec<String> {
-        self.store.lock().unwrap().clone()
-    }
+    fn delete(&mut self, hash: String);
 }
 
 /// `LlmClient`トレイトの汎用的な実装
@@ -122,12 +108,12 @@ pub struct GenericLlmClient {
     /// 使用するLLMのモデル名
     model: String,
     /// プロンプトを永続的に保持するためのキャッシュ
-    // cache: Box<dyn Cache>,
+    cache: HashMap<String, Content>,
     /// 現在のチャットセッションでのみ使用される一時的なプロンプト
-    prompts: Vec<String>,
+    prompts: Vec<Content>,
 }
 
-#[tower_lsp::async_trait]
+#[async_trait]
 impl LlmClient for GenericLlmClient {
     async fn chat(&mut self) -> Result<String, Box<dyn Error>> {
         let model = self.model.clone();
@@ -136,7 +122,21 @@ impl LlmClient for GenericLlmClient {
 
     async fn with_model(&mut self, model: &str) -> Result<String, Box<dyn Error>> {
         // TODO AGENTS.mdをfrom_system()で投入
-        let chat_req = ChatRequest::from_user(self.build_content());
+        let chat_req = ChatRequest::from_messages(vec![])
+            .append_messages(self.fetch_all().iter().filter_map(|c| {
+                if let Content::Text(s) = c {
+                    Some(ChatMessage::system(s))
+                } else {
+                    None
+                }
+            }))
+            .append_messages(self.prompts.iter().filter_map(|c| {
+                if let Content::Text(s) = c {
+                    Some(ChatMessage::user(s))
+                } else {
+                    None
+                }
+            }));
         let chat_opt = Some(&ChatOptions::default());
         let response = self
             .inner_client
@@ -149,26 +149,71 @@ impl LlmClient for GenericLlmClient {
         Ok(content)
     }
 
-    fn cache(&mut self, prompt: String) {
-        self.prompts.push(prompt); // TODO: Implement caching logic
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GenericLlmClient :{}", self.model)
     }
 
-    fn add(&mut self, prompt: String) {
+    fn add(&mut self, prompt: Content) {
         self.prompts.push(prompt);
+    }
+
+    fn build_content(&self) -> String {
+        self.fetch_all()
+            .iter()
+            .chain(self.prompts.iter())
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn get_model(&self) -> &str {
+        &self.model
+    }
+}
+
+impl Caching for GenericLlmClient {
+    fn cache(&mut self, prompt: Content) -> Result<String, genai::Error> {
+        match prompt {
+            Content::Text(s) => {
+                let key = format!("{:016x}", farmhash::hash64(s.as_bytes()));
+                self.cache.insert(key.clone(), Content::Text(s));
+                Ok(key)
+            }
+            Content::CacheEntry(key) => {
+                if self.cache.contains_key(&key) {
+                    Ok(key.clone())
+                } else {
+                    Err(genai::Error::Internal("cache not found".to_string()))
+                }
+            }
+        }
+    }
+
+    fn fetch(&self, hash: &String) -> Option<&Content> {
+        self.cache.get(hash)
+    }
+
+    fn fetch_all(&self) -> Vec<Content> {
+        self.cache.values().map(|c| c.clone()).collect()
+    }
+
+    fn clear(&mut self) {
+        self.cache.clear();
+    }
+
+    fn delete(&mut self, hash: String) {
+        self.cache.remove(&hash);
     }
 }
 
 impl GenericLlmClient {
     pub fn new(provider: Provider, model: &str, url: Option<&str>) -> GenericLlmClient {
-        // 暫定。Cacheの実装もプロバイダで変えなきゃダメそうな予感
-        let _cache: Box<dyn Cache> = Box::new(PromptCache::new());
-
         match provider {
-            Provider::Google | Provider::OpenAI | Provider::Anthropic | Provider::XAI => {
+            Provider::Google | Provider::OpenAI | Provider::Anthropic | Provider::XAi => {
                 GenericLlmClient {
                     inner_client: GenericLlmClient::builder(provider, model, url).build(),
                     model: model.to_string(),
-                    // cache,
+                    cache: HashMap::new(),
                     prompts: vec![],
                 }
             }
@@ -176,7 +221,7 @@ impl GenericLlmClient {
             _ => GenericLlmClient {
                 inner_client: GenericLlmClient::builder(provider, model, url).build(),
                 model: model.to_string(),
-                // cache,
+                cache: HashMap::new(),
                 prompts: vec![],
             },
         }
@@ -199,14 +244,11 @@ impl GenericLlmClient {
             }
         }
 
-        // 暫定。Cacheの実装もプロバイダで変えなきゃダメそうな予感
-        let _cache: Box<dyn Cache> = Box::new(PromptCache::new());
-
         GenericLlmClient {
             inner_client: GenericLlmClient::builder(Provider::from_str(prov).unwrap(), model, None)
                 .build(),
             model: String::from(model),
-            // cache,
+            cache: HashMap::new(),
             prompts: vec![],
         }
     }
@@ -228,7 +270,7 @@ impl GenericLlmClient {
                 AuthData::FromEnv("ANTHROPIC_API_KEY".to_string()),
                 AdapterKind::Anthropic,
             ),
-            Provider::XAI => (
+            Provider::XAi => (
                 AuthData::FromEnv("XAI_API_KEY".to_string()),
                 AdapterKind::Xai,
             ),
@@ -254,12 +296,5 @@ impl GenericLlmClient {
         );
 
         genai::Client::builder().with_service_target_resolver(proc)
-    }
-
-    pub fn build_content(&self) -> String {
-        self.prompts.join("\n")
-    }
-    pub fn get_model(&self) -> &str {
-        &self.model
     }
 }
