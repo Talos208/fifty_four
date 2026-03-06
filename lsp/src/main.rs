@@ -533,7 +533,7 @@ async fn main() {
     let current_exe = std::env::current_exe().unwrap(); // "C:\\Users\\talos\\RustroverProjects\\fifty_four\\target\\debug\\fifty_four_lsp.exe"
     let path = current_exe.ancestors().nth(3).unwrap(); // "C:\\Users\\talos\\RustroverProjects\\fifty_four"
 
-    if let Err(err) = dotenv::from_path(path.join(".env")) {
+    if let Err(err) = dotenvx_rs::dotenvx::from_path(path.join(".env")) {
         eprintln!("Failed to load environment variables: {}", err);
 
         eprintln!("{:?}", std::env::vars());

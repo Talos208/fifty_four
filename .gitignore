@@ -15,8 +15,7 @@ extension\target
 
 # OS
 Thumbs.db
-.env
-.env.local
+.env*
 
 **/extension.wasm
 data/*.db

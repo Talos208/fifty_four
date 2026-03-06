@@ -10,7 +10,7 @@ lindera = { version = "2.2.0", features = ["embed-ipadic"] }
 log = "0.4.29"
 env_logger = "0.11.9"
 dashmap = "6.1"
-dotenv = "0.15.0"
+dotenvx-rs = "0.4.30"
 
 genai = "0.5.3"
 indoc = "2.0.7"
