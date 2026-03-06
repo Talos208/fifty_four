@@ -29,10 +29,49 @@ use std::ops::{Deref, DerefMut};
 struct Backend {
     /// LSP クライアントへのハンドル。メッセージ送信などに使用する。
     client: Client,
+    // 文章データ（uri、行ごとのテキスト）
     text: DashMap<String, Vec<String>>,
+    // LLMクライアントへのハンドル
     llm: Option<tokio::sync::Mutex<Box<dyn LlmClient>>>,
+    //  アセットデータ格納フォルダへのパス
     data_path: PathBuf,
+    // 記録用DBへのコネクション
     conn: std::sync::Mutex<rusqlite::Connection>,
+}
+
+fn encode_semantic_tokens(
+    lines: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Vec<tower_lsp::lsp_types::SemanticToken> {
+    let mut encoded = Vec::new();
+    let mut prev_line: Option<u32> = None;
+    let mut prev_start = 0_u32;
+
+    for (line_no, line) in lines.into_iter().enumerate() {
+        let mut tokens = tokenize_conversation(line.as_ref());
+        tokens.sort_by_key(|t| t.start);
+
+        let line_no = line_no as u32;
+        for token in tokens {
+            let (delta_line, delta_start) = match prev_line {
+                None => (line_no, token.start),
+                Some(pl) if pl == line_no => (0, token.start.saturating_sub(prev_start)),
+                Some(pl) => (line_no.saturating_sub(pl), token.start),
+            };
+
+            encoded.push(tower_lsp::lsp_types::SemanticToken {
+                delta_line,
+                delta_start,
+                length: token.length,
+                token_type: token.token_type,
+                token_modifiers_bitset: token.modifier,
+            });
+
+            prev_line = Some(line_no);
+            prev_start = token.start;
+        }
+    }
+
+    encoded
 }
 
 /// `LanguageServer` トレイトの実装。
@@ -220,30 +259,11 @@ impl LanguageServer for Backend {
             .log_message(MessageType::LOG, "semantic_token_full")
             .await;
 
-        let mut line_no = 0;
-        let mut vec = vec![];
         let s = self
             .text
             .get(params.text_document.uri.as_ref())
             .expect("Failed to get text");
-        s.iter().for_each(|s| {
-            let tokens = tokenize_conversation(s.as_str());
-
-            let mut data: Vec<SemanticToken> = tokens // .windows(2).map(|v| (v.first(), v.last()))
-                .iter()
-                .map(|token| {
-                    SemanticToken {
-                        delta_line: line_no, // TODO: これではダメ。差分にしないと
-                        delta_start: token.start,
-                        length: token.length,
-                        token_type: token.token_type,
-                        token_modifiers_bitset: token.modifier,
-                    }
-                })
-                .collect();
-            vec.append(&mut data);
-            line_no += 1;
-        });
+        let vec = encode_semantic_tokens(s.iter().map(|line| line.as_str()));
 
         let tokens = SemanticTokens {
             result_id: None,
@@ -754,5 +774,42 @@ mod tests {
             ],
         );
         assert_eq!(ls, lines("Abcd"));
+    }
+    #[test]
+    fn test_encode_semantic_tokens_same_line_uses_relative_start() {
+        let encoded = encode_semantic_tokens(["これはテストです。"]);
+        assert!(encoded.len() >= 2);
+        assert_eq!(encoded[0].delta_line, 0);
+        assert_eq!(encoded[0].delta_start, 0);
+        assert_eq!(encoded[1].delta_line, 0);
+        assert_eq!(encoded[1].delta_start, 6);
+    }
+
+    #[test]
+    fn test_encode_semantic_tokens_new_line_resets_start_base() {
+        let encoded = encode_semantic_tokens(["これはテストです。", "これはテストです。"]);
+        assert!(encoded.len() >= 6);
+        assert_eq!(encoded[5].delta_line, 1);
+        assert_eq!(encoded[5].delta_start, 0);
+    }
+
+    #[test]
+    fn test_encode_semantic_tokens_skips_empty_lines_with_line_gap() {
+        let encoded = encode_semantic_tokens(["これはテストです。", "", "これはテストです。"]);
+        assert!(encoded.len() >= 6);
+        assert_eq!(encoded[5].delta_line, 2);
+        assert_eq!(encoded[5].delta_start, 0);
+    }
+
+    #[test]
+    fn test_encode_semantic_tokens_preserves_length_type_modifier() {
+        let source = tokenize_conversation("これはテストです。");
+        let encoded = encode_semantic_tokens(["これはテストです。"]);
+        assert_eq!(source.len(), encoded.len());
+        for (src, out) in source.iter().zip(encoded.iter()) {
+            assert_eq!(src.length, out.length);
+            assert_eq!(src.token_type, out.token_type);
+            assert_eq!(src.modifier, out.token_modifiers_bitset);
+        }
     }
 }

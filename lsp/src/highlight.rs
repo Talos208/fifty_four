@@ -1,3 +1,5 @@
+use std::fmt::Debug;
+
 use lindera::mode::Mode;
 use lindera::tokenizer::TokenizerBuilder;
 use tracing::{debug, instrument};
@@ -107,18 +109,21 @@ impl SemanticToken {
 ///
 /// Lindera を用いて形態素解析を行い、語種に基づくトークン種別を生成します。
 #[instrument]
-pub fn tokenize_conversation(text: &str) -> Vec<SemanticToken> {
+pub fn tokenize_conversation(text: impl AsRef<str> + Debug) -> Vec<SemanticToken> {
     // IPADIC を使用する設定でトークナイザを作成
     let tokenizer = TokenizerBuilder::new()
         .unwrap()
         .set_segmenter_mode(&Mode::Normal)
         .set_segmenter_dictionary("embedded://ipadic")
+        // .set_segmenter_user_dictionary("")
         .build()
         .expect("failed to create lindera tokenizer");
 
     let mut tokens = Vec::new();
     // `tokenize` は Result を返すため、expect で処理
-    let lindera_tokens = tokenizer.tokenize(text).expect("failed to tokenize text");
+    let lindera_tokens = tokenizer
+        .tokenize(text.as_ref())
+        .expect("failed to tokenize text");
 
     for mut token in lindera_tokens {
         let start = token.byte_start;
@@ -126,7 +131,7 @@ pub fn tokenize_conversation(text: &str) -> Vec<SemanticToken> {
 
         debug!(
             "Token: `{:?}`, Details: {:?}",
-            text[start..start + length].to_string(),
+            text.as_ref()[start..start + length].to_string(),
             token.details()
         );
 
