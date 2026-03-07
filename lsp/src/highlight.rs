@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::fmt::{Debug, Formatter};
 
 use lindera::mode::Mode;
 use lindera::tokenizer::TokenizerBuilder;
@@ -11,6 +11,7 @@ use tracing::{debug, instrument};
 /// ハイライト用トークンを表す型。
 ///
 /// `start`/`length` はバイト単位のオフセットを想定しています（LSP の semantic tokens 生成時に変換して使います）。
+#[derive(Debug, Clone)]
 pub struct SemanticToken {
     /// 先頭バイトオフセット
     pub start: u32,
@@ -105,62 +106,114 @@ impl SemanticToken {
     }
 }
 
-/// 会話テキストを受け取り、ハイライト用トークン列を返す。
-///
-/// Lindera を用いて形態素解析を行い、語種に基づくトークン種別を生成します。
-#[instrument]
-pub fn tokenize_conversation(text: impl AsRef<str> + Debug) -> Vec<SemanticToken> {
-    // IPADIC を使用する設定でトークナイザを作成
-    let tokenizer = TokenizerBuilder::new()
-        .unwrap()
-        .set_segmenter_mode(&Mode::Normal)
-        .set_segmenter_dictionary("embedded://ipadic")
-        // .set_segmenter_user_dictionary("")
-        .build()
-        .expect("failed to create lindera tokenizer");
+// #[derive(Debug)]
+pub struct Highlighter {
+    tokenizer: lindera::tokenizer::Tokenizer,
+}
 
-    let mut tokens = Vec::new();
-    // `tokenize` は Result を返すため、expect で処理
-    let lindera_tokens = tokenizer
-        .tokenize(text.as_ref())
-        .expect("failed to tokenize text");
+impl std::fmt::Debug for crate::highlight::Highlighter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Highlight tokenizer using Lindera")?;
+        Ok(())
+    }
+}
 
-    for mut token in lindera_tokens {
-        let start = token.byte_start;
-        let length = token.byte_end - token.byte_start;
+impl Highlighter {
+    pub fn new() -> Self {
+        // IPADIC を使用する設定でトークナイザを作成
+        let tokenizer = TokenizerBuilder::new()
+            .unwrap()
+            .set_segmenter_mode(&Mode::Normal)
+            .set_segmenter_dictionary("embedded://ipadic")
+            // .set_segmenter_user_dictionary("")
+            .build()
+            .expect("failed to create lindera tokenizer");
 
-        debug!(
-            "Token: `{:?}`, Details: {:?}",
-            text.as_ref()[start..start + length].to_string(),
-            token.details()
-        );
-
-        let details = token.details();
-        let kind = match details[0] {
-            "名詞" => "variable",
-            "動詞" => "function",
-            "形容詞" => "function",
-            "記号" => {
-                match details.get(1) {
-                    Some(&"句点") | Some(&"読点") => "comment",
-                    Some(&"括弧閉") => {
-                        // TODO 括弧モード開始
-                        "string"
-                    }
-                    Some(&"括弧開") => {
-                        // TODO 括弧モード終了
-                        "string"
-                    }
-                    _ => "comment",
-                }
-            }
-            _ => "comment",
-        };
-
-        tokens.push(SemanticToken::from_kind(start as u32, length as u32, kind));
+        Self { tokenizer }
     }
 
-    tokens
+    /// テキストを受け取り、ハイライト用トークン列を返す。
+    ///
+    /// Lindera を用いて形態素解析を行い、語種に基づくトークン種別を生成します。
+    pub fn tokenize(&self, text: impl AsRef<str> + Debug) -> Vec<SemanticToken> {
+        let mut tokens = Vec::new();
+        // `tokenize` は Result を返すため、expect で処理
+        let lindera_tokens = self
+            .tokenizer
+            .tokenize(text.as_ref())
+            .expect("failed to tokenize text");
+
+        for mut token in lindera_tokens {
+            let details = token.details();
+            let kind = match details[0] {
+                "名詞" => Some("keyword"),
+                "動詞" => Some("variable"),
+                "形容詞" => Some("function"),
+                "記号" => {
+                    match details.get(1) {
+                        Some(&"句点") | Some(&"読点") => Some("comment"),
+                        Some(&"括弧閉") => {
+                            // TODO 括弧モード開始
+                            Some("string")
+                        }
+                        Some(&"括弧開") => {
+                            // TODO 括弧モード終了
+                            Some("string")
+                        }
+                        _ => Some("comment"),
+                    }
+                }
+                _ => None,
+            };
+
+            if let Some(k) = kind {
+                let s = &text.as_ref()[0..token.byte_end];
+                let (left, right) = s.split_at(token.byte_start);
+
+                let start = left.chars().count();
+                let length = right.chars().count();
+
+                tokens.push(SemanticToken::from_kind(start as u32, length as u32, k));
+            }
+        }
+
+        tokens
+    }
+
+    /// ハイライト用トークン列をLSP用に変換する。
+    ///
+    /// Lindera を用いて形態素解析を行い、語種に基づくトークン種別を生成します。
+    pub fn to_semantic_tokens(
+        tokens: impl IntoIterator<Item = impl IntoIterator<Item = crate::highlight::SemanticToken>>,
+    ) -> Vec<tower_lsp::lsp_types::SemanticToken> {
+        let mut encoded = Vec::new();
+        let mut prev_line: Option<u32> = None;
+        let mut prev_start = 0_u32;
+
+        for (line_no, token) in tokens.into_iter().enumerate() {
+            let line_no = line_no as u32;
+            for tkn in token {
+                let (delta_line, delta_start) = match prev_line {
+                    None => (line_no, tkn.start),
+                    Some(pl) if pl == line_no => (0, tkn.start.saturating_sub(prev_start)),
+                    Some(pl) => (line_no.saturating_sub(pl), tkn.start),
+                };
+
+                encoded.push(tower_lsp::lsp_types::SemanticToken {
+                    delta_line,
+                    delta_start,
+                    length: tkn.length,
+                    token_type: tkn.token_type,
+                    token_modifiers_bitset: tkn.modifier,
+                });
+
+                prev_line = Some(line_no);
+                prev_start = tkn.start;
+            }
+        }
+
+        encoded
+    }
 }
 
 #[cfg(test)]
@@ -178,7 +231,8 @@ mod tests {
 
     #[test]
     fn test_tokenize_conversation_produces_tokens() {
-        let tokens = tokenize_conversation("これはテストです。");
+        let hilighter = Highlighter::new();
+        let tokens = hilighter.tokenize("これはテストです。");
         assert!(
             !tokens.is_empty(),
             "tokenize_conversation should produce tokens"
@@ -230,20 +284,83 @@ mod tests {
 
     #[test]
     fn test_tokenize_conversation_empty_string() {
-        let tokens = tokenize_conversation("");
+        let hilighter = Highlighter::new();
+        let tokens = hilighter.tokenize("");
         assert!(tokens.is_empty(), "Empty string should produce no tokens");
     }
 
     #[test]
     fn test_tokenize_conversation_unknown_words() {
-        let tokens = tokenize_conversation("がびがび");
-        // "ぴえん" は名詞として扱われるはず
+        let hilighter = Highlighter::new();
+        let tokens = hilighter.tokenize("がびがび");
+        // "がびがび" は名詞として扱われるはず
         assert_eq!(tokens[0].token_type, SemanticTokenType::Comment as u32);
     }
 
     #[test]
     fn test_tokenize_conversation_complex_sentence() {
-        let tokens = tokenize_conversation("吾輩は猫である。名前はまだない。");
+        let hilighter = Highlighter::new();
+        let tokens = hilighter.tokenize("吾輩は猫である。名前はまだない。");
         assert!(!tokens.is_empty());
+    }
+
+    #[test]
+    fn test_encode_semantic_tokens_same_line_uses_relative_start() {
+        let hilighter = Highlighter::new();
+        let tokens = hilighter.tokenize("これはテストです。");
+        let encoded = Highlighter::to_semantic_tokens(
+            ["これはテストです。"]
+                .iter()
+                .map(|s| hilighter.tokenize(s))
+                .collect::<Vec<_>>(),
+        );
+        assert!(encoded.len() >= 3);
+        assert_eq!(encoded[1].delta_line, 0);
+        assert_eq!(encoded[1].delta_start, 2);
+        assert_eq!(encoded[2].delta_line, 0);
+        assert_eq!(encoded[2].delta_start, 1);
+    }
+
+    #[test]
+    fn test_encode_semantic_tokens_new_line_resets_start_base() {
+        let hilighter = Highlighter::new();
+        let encoded = Highlighter::to_semantic_tokens(
+            ["これはテストです。", "これはテストです。"]
+                .iter()
+                .map(|s| hilighter.tokenize(s))
+                .collect::<Vec<_>>(),
+        );
+        assert!(encoded.len() >= 6);
+        assert_eq!(encoded[5].delta_line, 1);
+        assert_eq!(encoded[5].delta_start, 0);
+    }
+
+    #[test]
+    fn test_encode_semantic_tokens_skips_empty_lines_with_line_gap() {
+        let hilighter = Highlighter::new();
+        let encoded = Highlighter::to_semantic_tokens(
+            ["これはテストです。", "", "これはテストです。"]
+                .iter()
+                .map(|s| hilighter.tokenize(s))
+                .collect::<Vec<_>>(),
+        );
+        assert!(encoded.len() >= 6);
+        assert_eq!(encoded[5].delta_line, 2);
+        assert_eq!(encoded[5].delta_start, 0);
+    }
+
+    #[test]
+    fn test_encode_semantic_tokens_preserves_length_type_modifier() {
+        let hilighter = Highlighter::new();
+        let source = hilighter.tokenize("これはテストです。");
+
+        let encoded = Highlighter::to_semantic_tokens([source.clone()]);
+
+        assert_eq!(source.len(), encoded.len());
+        for (src, out) in source.iter().zip(encoded.iter()) {
+            assert_eq!(src.length, out.length);
+            assert_eq!(src.token_type, out.token_type);
+            assert_eq!(src.modifier, out.token_modifiers_bitset);
+        }
     }
 }

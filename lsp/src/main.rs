@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, async_trait};
 use tracing::{debug, info, instrument, span, warn};
 mod highlight;
-use crate::highlight::tokenize_conversation;
+use crate::highlight::Highlighter;
 mod logging;
 use crate::logging::Logger;
 use dashmap::DashMap;
@@ -35,43 +35,11 @@ struct Backend {
     llm: Option<tokio::sync::Mutex<Box<dyn LlmClient>>>,
     //  アセットデータ格納フォルダへのパス
     data_path: PathBuf,
+
+    highliter: Highlighter,
     // 記録用DBへのコネクション
+    #[cfg(debug_assertions)]
     conn: std::sync::Mutex<rusqlite::Connection>,
-}
-
-fn encode_semantic_tokens(
-    lines: impl IntoIterator<Item = impl AsRef<str>>,
-) -> Vec<tower_lsp::lsp_types::SemanticToken> {
-    let mut encoded = Vec::new();
-    let mut prev_line: Option<u32> = None;
-    let mut prev_start = 0_u32;
-
-    for (line_no, line) in lines.into_iter().enumerate() {
-        let mut tokens = tokenize_conversation(line.as_ref());
-        tokens.sort_by_key(|t| t.start);
-
-        let line_no = line_no as u32;
-        for token in tokens {
-            let (delta_line, delta_start) = match prev_line {
-                None => (line_no, token.start),
-                Some(pl) if pl == line_no => (0, token.start.saturating_sub(prev_start)),
-                Some(pl) => (line_no.saturating_sub(pl), token.start),
-            };
-
-            encoded.push(tower_lsp::lsp_types::SemanticToken {
-                delta_line,
-                delta_start,
-                length: token.length,
-                token_type: token.token_type,
-                token_modifiers_bitset: token.modifier,
-            });
-
-            prev_line = Some(line_no);
-            prev_start = token.start;
-        }
-    }
-
-    encoded
 }
 
 /// `LanguageServer` トレイトの実装。
@@ -248,8 +216,6 @@ impl LanguageServer for Backend {
 
     /// ドキュメント全体に対する semantic tokens の問い合わせに応答します。
     ///
-    /// 現状はトークン配列を空で返し、クライアントに対して "サーバは semantic tokens を提供する"
-    /// ことを示すための最小実装です。後で実際のトークン列を生成する処理を追加できます。
     #[instrument(ret, err)]
     async fn semantic_tokens_full(
         &self,
@@ -259,11 +225,16 @@ impl LanguageServer for Backend {
             .log_message(MessageType::LOG, "semantic_token_full")
             .await;
 
-        let s = self
+        let text = self
             .text
             .get(params.text_document.uri.as_ref())
-            .expect("Failed to get text");
-        let vec = encode_semantic_tokens(s.iter().map(|line| line.as_str()));
+            .expect("Failed to get text")
+            .value()
+            .to_vec();
+
+        let tokens = text.iter().map(|s| self.highliter.tokenize(s));
+
+        let vec = Highlighter::to_semantic_tokens(tokens);
 
         let tokens = SemanticTokens {
             result_id: None,
@@ -296,7 +267,7 @@ impl LanguageServer for Backend {
         }
 
         let uri = params.text_document_position.text_document.uri.as_str();
-        let text = self.text.get(uri).unwrap();
+        let text = self.text.get(uri).unwrap().value().to_owned();
         let line_no = params.text_document_position.position.line as usize;
         let offset = params.text_document_position.position.character as usize;
 
@@ -304,7 +275,7 @@ impl LanguageServer for Backend {
             .iter()
             .take(line_no)
             .map(|s| s.as_str())
-            .collect::<Vec<&str>>()
+            .collect::<Vec<_>>()
             .join("\n");
 
         self.client
@@ -332,6 +303,7 @@ impl LanguageServer for Backend {
                         l.add(Content::Text(before));
                         l.add(Content::Text(left));
 
+                        #[cfg(debug_assertions)]
                         {
                             let db = self.conn.lock().unwrap();
                             let prompt = l.build_content();
@@ -366,22 +338,25 @@ impl LanguageServer for Backend {
                 Ok(response) => {
                     let cr = Regex::new(r"\r\n|\r|\n").unwrap();
 
-                    let db = self.conn.lock().unwrap();
                     let items = cr
                         .split(response.as_str())
                         .inspect(|i| {
-                            db.execute(
-                                indoc!(
-                                    "INSERT INTO completion_candidates
-                                    (completion_id, rank, candidate)
-                                    VALUES (?,?,?);"
-                                ),
-                                rusqlite::params![completion_id, 0, i],
-                            )
-                            .unwrap_or_else(|err| {
-                                eprintln!("Failed to insert completion_candidate: {}", err);
-                                0
-                            });
+                            #[cfg(debug_assertions)]
+                            {
+                                let db = self.conn.lock().unwrap();
+                                db.execute(
+                                    indoc!(
+                                        "INSERT INTO completion_candidates
+                                        (completion_id, rank, candidate)
+                                        VALUES (?,?,?);"
+                                    ),
+                                    rusqlite::params![completion_id, 0, i],
+                                )
+                                .unwrap_or_else(|err| {
+                                    eprintln!("Failed to insert completion_candidate: {}", err);
+                                    0
+                                });
+                            }
                         })
                         .map(|r| CompletionItem {
                             label: r.to_string(),
@@ -591,6 +566,8 @@ async fn main() {
             // ),
         ))),
         data_path: path.join("data"),
+        highliter: Highlighter::new(),
+        #[cfg(debug_assertions)]
         conn: conn,
     })
     .finish();
@@ -774,42 +751,5 @@ mod tests {
             ],
         );
         assert_eq!(ls, lines("Abcd"));
-    }
-    #[test]
-    fn test_encode_semantic_tokens_same_line_uses_relative_start() {
-        let encoded = encode_semantic_tokens(["これはテストです。"]);
-        assert!(encoded.len() >= 2);
-        assert_eq!(encoded[0].delta_line, 0);
-        assert_eq!(encoded[0].delta_start, 0);
-        assert_eq!(encoded[1].delta_line, 0);
-        assert_eq!(encoded[1].delta_start, 6);
-    }
-
-    #[test]
-    fn test_encode_semantic_tokens_new_line_resets_start_base() {
-        let encoded = encode_semantic_tokens(["これはテストです。", "これはテストです。"]);
-        assert!(encoded.len() >= 6);
-        assert_eq!(encoded[5].delta_line, 1);
-        assert_eq!(encoded[5].delta_start, 0);
-    }
-
-    #[test]
-    fn test_encode_semantic_tokens_skips_empty_lines_with_line_gap() {
-        let encoded = encode_semantic_tokens(["これはテストです。", "", "これはテストです。"]);
-        assert!(encoded.len() >= 6);
-        assert_eq!(encoded[5].delta_line, 2);
-        assert_eq!(encoded[5].delta_start, 0);
-    }
-
-    #[test]
-    fn test_encode_semantic_tokens_preserves_length_type_modifier() {
-        let source = tokenize_conversation("これはテストです。");
-        let encoded = encode_semantic_tokens(["これはテストです。"]);
-        assert_eq!(source.len(), encoded.len());
-        for (src, out) in source.iter().zip(encoded.iter()) {
-            assert_eq!(src.length, out.length);
-            assert_eq!(src.token_type, out.token_type);
-            assert_eq!(src.modifier, out.token_modifiers_bitset);
-        }
     }
 }
