@@ -1,5 +1,6 @@
 // シンプルな LSP サーバの実装例（tower-lsp を利用）
 // このファイルは最小限の動作をする "何もしない" サーバを提供します。
+// use lsp_types::CompletionItemTextEdit;
 use tower_lsp::jsonrpc::{Error, ErrorCode, Result};
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, async_trait};
@@ -39,7 +40,7 @@ struct Backend {
     highliter: Highlighter,
     // 記録用DBへのコネクション
     #[cfg(debug_assertions)]
-    conn: std::sync::Mutex<rusqlite::Connection>,
+    conn: Option<std::sync::Mutex<rusqlite::Connection>>,
 }
 
 /// `LanguageServer` トレイトの実装。
@@ -125,7 +126,7 @@ impl LanguageServer for Backend {
                     work_done_progress: None,
                 },
                 completion_item: Some(CompletionOptionsCompletionItem {
-                    label_details_support: None,
+                    label_details_support: Some(true),
                 }),
             }),
             ..ServerCapabilities::default()
@@ -144,6 +145,15 @@ impl LanguageServer for Backend {
     async fn initialized(&self, _: InitializedParams) {
         self.client
             .log_message(MessageType::INFO, "LSP server initialized")
+            .await;
+    }
+
+    async fn did_change_configuration(&self, param: DidChangeConfigurationParams) {
+        self.client
+            .log_message(MessageType::INFO, "did_change_configuration")
+            .await;
+        self.client
+            .log_message(MessageType::INFO, format!("{:?}", param.settings))
             .await;
     }
 
@@ -305,28 +315,30 @@ impl LanguageServer for Backend {
 
                         #[cfg(debug_assertions)]
                         {
-                            let db = self.conn.lock().unwrap();
-                            let prompt = l.build_content();
-                            match db.query_row(
-                                indoc!(
-                                    "INSERT INTO completions
-                                    (document_uri, cursor_line, cursor_character, model_name, prompt)
-                                    VALUES (?,?,?,?,?) RETURNING id;"
-                                ),
-                                rusqlite::params![
-                                    uri,
-                                    line_no.to_string().as_str(),
-                                    offset.to_string().as_str(),
-                                    l.get_model(),
-                                    prompt.as_str(),
-                                ],
-                                |row| row.get(0),
-                            ) {
-                                Ok(r) => {
-                                    completion_id = r;
-                                }
-                                Err(e) => eprintln!("Failed to insert completion: {}", e),
-                            };
+                            if let Some(db) = self.conn.as_ref() {
+                                let db = db.lock().unwrap();
+                                let prompt = l.build_content();
+                                match db.query_row(
+                                    indoc!(
+                                        "INSERT INTO completions
+                                        (document_uri, cursor_line, cursor_character, model_name, prompt)
+                                        VALUES (?,?,?,?,?) RETURNING id;"
+                                    ),
+                                    rusqlite::params![
+                                        uri,
+                                        line_no.to_string().as_str(),
+                                        offset.to_string().as_str(),
+                                        l.get_model(),
+                                        prompt.as_str(),
+                                    ],
+                                    |row| row.get(0),
+                                ) {
+                                    Ok(r) => {
+                                        completion_id = r;
+                                    }
+                                    Err(e) => eprintln!("Failed to insert completion: {}", e),
+                                };
+                            }
                         }
 
                         l.chat().await
@@ -343,25 +355,44 @@ impl LanguageServer for Backend {
                         .inspect(|i| {
                             #[cfg(debug_assertions)]
                             {
-                                let db = self.conn.lock().unwrap();
-                                db.execute(
-                                    indoc!(
-                                        "INSERT INTO completion_candidates
+                                if let Some(db) = self.conn.as_ref() {
+                                    let db = db.lock().unwrap();
+                                    db.execute(
+                                        indoc!(
+                                            "INSERT INTO completion_candidates
                                         (completion_id, rank, candidate)
                                         VALUES (?,?,?);"
-                                    ),
-                                    rusqlite::params![completion_id, 0, i],
-                                )
-                                .unwrap_or_else(|err| {
-                                    eprintln!("Failed to insert completion_candidate: {}", err);
-                                    0
-                                });
+                                        ),
+                                        rusqlite::params![completion_id, 0, i],
+                                    )
+                                    .unwrap_or_else(|err| {
+                                        eprintln!("Failed to insert completion_candidate: {}", err);
+                                        0
+                                    });
+                                }
                             }
                         })
-                        .map(|r| CompletionItem {
-                            label: r.to_string(),
-                            kind: Some(CompletionItemKind::TEXT),
-                            ..Default::default()
+                        .map(|r| {
+                            if r.len() > 20 {
+                                CompletionItem {
+                                    label: r.chars().take(18).collect::<String>() + "…",
+                                    kind: Some(CompletionItemKind::TEXT),
+                                    documentation: Some(Documentation::MarkupContent(
+                                        MarkupContent {
+                                            kind: MarkupKind::Markdown,
+                                            value: r.to_string(),
+                                        },
+                                    )),
+                                    insert_text: Some(r.to_string()),
+                                    ..Default::default()
+                                }
+                            } else {
+                                CompletionItem {
+                                    label: r.to_string(),
+                                    kind: Some(CompletionItemKind::TEXT),
+                                    ..Default::default()
+                                }
+                            }
                         })
                         .collect();
                     let list = CompletionList {
@@ -536,18 +567,24 @@ async fn main() {
     }
 
     // DBマイグレーション
-    let conn = std::sync::Mutex::new(
-        rusqlite::Connection::open(path.join("data").join("fifty_four.db")).unwrap(),
-    );
-    {
-        let mut c = conn.lock().unwrap();
-        match migrations::migrations::runner().run(c.deref_mut()) {
-            Ok(_) => {}
-            Err(e) => {
-                panic!("Fail to migrate: {:?}", e);
+    #[cfg(debug_assertions)]
+    let conn = {
+        let conn = std::sync::Mutex::new(
+            rusqlite::Connection::open(path.join("data").join("fifty_four.db")).unwrap(),
+        );
+        {
+            let mut c = conn.lock().unwrap();
+            match migrations::migrations::runner().run(c.deref_mut()) {
+                Ok(_) => {}
+                Err(e) => {
+                    panic!("Fail to migrate: {:?}", e);
+                }
             }
         }
-    }
+        Some(conn)
+    };
+    #[cfg(not(debug_assertions))]
+    let conn = None;
 
     // LspService を構築し、`Backend` をクライアントハンドルで初期化する
     info!("initialize lsp service");
@@ -567,7 +604,6 @@ async fn main() {
         ))),
         data_path: path.join("data"),
         highliter: Highlighter::new(),
-        #[cfg(debug_assertions)]
         conn: conn,
     })
     .finish();
