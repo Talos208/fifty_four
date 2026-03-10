@@ -1,23 +1,22 @@
+use async_trait::async_trait;
 use farmhash;
 use genai::adapter::AdapterKind;
 use genai::chat::{ChatMessage, ChatOptions, ChatRequest};
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
-use genai::{Client, ClientBuilder, ModelIden, ModelName, ServiceTarget};
+use genai::{Client, ModelIden, ModelName, ServiceTarget};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::error::Error;
-use std::fmt::{self, Display, LowerHex};
-use std::sync::{Arc, Mutex};
-use tower_lsp::async_trait;
-use tower_lsp::lsp_types::CompletionOptionsCompletionItem;
+use std::fmt::{self, Display};
 
 /// LLMプロバイダを表すenum
 #[derive(Debug, Clone)]
 pub enum Provider {
-    Google,
-    OpenAI,
-    Anthropic,
-    XAi,
-    LMStudio,
+    Google(String),
+    OpenAI(String),
+    Anthropic(String),
+    XAi(String),
+    LMStudio(String, Option<String>),
 
     Undefined,
 }
@@ -26,12 +25,75 @@ impl Provider {
     /// 文字列からProviderを生成する
     pub fn from_str(s: &str) -> Result<Self, String> {
         match s.to_lowercase().as_str() {
-            "google" => Ok(Provider::Google),
-            "openai" => Ok(Provider::OpenAI),
-            "anthropic" => Ok(Provider::Anthropic),
-            "xai" => Ok(Provider::XAi),
-            "lmstudio" => Ok(Provider::LMStudio),
+            "google" => Ok(Provider::Google("gemini-3.1-pro-preview".to_string())),
+            "openai" => Ok(Provider::OpenAI("gpt-5.3".to_string())),
+            "anthropic" => Ok(Provider::Anthropic("claude-4.6-sonnet".to_string())),
+            "xai" => Ok(Provider::XAi("grok-4.1".to_string())),
+            "lmstudio" => Ok(Provider::LMStudio(
+                "qwen3.5-2b".to_string(),
+                Some("http://localhost:1234/v1/".to_string()),
+            )),
             _ => Err(format!("Unsupported provider: {}", s)),
+        }
+    }
+
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        let (mut prov, model) = if let Some((prov, model)) = name.split_once('/') {
+            (prov, model)
+        } else {
+            (
+                if let Some((token, _)) = name.split_once('-') {
+                    match token {
+                        "gemini" => "google",
+                        "gpt" => "openai",
+                        "claude" => "anthropic",
+                        "grok" => "xai",
+                        _ => "lmstudio",
+                    }
+                } else {
+                    name
+                },
+                name,
+            )
+        };
+
+        let mut url = "localhost:1234";
+        if prov.starts_with("lmstudio") {
+            if let Some((p, u)) = prov.split_once('@') {
+                prov = p;
+                url = u;
+            }
+        }
+
+        match prov {
+            "google" => Ok(Provider::Google(model.to_string())),
+            "openai" => Ok(Provider::OpenAI(model.to_string())),
+            "anthropic" => Ok(Provider::Anthropic(model.to_string())),
+            "xai" => Ok(Provider::XAi(model.to_string())),
+            "lmstudio" => Ok(Provider::LMStudio(model.to_string(), Some(url.to_string()))),
+            _ => Err(format!("Unsupported provider: {}", name)),
+        }
+    }
+
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Provider::Google(s) => write!(f, "Google({})", s.to_string()),
+            Provider::OpenAI(s) => write!(f, "OpenAI({})", s),
+            Provider::Anthropic(s) => write!(f, "Anthropic({})", s),
+            Provider::XAi(s) => write!(f, "XAi({})", s),
+            Provider::LMStudio(s, _) => write!(f, "LMStudio({})", s),
+            Provider::Undefined => write!(f, "Undefined"),
+        }
+    }
+
+    fn clone(&self) -> Self {
+        match self {
+            Provider::Google(s) => Provider::Google(s.clone()),
+            Provider::OpenAI(s) => Provider::OpenAI(s.clone()),
+            Provider::Anthropic(s) => Provider::Anthropic(s.clone()),
+            Provider::XAi(s) => Provider::XAi(s.clone()),
+            Provider::LMStudio(s, _) => Provider::LMStudio(s.clone(), None),
+            _ => Provider::Undefined,
         }
     }
 }
@@ -57,8 +119,18 @@ impl Display for Content {
     }
 }
 
+impl AsRef<String> for Content {
+    fn as_ref(&self) -> &String {
+        match self {
+            Content::Text(s) => s,
+            Content::CacheEntry(s) => s,
+        }
+    }
+}
+
 #[async_trait]
 pub trait LlmClient: Send + Sync + std::fmt::Debug {
+    //+ MaybeUninit {
     /// LLMとチャットセッションを実行する
     ///
     /// 現在のプロンプトを基にLLMにリクエストを送信し、応答を文字列として返します。
@@ -75,13 +147,14 @@ pub trait LlmClient: Send + Sync + std::fmt::Debug {
         write!(f, "LlmClient")
     }
 
+    async fn get_service_target(&self) -> String {
+        "".to_string()
+    }
+
     fn build_content(&self) -> String;
 
     fn get_model(&self) -> &str;
-}
 
-#[async_trait]
-pub trait Caching: std::fmt::Debug {
     /// キャッシュを初期化（クリア）する
     fn clear(&mut self);
 
@@ -94,7 +167,132 @@ pub trait Caching: std::fmt::Debug {
 
     fn fetch_all(&self) -> Vec<Content>;
 
-    fn delete(&mut self, hash: String);
+    fn remove(&mut self, hash: String);
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmClientBuilder {
+    provider: Provider,
+    model: Option<String>,
+    url: Option<String>,
+}
+
+impl LlmClientBuilder {
+    /// LLMビルダーを構築する
+    fn new(_provider: Provider) -> LlmClientBuilder {
+        LlmClientBuilder {
+            provider: _provider.clone(),
+            model: None,
+            url: None,
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        LlmClientBuilder {
+            provider: Provider::from_name(name).unwrap(),
+            model: None,
+            url: None,
+        }
+    }
+
+    pub fn from_value(value: &serde_json::Value) -> Self {
+        LlmClientBuilder {
+            provider: Provider::from_str(value["provider"].as_str().unwrap()).unwrap(),
+            model: value.get("model").map(|v| v.as_str().unwrap().to_string()),
+            url: value.get("url").map(|v| v.as_str().unwrap().to_string()),
+        }
+    }
+
+    pub fn model(&mut self, model: &str) -> Self {
+        Self {
+            model: Some(model.to_string()),
+            provider: self.provider.clone(),
+            url: self.url.clone(),
+        }
+    }
+
+    pub fn url(&mut self, url: &str) -> Self {
+        Self {
+            url: Some(url.to_string()),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+        }
+    }
+
+    pub fn build(&self) -> Box<dyn LlmClient> {
+        let mut u_from_prov = None;
+        let (auth, kind, mdl_name) = match &self.provider {
+            Provider::Google(mdl) => (
+                AuthData::FromEnv("GEMINI_API_KEY".to_string()),
+                AdapterKind::Gemini,
+                mdl,
+            ),
+            Provider::OpenAI(mdl) => (
+                AuthData::FromEnv("OPENAI_API_KEY".to_string()),
+                AdapterKind::OpenAI,
+                mdl,
+            ),
+            Provider::Anthropic(mdl) => (
+                AuthData::FromEnv("ANTHROPIC_API_KEY".to_string()),
+                AdapterKind::Anthropic,
+                mdl,
+            ),
+            Provider::XAi(mdl) => (
+                AuthData::FromEnv("XAI_API_KEY".to_string()),
+                AdapterKind::Xai,
+                mdl,
+            ),
+            Provider::LMStudio(mdl, u) => {
+                u_from_prov = u.clone();
+                (
+                    AuthData::Key("".to_string()), // No authentication required for local LMStudio
+                    AdapterKind::Anthropic,
+                    mdl,
+                )
+            }
+            _ => panic!("Unsupported provider"),
+        };
+
+        let mdl_name = self.model.as_ref().unwrap_or(&mdl_name);
+        let model_iden = ModelIden {
+            adapter_kind: kind,
+            model_name: ModelName::from(mdl_name),
+        };
+        let endpoint = if let Some(url) = self.url.clone() {
+            Endpoint::from_owned(url)
+        } else if let Some(url) = u_from_prov {
+            Endpoint::from_owned(url)
+        } else {
+            Endpoint::from_static("")
+        };
+
+        let proc = ServiceTargetResolver::from_resolver_fn(
+            |target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+                let e = if endpoint.base_url().is_empty() {
+                    target.endpoint
+                } else {
+                    endpoint
+                };
+                debug!("{:?}, {:?}, {:?}", e, auth, model_iden);
+                Ok(ServiceTarget {
+                    endpoint: e,
+                    auth,
+                    model: model_iden,
+                })
+            },
+        );
+
+        let inner_client = genai::Client::builder()
+            .with_service_target_resolver(proc)
+            .build();
+
+        Box::new(GenericLlmClient {
+            inner_client,
+            model: mdl_name.clone(),
+            cache: HashMap::new(),
+            prompts: vec![],
+        })
+    }
 }
 
 /// `LlmClient`トレイトの汎用的な実装
@@ -124,33 +322,27 @@ impl LlmClient for GenericLlmClient {
         // TODO AGENTS.mdをfrom_system()で投入
         let chat_req = ChatRequest::from_messages(vec![])
             .append_messages(self.fetch_all().iter().filter_map(|c| {
-                if let Content::Text(s) = c {
-                    Some(ChatMessage::system(s))
-                } else {
-                    None
-                }
+                Some(ChatMessage::system(match c {
+                    Content::Text(s) => s,
+                    Content::CacheEntry(h) => &self.fetch(h).unwrap().as_ref(),
+                }))
             }))
             .append_messages(self.prompts.iter().filter_map(|c| {
-                if let Content::Text(s) = c {
-                    Some(ChatMessage::user(s))
-                } else {
-                    None
-                }
+                Some(ChatMessage::user(match c {
+                    Content::Text(s) => s,
+                    Content::CacheEntry(h) => &self.fetch(h).unwrap().as_ref(),
+                }))
             }));
         let chat_opt = Some(&ChatOptions::default());
         let response = self
             .inner_client
             .exec_chat(model, chat_req, chat_opt)
             .await?;
-        let content = response.content.texts().join("\n");
+        let content = response.content.texts().join("");
 
         self.prompts.clear(); // promptはクリア、キャッシュは保存
 
         Ok(content)
-    }
-
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "GenericLlmClient :{}", self.model)
     }
 
     fn add(&mut self, prompt: Content) {
@@ -163,15 +355,13 @@ impl LlmClient for GenericLlmClient {
             .chain(self.prompts.iter())
             .map(|v| v.to_string())
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("")
     }
 
     fn get_model(&self) -> &str {
         &self.model
     }
-}
 
-impl Caching for GenericLlmClient {
     fn cache(&mut self, prompt: Content) -> Result<String, genai::Error> {
         match prompt {
             Content::Text(s) => {
@@ -201,100 +391,17 @@ impl Caching for GenericLlmClient {
         self.cache.clear();
     }
 
-    fn delete(&mut self, hash: String) {
+    fn remove(&mut self, hash: String) {
         self.cache.remove(&hash);
     }
-}
 
-impl GenericLlmClient {
-    pub fn new(provider: Provider, model: &str, url: Option<&str>) -> GenericLlmClient {
-        match provider {
-            Provider::Google | Provider::OpenAI | Provider::Anthropic | Provider::XAi => {
-                GenericLlmClient {
-                    inner_client: GenericLlmClient::builder(provider, model, url).build(),
-                    model: model.to_string(),
-                    cache: HashMap::new(),
-                    prompts: vec![],
-                }
-            }
-            // TODO Resultにしてエラー返すべきだろう
-            _ => GenericLlmClient {
-                inner_client: GenericLlmClient::builder(provider, model, url).build(),
-                model: model.to_string(),
-                cache: HashMap::new(),
-                prompts: vec![],
-            },
-        }
-    }
+    async fn get_service_target(&self) -> String {
+        let st = self
+            .inner_client
+            .resolve_service_target(self.model.as_str())
+            .await
+            .unwrap();
 
-    pub fn from_name(model_name: &str) -> GenericLlmClient {
-        let (mut prov, mut model) = model_name.split_once('/').unwrap();
-
-        if model.is_empty() {
-            model = prov;
-            if let Some((token, _)) = model.split_once('-') {
-                prov = match token {
-                    "gemini" => "google",
-                    "gpt" => "openai",
-                    "claude" => "anthropic",
-                    "grok" => "xai",
-                    "lmstudio" => "lmstudio",
-                    _ => "Unknown",
-                };
-            }
-        }
-
-        GenericLlmClient {
-            inner_client: GenericLlmClient::builder(Provider::from_str(prov).unwrap(), model, None)
-                .build(),
-            model: String::from(model),
-            cache: HashMap::new(),
-            prompts: vec![],
-        }
-    }
-
-    /// LLMビルダーを構築する
-    fn builder(_provider: Provider, model_name: &str, url: Option<&str>) -> ClientBuilder {
-        let endpoint = url.map(Endpoint::from_owned);
-
-        let (auth, kind) = match _provider {
-            Provider::Google => (
-                AuthData::FromEnv("GEMINI_API_KEY".to_string()),
-                AdapterKind::Gemini,
-            ),
-            Provider::OpenAI => (
-                AuthData::FromEnv("OPENAI_API_KEY".to_string()),
-                AdapterKind::OpenAI,
-            ),
-            Provider::Anthropic => (
-                AuthData::FromEnv("ANTHROPIC_API_KEY".to_string()),
-                AdapterKind::Anthropic,
-            ),
-            Provider::XAi => (
-                AuthData::FromEnv("XAI_API_KEY".to_string()),
-                AdapterKind::Xai,
-            ),
-            Provider::LMStudio => (
-                AuthData::Key("".to_string()), // No authentication required for local LMStudio
-                AdapterKind::Anthropic,
-            ),
-            _ => panic!("Unsupported provider"),
-        };
-        let model = ModelIden {
-            adapter_kind: kind,
-            model_name: ModelName::from(model_name),
-        };
-
-        let proc = ServiceTargetResolver::from_resolver_fn(
-            |target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-                Ok(ServiceTarget {
-                    endpoint: endpoint.unwrap_or(target.endpoint),
-                    auth,
-                    model,
-                })
-            },
-        );
-
-        genai::Client::builder().with_service_target_resolver(proc)
+        format!("{:?} {:?}", st.model, st.endpoint)
     }
 }

@@ -18,5 +18,4 @@ Thumbs.db
 .env*
 
 **/extension.wasm
-data/*.db
-data/*.db.wal
+**/*.db
