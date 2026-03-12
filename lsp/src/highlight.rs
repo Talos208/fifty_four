@@ -109,6 +109,7 @@ impl SemanticToken {
 // #[derive(Debug)]
 pub struct Highlighter {
     tokenizer: lindera::tokenizer::Tokenizer,
+    bracket_depth: std::sync::atomic::AtomicU32,
 }
 
 impl std::fmt::Debug for crate::highlight::Highlighter {
@@ -129,7 +130,10 @@ impl Highlighter {
             .build()
             .expect("failed to create lindera tokenizer");
 
-        Self { tokenizer }
+        Self {
+            tokenizer,
+            bracket_depth: std::sync::atomic::AtomicU32::new(0),
+        }
     }
 
     /// テキストを受け取り、ハイライト用トークン列を返す。
@@ -145,25 +149,29 @@ impl Highlighter {
 
         for mut token in lindera_tokens {
             let details = token.details();
-            let kind = match details[0] {
-                "名詞" => Some("keyword"),
-                "動詞" => Some("variable"),
-                "形容詞" => Some("function"),
-                "記号" => {
-                    match details.get(1) {
-                        Some(&"句点") | Some(&"読点") => Some("comment"),
-                        Some(&"括弧閉") => {
-                            // TODO 括弧モード開始
-                            Some("string")
-                        }
-                        Some(&"括弧開") => {
-                            // TODO 括弧モード終了
-                            Some("string")
-                        }
-                        _ => Some("comment"),
+            use std::sync::atomic::Ordering::Relaxed;
+
+            // 括弧開閉はモード dispatch の外で処理する（常に括弧外扱い）。
+            // 括弧開: kind確定("comment") → depth加算（自身はまだ外側）
+            // 括弧閉: depth減算 → kind確定("comment")（自身はもう外側）
+            // それ以外: 現在のdepthでモードを決定し classify へ委譲
+            let kind = match (details[0], details.get(1)) {
+                ("記号", Some(&"括弧開")) => {
+                    self.bracket_depth.fetch_add(1, Relaxed);
+                    Some("comment")
+                }
+                ("記号", Some(&"括弧閉")) => {
+                    let d = self.bracket_depth.load(Relaxed);
+                    self.bracket_depth.store(d.saturating_sub(1), Relaxed);
+                    Some("comment")
+                }
+                _ => {
+                    if self.bracket_depth.load(Relaxed) > 0 {
+                        Self::classify_bracket(&details)
+                    } else {
+                        Self::classify_normal(&details)
                     }
                 }
-                _ => None,
             };
 
             if let Some(k) = kind {
@@ -180,9 +188,30 @@ impl Highlighter {
         tokens
     }
 
+    /// 通常モードでの品詞→トークン種別マッピング
+    fn classify_normal(details: &[&str]) -> Option<&'static str> {
+        match details[0] {
+            "名詞" => Some("keyword"),
+            "動詞" => Some("variable"),
+            "形容詞" => Some("function"),
+            "記号" => Some("comment"),
+            _ => None,
+        }
+    }
+
+    /// 括弧内モードでの品詞→トークン種別マッピング
+    fn classify_bracket(details: &[&str]) -> Option<&'static str> {
+        match details[0] {
+            "名詞" => Some("keyword"),
+            "動詞" => Some("variable"),
+            "形容詞" => Some("function"),
+            "記号" => Some("comment"),
+            _ => Some("string"),
+        }
+    }
+
     /// ハイライト用トークン列をLSP用に変換する。
     ///
-    /// Lindera を用いて形態素解析を行い、語種に基づくトークン種別を生成します。
     pub fn to_semantic_tokens(
         tokens: impl IntoIterator<Item = impl IntoIterator<Item = crate::highlight::SemanticToken>>,
     ) -> Vec<tower_lsp::lsp_types::SemanticToken> {
@@ -239,46 +268,32 @@ mod tests {
         );
 
         // 簡単な検証
-        // "これ" -> 名詞 -> variable
-        // "は" -> 助詞 -> comment
-        // "テスト" -> 名詞 -> variable
-        // "です" -> 助動詞 -> comment
+        // "これ" -> 名詞 -> keyword
+        // "は" -> 助詞 -> None
+        // "テスト" -> 名詞 -> keyword
+        // "です" -> 助動詞 -> None
         // "。" -> 記号 -> comment
-        assert_eq!(tokens.len(), 5);
+        assert_eq!(tokens.len(), 3);
         assert_eq!(
             tokens[0].token_type,
-            SemanticTokenType::Variable as u32, //, "variable",
+            SemanticTokenType::Keyword as u32,
             "{} <> variable @{}",
             tokens[0].token_type,
             tokens[0].start
         ); // これ
         assert_eq!(
             tokens[1].token_type,
-            SemanticTokenType::Comment as u32,
-            "{} <> comment @{}",
+            SemanticTokenType::Keyword as u32,
+            "{} <> variable @{}",
             tokens[1].token_type,
             tokens[1].start
-        ); // は
-        assert_eq!(
-            tokens[2].token_type,
-            SemanticTokenType::Variable as u32,
-            "{} <> variable @{}",
-            tokens[2].token_type,
-            tokens[2].start
         ); // テスト
         assert_eq!(
-            tokens[3].token_type,
+            tokens[2].token_type,
             SemanticTokenType::Comment as u32,
             "{} <> comment @{}",
-            tokens[3].token_type,
-            tokens[3].start
-        ); // です
-        assert_eq!(
-            tokens[4].token_type,
-            SemanticTokenType::Comment as u32,
-            "{} <> comment @{}",
-            tokens[4].token_type,
-            tokens[4].start
+            tokens[2].token_type,
+            tokens[2].start
         ); // 。
     }
 
@@ -294,7 +309,7 @@ mod tests {
         let hilighter = Highlighter::new();
         let tokens = hilighter.tokenize("がびがび");
         // "がびがび" は名詞として扱われるはず
-        assert_eq!(tokens[0].token_type, SemanticTokenType::Comment as u32);
+        assert_eq!(tokens[0].token_type, SemanticTokenType::Keyword as u32);
     }
 
     #[test]
@@ -308,17 +323,12 @@ mod tests {
     fn test_encode_semantic_tokens_same_line_uses_relative_start() {
         let hilighter = Highlighter::new();
         let tokens = hilighter.tokenize("これはテストです。");
-        let encoded = Highlighter::to_semantic_tokens(
-            ["これはテストです。"]
-                .iter()
-                .map(|s| hilighter.tokenize(s))
-                .collect::<Vec<_>>(),
-        );
+        let encoded = Highlighter::to_semantic_tokens([tokens.clone()]);
         assert!(encoded.len() >= 3);
         assert_eq!(encoded[1].delta_line, 0);
-        assert_eq!(encoded[1].delta_start, 2);
+        assert_eq!(encoded[1].delta_start, 3);
         assert_eq!(encoded[2].delta_line, 0);
-        assert_eq!(encoded[2].delta_start, 1);
+        assert_eq!(encoded[2].delta_start, 5);
     }
 
     #[test]
@@ -330,9 +340,9 @@ mod tests {
                 .map(|s| hilighter.tokenize(s))
                 .collect::<Vec<_>>(),
         );
-        assert!(encoded.len() >= 6);
-        assert_eq!(encoded[5].delta_line, 1);
-        assert_eq!(encoded[5].delta_start, 0);
+        assert!(encoded.len() >= 4);
+        assert_eq!(encoded[3].delta_line, 1);
+        assert_eq!(encoded[3].delta_start, 0);
     }
 
     #[test]
@@ -344,9 +354,9 @@ mod tests {
                 .map(|s| hilighter.tokenize(s))
                 .collect::<Vec<_>>(),
         );
-        assert!(encoded.len() >= 6);
-        assert_eq!(encoded[5].delta_line, 2);
-        assert_eq!(encoded[5].delta_start, 0);
+        assert!(encoded.len() >= 4);
+        assert_eq!(encoded[3].delta_line, 2);
+        assert_eq!(encoded[3].delta_start, 0);
     }
 
     #[test]
@@ -362,5 +372,114 @@ mod tests {
             assert_eq!(src.token_type, out.token_type);
             assert_eq!(src.modifier, out.token_modifiers_bitset);
         }
+    }
+
+    // --- 括弧内モードのテスト ---
+
+    /// 助詞「は」が通常モードでスキップされることを確認するヘルパーテスト。
+    /// "猫は" で形態素解析すると「猫(名詞)」「は(助詞)」に分かれることを利用する。
+    #[test]
+    fn test_particle_ha_is_skipped_outside_bracket() {
+        // 助詞は _ カテゴリ → None → スキップ
+        let h = Highlighter::new();
+        let tokens = h.tokenize("猫は");
+        // 猫 → keyword (名詞), は → スキップ
+        assert_eq!(
+            tokens.len(),
+            1,
+            "猫は should produce 1 token (猫 only, は skipped)"
+        );
+        assert_eq!(tokens[0].token_type, SemanticTokenType::Keyword as u32);
+    }
+
+    #[test]
+    fn test_bracket_open_and_close_are_comment() {
+        // 括弧開・括弧閉自体は括弧外扱いで "comment"
+        let h = Highlighter::new();
+        let tokens = h.tokenize("「テスト」");
+        // [「(comment), テスト(keyword/名詞), 」(comment)]
+        assert_eq!(tokens.len(), 3, "「テスト」 should produce 3 tokens");
+        assert_eq!(
+            tokens[0].token_type,
+            SemanticTokenType::Comment as u32,
+            "括弧開「 should be comment (bracket-external)"
+        );
+        assert_eq!(
+            tokens[1].token_type,
+            SemanticTokenType::Keyword as u32,
+            "テスト(名詞) inside bracket should be keyword"
+        );
+        assert_eq!(
+            tokens[2].token_type,
+            SemanticTokenType::Comment as u32,
+            "括弧閉」 should be comment (bracket-external)"
+        );
+    }
+
+    #[test]
+    fn test_particle_inside_bracket_becomes_string() {
+        // 括弧内では _ カテゴリが "string" になる
+        // "猫は" で「猫(名詞)」「は(助詞)」に分かれる → 括弧内の「は」が string になるか
+        let h = Highlighter::new();
+        let tokens = h.tokenize("「猫は」");
+        // [「(comment), 猫(keyword), は(string), 」(comment)]
+        assert_eq!(tokens.len(), 4, "「猫は」 should produce 4 tokens");
+        assert_eq!(
+            tokens[2].token_type,
+            SemanticTokenType::String as u32,
+            "助詞「は」 inside bracket should be string"
+        );
+    }
+
+    #[test]
+    fn test_bracket_mode_persists_across_tokenize_calls() {
+        // 複数行にまたがる括弧でモードが行をまたいで保持される
+        let h = Highlighter::new();
+        h.tokenize("「猫"); // 括弧開 → depth=1
+        let inside = h.tokenize("猫は"); // 括弧内 → は が "string"
+        // [猫(keyword), は(string)]
+        assert_eq!(
+            inside.len(),
+            2,
+            "猫は inside bracket (cross-line) should produce 2 tokens"
+        );
+        assert_eq!(
+            inside[1].token_type,
+            SemanticTokenType::String as u32,
+            "助詞 should be string when inside bracket across lines"
+        );
+        h.tokenize("」"); // 括弧閉 → depth=0
+        let outside = h.tokenize("猫は"); // 括弧外 → は スキップ
+        assert_eq!(
+            outside.len(),
+            1,
+            "猫は outside bracket should produce 1 token (猫 only)"
+        );
+    }
+
+    #[test]
+    fn test_nested_brackets_depth() {
+        // ネストした括弧でdepthが正しく管理される
+        let h = Highlighter::new();
+        h.tokenize("「"); // depth=1
+        h.tokenize("「"); // depth=2
+        let inner = h.tokenize("猫は"); // depth=2 → は=string
+        assert_eq!(inner.len(), 2, "should be in bracket mode at depth 2");
+        assert_eq!(inner[1].token_type, SemanticTokenType::String as u32);
+        h.tokenize("」"); // depth=1
+        let still_inside = h.tokenize("猫は"); // depth=1 → は=string
+        assert_eq!(
+            still_inside.len(),
+            2,
+            "should still be in bracket mode at depth 1"
+        );
+        assert_eq!(still_inside[1].token_type, SemanticTokenType::String as u32);
+        h.tokenize("」"); // depth=0
+        let outside = h.tokenize("猫は"); // depth=0 → は スキップ
+        assert_eq!(
+            outside.len(),
+            1,
+            "should be outside bracket mode at depth 0"
+        );
     }
 }
