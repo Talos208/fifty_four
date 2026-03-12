@@ -2,7 +2,8 @@ use std::fmt::{Debug, Formatter};
 
 use lindera::mode::Mode;
 use lindera::tokenizer::TokenizerBuilder;
-use tracing::{debug, instrument};
+use log::debug;
+use strum_macros::EnumIter;
 
 /// 会話ハイライト用のトークナイザ・ユーティリティ
 ///
@@ -22,30 +23,34 @@ pub struct SemanticToken {
     pub modifier: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, EnumIter)]
 #[repr(u32)]
 pub enum SemanticTokenType {
-    Comment = 0,
-    String = 1,
-    Keyword = 2,
-    Number = 3,
-    Regexp = 4,
-    Operator = 5,
-    Namespace = 6,
-    Type = 7,
-    Struct = 8,
-    Class = 9,
-    Interface = 10,
-    Enum = 11,
-    TypeParameter = 12,
-    Function = 13,
-    Method = 14,
-    Member = 15,
-    Macro = 16,
-    Variable = 17,
-    Parameter = 18,
-    Property = 19,
-    Label = 20,
+    // LSP 3.17 仕様の SemanticTokenTypes 定義順
+    // https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#semanticTokenTypes
+    Namespace,
+    Type,
+    Class,
+    Enum,
+    Interface,
+    Struct,
+    TypeParameter,
+    Parameter,
+    Variable,
+    Property,
+    EnumMember,
+    Event,
+    Function,
+    Method,
+    Macro,
+    Keyword,
+    Modifier,
+    Comment,
+    String,
+    Number,
+    Regexp,
+    Operator,
+    Decorator,
 
     Undefined = u32::MAX,
 }
@@ -73,31 +78,29 @@ impl SemanticToken {
 
     pub fn kind2token(kind: &str) -> (u32, u32) {
         match kind {
+            "namespace" => (SemanticTokenType::Namespace as u32, 0),
+            "type" => (SemanticTokenType::Type as u32, 0),
+            "class" => (SemanticTokenType::Class as u32, 0),
+            "enum" => (SemanticTokenType::Enum as u32, 0),
+            "interface" => (SemanticTokenType::Interface as u32, 0),
+            "struct" => (SemanticTokenType::Struct as u32, 0),
+            "typeparameter" => (SemanticTokenType::TypeParameter as u32, 0),
+            "parameter" => (SemanticTokenType::Parameter as u32, 0),
+            "variable" => (SemanticTokenType::Variable as u32, 0),
+            "property" => (SemanticTokenType::Property as u32, 0),
+            "enummember" => (SemanticTokenType::EnumMember as u32, 0),
+            "event" => (SemanticTokenType::Event as u32, 0),
+            "function" => (SemanticTokenType::Function as u32, 0),
+            "method" => (SemanticTokenType::Method as u32, 0),
+            "macro" => (SemanticTokenType::Macro as u32, 0),
+            "keyword" => (SemanticTokenType::Keyword as u32, 0),
+            "modifier" => (SemanticTokenType::Modifier as u32, 0),
             "comment" => (SemanticTokenType::Comment as u32, 0),
             "string" => (SemanticTokenType::String as u32, 0),
-            "keyword" => (SemanticTokenType::Keyword as u32, 0),
             "number" => (SemanticTokenType::Number as u32, 0),
             "regexp" => (SemanticTokenType::Regexp as u32, 0),
             "operator" => (SemanticTokenType::Operator as u32, 0),
-
-            "namespace" => (SemanticTokenType::Namespace as u32, 0),
-            "type" => (SemanticTokenType::Type as u32, 0),
-            "struct" => (SemanticTokenType::Struct as u32, 0),
-            "class" => (SemanticTokenType::Class as u32, 0),
-            "interface" => (SemanticTokenType::Interface as u32, 0),
-
-            "enum" => (SemanticTokenType::Enum as u32, 0),
-            "typeParameter" => (SemanticTokenType::TypeParameter as u32, 0),
-            "function" => (SemanticTokenType::Function as u32, 0),
-            "method" => (SemanticTokenType::Method as u32, 0),
-            "member" => (SemanticTokenType::Member as u32, 0),
-
-            "macro" => (SemanticTokenType::Macro as u32, 0),
-            "variable" => (SemanticTokenType::Variable as u32, 0),
-            "parameter" => (SemanticTokenType::Parameter as u32, 0),
-            "property" => (SemanticTokenType::Property as u32, 0),
-            "label" => (SemanticTokenType::Label as u32, 0),
-
+            "decorator" => (SemanticTokenType::Decorator as u32, 0),
             _ => (
                 SemanticTokenType::Undefined as u32,
                 SemanticTokenType::Undefined as u32,
@@ -134,6 +137,11 @@ impl Highlighter {
             tokenizer,
             bracket_depth: std::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    pub fn initialize(&self) {
+        self.bracket_depth
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// テキストを受け取り、ハイライト用トークン列を返す。
@@ -191,9 +199,22 @@ impl Highlighter {
     /// 通常モードでの品詞→トークン種別マッピング
     fn classify_normal(details: &[&str]) -> Option<&'static str> {
         match details[0] {
-            "名詞" => Some("keyword"),
-            "動詞" => Some("variable"),
-            "形容詞" => Some("function"),
+            "名詞" => match details[1..] {
+                ["固有名詞", "人名", "一般"]
+                | ["固有名詞", "人名", "姓"]
+                | ["固有名詞", "人名", "名"] => Some("keyword"),
+
+                ["固有名詞", "組織"] => Some("variable"),
+
+                ["固有名詞", "地域", "一般"] | ["固有名詞", "地域", "国"] => {
+                    Some("function")
+                }
+
+                ["接尾", "サ変接続"] => Some("variable"),
+                _ => None,
+            },
+            // "動詞" => Some("variable"),
+            // "形容詞" => Some("function"),
             "記号" => Some("comment"),
             _ => None,
         }
@@ -202,9 +223,22 @@ impl Highlighter {
     /// 括弧内モードでの品詞→トークン種別マッピング
     fn classify_bracket(details: &[&str]) -> Option<&'static str> {
         match details[0] {
-            "名詞" => Some("keyword"),
-            "動詞" => Some("variable"),
-            "形容詞" => Some("function"),
+            "名詞" => match details[1..] {
+                ["固有名詞", "人名", "一般"]
+                | ["固有名詞", "人名", "姓"]
+                | ["固有名詞", "人名", "名"] => Some("keyword"),
+
+                ["固有名詞", "組織"] => Some("variable"),
+
+                ["固有名詞", "地域", "一般"] | ["固有名詞", "地域", "国"] => {
+                    Some("function")
+                }
+                ["サ変接続"] | ["接尾", "サ変接続"] => Some("string"),
+                _ => Some("decorator"),
+            },
+
+            // "動詞" => Some("variable"),
+            // "形容詞" => Some("function"),
             "記号" => Some("comment"),
             _ => Some("string"),
         }

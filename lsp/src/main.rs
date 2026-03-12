@@ -108,13 +108,31 @@ impl LanguageServer for Backend {
                         semantic_tokens_options: SemanticTokensOptions {
                             // 代表的なトークン種類を列挙しておく（クライアントが期待するため）
                             legend: SemanticTokensLegend {
+                                // LSP 3.17 仕様の SemanticTokenTypes 定義順
                                 token_types: vec![
-                                    SemanticTokenType::COMMENT,
+                                    SemanticTokenType::NAMESPACE,
+                                    SemanticTokenType::TYPE,
+                                    SemanticTokenType::CLASS,
+                                    SemanticTokenType::ENUM,
+                                    SemanticTokenType::INTERFACE,
+                                    SemanticTokenType::STRUCT,
+                                    SemanticTokenType::TYPE_PARAMETER,
+                                    SemanticTokenType::PARAMETER,
+                                    SemanticTokenType::VARIABLE,
+                                    SemanticTokenType::PROPERTY,
+                                    SemanticTokenType::ENUM_MEMBER,
+                                    SemanticTokenType::EVENT,
+                                    SemanticTokenType::FUNCTION,
+                                    SemanticTokenType::METHOD,
+                                    SemanticTokenType::MACRO,
                                     SemanticTokenType::KEYWORD,
+                                    SemanticTokenType::MODIFIER,
+                                    SemanticTokenType::COMMENT,
                                     SemanticTokenType::STRING,
                                     SemanticTokenType::NUMBER,
-                                    SemanticTokenType::FUNCTION,
-                                    SemanticTokenType::VARIABLE,
+                                    SemanticTokenType::REGEXP,
+                                    SemanticTokenType::OPERATOR,
+                                    SemanticTokenType::DECORATOR,
                                 ],
                                 token_modifiers: vec![],
                             },
@@ -208,6 +226,8 @@ impl LanguageServer for Backend {
             .map(|s| s.to_string())
             .collect();
         self.update_all(params.text_document.uri.as_str(), 0, texts);
+
+        let _ = self.client.semantic_tokens_refresh().await;
     }
 
     // #[instrument]
@@ -239,6 +259,8 @@ impl LanguageServer for Backend {
             param.text_document.uri.as_str(),
             param.content_changes.as_ref(),
         );
+
+        let _ = self.client.semantic_tokens_refresh().await;
     }
 
     // #[instrument(ret)]
@@ -271,6 +293,8 @@ impl LanguageServer for Backend {
             .expect("Failed to get text")
             .value()
             .to_vec();
+
+        self.highliter.initialize();
 
         let tokens = text.iter().map(|s| self.highliter.tokenize(s));
 
@@ -378,7 +402,10 @@ impl LanguageServer for Backend {
                 )
                 .await;
 
-            debug!("{}", format!("{:?}", raw).to_string().split_off(30));
+            debug!(
+                "{}",
+                format!("{:?}", raw).chars().take(30).collect::<String>()
+            );
             match raw {
                 Ok(response) => {
                     debug!("raw Ok.");
