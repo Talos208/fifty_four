@@ -24,6 +24,14 @@ use log::{debug, error, info, warn};
 use regex::Regex;
 use rust_embed::Embed;
 use std::ops::{Deref, DerefMut};
+/// 直近のcompletion候補を記録する構造体（デバッグビルドのみ）
+#[cfg(debug_assertions)]
+#[derive(Debug)]
+struct PendingCandidate {
+    db_id: i64,
+    candidate: String,
+}
+
 /// `Backend` はサーバの状態を保持する構造体です。
 ///
 /// 現在は `Client` を保持しており、サーバからクライアントへログや通知を送信する際に使用します。
@@ -40,6 +48,9 @@ struct Backend {
     // 記録用DBへのコネクション
     #[cfg(debug_assertions)]
     conn: Option<std::sync::Mutex<rusqlite::Connection>>,
+    // 直近のcompletion候補（URI, 候補リスト）
+    #[cfg(debug_assertions)]
+    pending_completions: std::sync::Mutex<Option<(String, Vec<PendingCandidate>)>>,
 }
 
 /// `LanguageServer` トレイトの実装。
@@ -234,6 +245,30 @@ impl LanguageServer for Backend {
     async fn did_change(&self, param: DidChangeTextDocumentParams) {
         debug!("did_change");
 
+        #[cfg(debug_assertions)]
+        {
+            let uri = param.text_document.uri.as_str();
+            let taken = self.pending_completions.lock().unwrap().take();
+            if let Some((pending_uri, candidates)) = taken {
+                if pending_uri == uri {
+                    for change in &param.content_changes {
+                        if let Some(c) = candidates.iter().find(|c| c.candidate == change.text) {
+                            if let Some(db) = self.conn.as_ref() {
+                                let db = db.lock().unwrap();
+                                if let Err(e) = db.execute(
+                                    "UPDATE completion_candidates SET selected = true WHERE id = ?;",
+                                    rusqlite::params![c.db_id],
+                                ) {
+                                    debug!("Failed to update completion_candidates: {}", e);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         // 全体が送られて来た時
         if param
             .content_changes
@@ -411,32 +446,38 @@ impl LanguageServer for Backend {
                     debug!("raw Ok.");
                     let cr = Regex::new(r"\r\n|\r|\n").unwrap();
 
+                    #[cfg(debug_assertions)]
+                    let mut pending: Vec<PendingCandidate> = Vec::new();
+
                     let items = cr
                         .split(response.as_str())
-                        .inspect(|i| {
+                        .map(|r| {
                             #[cfg(debug_assertions)]
                             {
                                 if let Some(db) = self.conn.as_ref() {
                                     let db = db.lock().unwrap();
-                                    db.execute(
+                                    match db.query_row(
                                         indoc!(
                                             "INSERT INTO completion_candidates
-                                        (completion_id, rank, candidate)
-                                        VALUES (?,?,?);"
+                                            (completion_id, rank, candidate)
+                                            VALUES (?,?,?) RETURNING id;"
                                         ),
-                                        rusqlite::params![completion_id, 0, i],
-                                    )
-                                    .unwrap_or_else(|err| {
-                                        debug!("Failed to insert completion_candidate: {}", err);
-                                        0
-                                    });
+                                        rusqlite::params![completion_id, 0, r],
+                                        |row| row.get::<_, i64>(0),
+                                    ) {
+                                        Ok(id) => pending.push(PendingCandidate {
+                                            db_id: id,
+                                            candidate: r.to_string(),
+                                        }),
+                                        Err(err) => {
+                                            debug!("Failed to insert completion_candidate: {}", err)
+                                        }
+                                    }
                                 }
                             }
-                        })
-                        .map(|r| {
-                            if r.len() > 20 {
+                            if r.chars().count() > 20 {
                                 CompletionItem {
-                                    label: r.chars().take(18).collect::<String>() + "…",
+                                    label: r.chars().take(18).collect::<String>() + "……",
                                     kind: Some(CompletionItemKind::TEXT),
                                     documentation: Some(Documentation::MarkupContent(
                                         MarkupContent {
@@ -456,6 +497,12 @@ impl LanguageServer for Backend {
                             }
                         })
                         .collect();
+
+                    #[cfg(debug_assertions)]
+                    {
+                        *self.pending_completions.lock().unwrap() =
+                            Some((uri.to_string(), pending));
+                    }
                     let list = CompletionList {
                         is_incomplete: false,
                         items,
@@ -666,6 +713,8 @@ async fn main() {
         llm: tokio::sync::Mutex::new(none),
         highliter: Highlighter::new(),
         conn,
+        #[cfg(debug_assertions)]
+        pending_completions: std::sync::Mutex::new(None),
     })
     .finish();
 
