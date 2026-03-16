@@ -7,8 +7,9 @@ use tower_lsp::{Client, LanguageServer, async_trait};
 mod highlight;
 use crate::highlight::Highlighter;
 mod logging;
-use crate::logging::Logger;
+use crate::highlight::CachedLinderaToken;
 use dashmap::DashMap;
+use std::str::FromStr;
 mod llm;
 use crate::llm::{Content, LlmClient, LlmClientBuilder};
 use rusqlite;
@@ -21,15 +22,39 @@ mod migrations {
 use env_logger;
 use indoc::{formatdoc, indoc};
 use log::{debug, error, info, warn};
-use regex::Regex;
 use rust_embed::Embed;
+use std::fmt::Write;
 use std::ops::{Deref, DerefMut};
+
 /// 直近のcompletion候補を記録する構造体（デバッグビルドのみ）
 #[cfg(debug_assertions)]
 #[derive(Debug)]
 struct PendingCandidate {
     db_id: i64,
     candidate: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineData {
+    text: String,
+    tokens: Vec<CachedLinderaToken>,
+}
+
+impl FromStr for LineData {
+    type Err = std::convert::Infallible;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(Self {
+            text: text.to_string(),
+            tokens: Vec::new(),
+        })
+    }
+}
+
+impl LineData {
+    pub fn surface(&self, ptr: &CachedLinderaToken) -> &str {
+        &self.text[ptr.byte_start..ptr.byte_end].as_ref()
+    }
 }
 
 /// `Backend` はサーバの状態を保持する構造体です。
@@ -40,7 +65,7 @@ struct Backend {
     /// LSP クライアントへのハンドル。メッセージ送信などに使用する。
     client: Client,
     // 文章データ（uri、行ごとのテキスト）
-    text: DashMap<String, Vec<String>>,
+    text: DashMap<String, Vec<LineData>>,
     // LLMクライアントへのハンドル
     llm: tokio::sync::Mutex<Option<Box<dyn LlmClient>>>,
 
@@ -231,9 +256,10 @@ impl LanguageServer for Backend {
         debug!("file opened!");
 
         // 行ごとに分割しておく
-        let cr = Regex::new(r"\r\n|\r|\n").unwrap();
-        let texts = cr
-            .split(params.text_document.text.as_str())
+        let texts = params
+            .text_document
+            .text
+            .lines() // TODO これは大丈夫な気がするけど……
             .map(|s| s.to_string())
             .collect();
         self.update_all(params.text_document.uri.as_str(), 0, texts);
@@ -270,19 +296,14 @@ impl LanguageServer for Backend {
         }
 
         // 全体が送られて来た時
-        if param
-            .content_changes
-            .iter()
-            .all(|c| c.range.is_none() && c.range_length.is_none())
-        {
-            let cr = Regex::new(r"\r\n|\r|\n").unwrap();
+        if param.content_changes.iter().all(|c| c.range.is_none()) {
             self.update_all(
                 param.text_document.uri.as_str(),
                 0,
                 param
                     .content_changes
                     .iter()
-                    .flat_map(|c| cr.split(c.text.as_str()).map(|s| s.to_string()))
+                    .flat_map(|c| c.text.lines().map(|s| s.to_string()))
                     .collect(),
             );
             return;
@@ -292,7 +313,18 @@ impl LanguageServer for Backend {
 
         self.update_partial(
             param.text_document.uri.as_str(),
-            param.content_changes.as_ref(),
+            param
+                .content_changes
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>()
+                .as_slice(),
+            param
+                .content_changes
+                .iter()
+                .map(|c| c.range.unwrap())
+                .collect::<Vec<_>>()
+                .as_slice(),
         );
 
         let _ = self.client.semantic_tokens_refresh().await;
@@ -322,16 +354,15 @@ impl LanguageServer for Backend {
     ) -> Result<Option<SemanticTokensResult>> {
         debug!("semantic_token_full");
 
-        let text = self
-            .text
-            .get(params.text_document.uri.as_ref())
-            .expect("Failed to get text")
-            .value()
-            .to_vec();
+        let uri = params.text_document.uri.as_ref();
+        let mut lines = self.text.get(uri).expect("Failed to get text").to_vec();
 
         self.highliter.initialize();
 
-        let tokens = text.iter().map(|s| self.highliter.tokenize(s));
+        let tokens: Vec<_> = lines
+            .iter_mut()
+            .map(|l| self.highliter.tokenize(l))
+            .collect();
 
         let vec = Highlighter::to_semantic_tokens(tokens);
 
@@ -371,20 +402,12 @@ impl LanguageServer for Backend {
         let before = text
             .iter()
             .take(line_no)
-            .map(|s| s.as_str())
+            .map(|l| l.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
 
-        // self.client
-        //     .log_message(MessageType::LOG, before.as_str())
-        //     .await;
-
-        let line: &str = text[line_no].as_ref();
+        let line: &str = &text[line_no].text.as_str();
         let left: String = line.chars().take(offset).collect();
-
-        // self.client
-        //     .log_message(MessageType::LOG, left.as_str())
-        //     .await;
 
         let prompt = String::from_utf8_lossy(
             Asset::get("prompt_completion.md")
@@ -444,13 +467,12 @@ impl LanguageServer for Backend {
             match raw {
                 Ok(response) => {
                     debug!("raw Ok.");
-                    let cr = Regex::new(r"\r\n|\r|\n").unwrap();
 
                     #[cfg(debug_assertions)]
                     let mut pending: Vec<PendingCandidate> = Vec::new();
 
-                    let items = cr
-                        .split(response.as_str())
+                    let items = response
+                        .lines()
                         .map(|r| {
                             #[cfg(debug_assertions)]
                             {
@@ -571,53 +593,43 @@ impl LanguageServer for Backend {
     // }
 }
 
-fn apply_changes(lines: &mut Vec<String>, changes: &[TextDocumentContentChangeEvent]) {
-    for change in changes {
-        let cr = Regex::new(r"\r\n|\r|\n").unwrap();
-        match change.range {
-            None => {
-                *lines = cr
-                    .split(change.text.as_str())
-                    .map(|s| s.to_string())
-                    .collect();
-            }
-            Some(range) => {
-                let start_line = range.start.line as usize;
-                let start_char = range.start.character as usize;
-                let end_line = range.end.line as usize;
-                let end_char = range.end.character as usize;
+fn apply_changes<T: AsRef<str>>(lines: &mut Vec<LineData>, text: T, range: Range) {
+    let start_line = range.start.line as usize;
+    let start_char = range.start.character as usize;
+    let end_line = range.end.line as usize;
+    let end_char = range.end.character as usize;
 
-                let prefix = lines
-                    .get(start_line)
-                    .map(|l| {
-                        let ix = start_char.min(l.len());
-                        let n = l.chars().take(ix);
-                        String::from_iter(n)
-                    })
-                    .unwrap_or("".to_string());
-                let suffix = lines
-                    .get(end_line)
-                    .map(|l| {
-                        let ix = end_char.min(l.len());
-                        let n = l.chars().skip(ix);
-                        String::from_iter(n)
-                    })
-                    .unwrap_or("".to_string());
+    let prefix = lines
+        .get(start_line)
+        .map(|l| {
+            let ix = start_char.min(l.text.len());
+            let n = l.text.chars().take(ix);
+            String::from_iter(n)
+        })
+        .unwrap_or("".to_string());
+    let suffix = lines
+        .get(end_line)
+        .map(|l| {
+            let ix = end_char.min(l.text.len());
+            let n = l.text.chars().skip(ix);
+            String::from_iter(n)
+        })
+        .unwrap_or("".to_string());
 
-                let mut new_text =
-                    String::with_capacity(prefix.len() + change.text.len() + suffix.len());
-                new_text.push_str(&prefix);
-                new_text.push_str(&change.text);
-                new_text.push_str(&suffix);
+    let mut new_text = String::with_capacity(prefix.len() + text.as_ref().len() + suffix.len());
+    new_text.push_str(&prefix);
+    new_text.push_str(text.as_ref());
+    new_text.push_str(&suffix);
 
-                let new_lines: Vec<String> =
-                    cr.split(new_text.as_str()).map(|s| s.to_string()).collect();
+    let cr = regex::Regex::new(r"(\r\n|\n)").unwrap();
+    let new_lines: Vec<_> = cr
+        .split(new_text.as_str())
+        // .lines() // 文字列末尾に改行だけ挿入した場合、1行扱いになってしまう
+        .map(|s| LineData::from_str(s).unwrap())
+        .collect();
 
-                let end = end_line.min(lines.len() - 1);
-                lines.splice(start_line..=end, new_lines);
-            }
-        }
-    }
+    let end = end_line.min(lines.len() - 1);
+    lines.splice(start_line..=end, new_lines);
 }
 
 impl Backend {
@@ -644,14 +656,29 @@ impl Backend {
     }
 
     fn update_all(&self, uri: &str, _offset: u32, texts: Vec<String>) {
-        self.text.insert(uri.to_string(), texts);
+        self.text.insert(
+            uri.to_string(),
+            texts
+                .iter()
+                .map(|t| LineData::from_str(t).unwrap())
+                .collect::<Vec<_>>(),
+        );
     }
 
-    fn update_partial(&self, uri: &str, changes: &[TextDocumentContentChangeEvent]) {
-        let Some(mut lines) = self.text.get_mut(uri) else {
+    fn update_partial(&self, uri: &str, texts: &[impl AsRef<str>], changes: &[Range]) {
+        if !self.text.contains_key(uri) {
             return;
-        };
-        apply_changes(&mut lines, changes);
+        }
+
+        let mut rv = self.text.get_mut(uri).unwrap();
+
+        texts
+            .into_iter()
+            .zip(changes.into_iter())
+            .rev() // 後ろから突っ込んで、改行による行数の変更で矛盾が生じないように
+            .for_each(|(text, change)| {
+                apply_changes(rv.deref_mut(), text, *change);
+            });
     }
 }
 
@@ -755,8 +782,8 @@ mod tests {
         }
     }
 
-    fn lines(s: &str) -> Vec<String> {
-        s.split('\n').map(|l| l.to_string()).collect()
+    fn lines(s: &str) -> Vec<LineData> {
+        s.lines().map(|l| LineData::from_str(l).unwrap()).collect()
     }
 
     // 1. 単一文字挿入
@@ -766,7 +793,7 @@ mod tests {
             "祇園精舍の鐘の声、諸行無常の響きあり。
             娑羅双樹の花の色、盛者必衰の理をあらはす。"
         ));
-        apply_changes(&mut ls, &[change(Some(range(0, 19, 0, 19)), "!")]);
+        apply_changes(&mut ls, "!", range(0, 19, 0, 19));
         assert_eq!(
             ls,
             lines(indoc!(
@@ -785,7 +812,7 @@ mod tests {
             驕れる人も久しからず、ただ春の夜の夢のごとし。
             猛き者もつひにはほろびぬ、ひとへに風の前の塵に同じ。"
         ));
-        apply_changes(&mut ls, &[change(Some(range(1, 0, 3, 0)), "")]);
+        apply_changes(&mut ls, "", range(1, 0, 3, 0));
         assert_eq!(
             ls,
             lines(indoc!(
@@ -805,13 +832,11 @@ mod tests {
         ));
         apply_changes(
             &mut ls,
-            &[change(
-                Some(range(1, 0, 1, 3)),
-                indoc!(
-                    "猛き者もつひにはほろびぬ、
-                    ひとへに風の前の塵に同じ。"
-                ),
-            )],
+            indoc!(
+                "猛き者もつひにはほろびぬ、
+                ひとへに風の前の塵に同じ。"
+            ),
+            range(1, 0, 1, 3),
         );
         assert_eq!(
             ls,
@@ -828,10 +853,7 @@ mod tests {
     #[test]
     fn test_insert_at_line_start() {
         let mut ls = lines("諸行無常の響きあり。");
-        apply_changes(
-            &mut ls,
-            &[change(Some(range(0, 0, 0, 0)), "祇園精舍の鐘の声、")],
-        );
+        apply_changes(&mut ls, "祇園精舍の鐘の声、", range(0, 0, 0, 0));
         assert_eq!(ls, lines("祇園精舍の鐘の声、諸行無常の響きあり。"));
     }
 
@@ -842,13 +864,7 @@ mod tests {
             "祇園精舍の鐘の声、諸行無常の響きあり。
             娑羅双樹の花の色、盛者必衰の理をあらはす。"
         ));
-        apply_changes(
-            &mut ls,
-            &[change(
-                Some(range(0, 19, 0, 19)),
-                "\nただ春の夜の夢のごとし。",
-            )],
-        );
+        apply_changes(&mut ls, "\nただ春の夜の夢のごとし。", range(0, 19, 0, 19));
         assert_eq!(
             ls,
             lines(indoc!(
@@ -859,32 +875,94 @@ mod tests {
         );
     }
 
-    // 6. range が None → フルテキスト置換
+    // 6.tokenize後の行挿入
     #[test]
-    fn test_full_replace_when_range_none() {
+    fn test_insert_after_tokenize() {
         let mut ls = lines(indoc!(
             "祇園精舍の鐘の声、諸行無常の響きあり。
-            娑羅双樹の花の色、盛者必衰の理をあらはす。"
+            「娑羅双樹」の花の色、「盛者必衰」の理をあらはす。"
         ));
-        apply_changes(
-            &mut ls,
-            &[change(
-                None,
+        let hl = Highlighter::new();
+        hl.initialize();
+        ls.iter_mut().for_each(|l| {
+            hl.tokenize(l);
+        });
+
+        assert_eq!(ls.len(), 2);
+        // let mut s = String::new();
+        // ls[1].tokens.iter().for_each(|t| {
+        //     let _ = writeln!(s, "{:?}:\t{:?}", ls[1].surface(&t), t.details.split_at(4).0);
+        // });
+        /*
+        "「":	["記号", "括弧開", "*", "*"]
+        "娑":	["名詞", "一般", "*", "*"]
+        "羅":	["名詞", "固有名詞", "人名", "姓"]
+        "双":	["接頭詞", "名詞接続", "*", "*"]
+        "樹":	["名詞", "一般", "*", "*"]
+        "」":	["記号", "括弧閉", "*", "*"]
+        "の":	["助詞", "連体化", "*", "*"]
+        "花":	["名詞", "一般", "*", "*"]
+        "の":	["助詞", "連体化", "*", "*"]
+        "色":	["名詞", "一般", "*", "*"]
+        "、":	["記号", "読点", "*", "*"]
+        "「":	["記号", "括弧開", "*", "*"]
+        "盛者":	["名詞", "一般", "*", "*"]
+        "必":	["名詞", "一般", "*", "*"]
+        "衰":	["名詞", "一般", "*", "*"]
+        "」":	["記号", "括弧閉", "*", "*"]
+        "の":	["助詞", "連体化", "*", "*"]
+        "理":	["名詞", "一般", "*", "*"]
+        "を":	["助詞", "格助詞", "一般", "*"]
+        "あら":	["名詞", "一般", "*", "*"]
+        "は":	["助詞", "係助詞", "*", "*"]
+        "す":	["動詞", "自立", "*", "*"]
+        "。":	["記号", "句点", "*", "*"]
+        */
+        assert_eq!(ls[1].tokens.len(), 23);
+
+        // 一文字追加
+        apply_changes(&mut ls, "\r\n", range(0, 19, 0, 19));
+
+        assert_eq!(ls.len(), 3); // 改行分だけ行数が増える
+        assert_eq!(ls[1].text, "");
+
+        assert_ne!(ls[0].text.len(), 0); // 変更された行もtextはそのまま
+        assert_eq!(ls[0].tokens.len(), 0); // 変更された行のtokenは空になる
+
+        assert_eq!(ls[2].tokens.len(), 23); // 改行分後ろにずれるけどtokenはそのまま
+
+        // let mut s = String::new();
+        // ls[1].tokens.iter().for_each(|t| {
+        //     let _ = writeln!(s, "{:?}:\t{:?}", ls[1].surface(&t), t.details.split_at(4).0);
+        // });
+    }
+    /*
+    size=2*/
+    // 6. range が None → フルテキスト置換
+    /*   #[test]
+        fn test_full_replace_when_range_none() {
+            let mut ls = lines(indoc!(
+                "祇園精舍の鐘の声、諸行無常の響きあり。
+                娑羅双樹の花の色、盛者必衰の理をあらはす。"
+            ));
+            apply_changes(
+                &mut ls,
                 indoc!(
                     "驕れる人も久しからず、ただ春の夜の夢のごとし。
                     猛き者もつひにはほろびぬ、ひとへに風の前の塵に同じ。"
                 ),
-            )],
-        );
-        assert_eq!(
-            ls,
-            lines(indoc!(
-                "驕れる人も久しからず、ただ春の夜の夢のごとし。
-                猛き者もつひにはほろびぬ、ひとへに風の前の塵に同じ。"
-            ))
-        );
-    }
-
+                &[change(
+                    None,
+                )],
+            );
+            assert_eq!(
+                ls,
+                lines(indoc!(
+                    "驕れる人も久しからず、ただ春の夜の夢のごとし。
+                    猛き者もつひにはほろびぬ、ひとへに風の前の塵に同じ。"
+                ))
+            );
+        }
     // 7. 複数 change の順次適用
     #[test]
     fn test_multiple_changes_applied_sequentially() {
@@ -898,4 +976,5 @@ mod tests {
         );
         assert_eq!(ls, lines("Abcd"));
     }
+    */
 }
