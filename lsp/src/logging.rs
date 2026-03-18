@@ -1,11 +1,13 @@
 use std::env;
 
+#[allow(unused)]
 pub struct Logger {
     pub tracer_provider: Option<SdkTracerProvider>,
     pub tracer: Option<BoxedTracer>,
     pub logger_provider: Option<SdkLoggerProvider>,
 }
 
+#[allow(unused)]
 impl Logger {
     pub fn new() -> Self {
         if true {
@@ -21,6 +23,7 @@ impl Logger {
     }
 }
 
+#[allow(unused)]
 fn prepare_env_logger() {
     // In debug mode, default to info level if RUST_LOG is not set
     let mut lb = if env::var("RUST_LOG").is_err() {
@@ -28,7 +31,7 @@ fn prepare_env_logger() {
     } else {
         env_logger::Builder::from_env("RUST_LOG")
     };
-    if env::var("G_SYNC_DEBUG").is_ok() {
+    if env::var("FIFTY_FOUR_DEBUG").is_ok() {
         lb.filter_level(log::LevelFilter::Trace)
             .format_timestamp_millis()
             .format_module_path(true);
@@ -38,18 +41,19 @@ fn prepare_env_logger() {
 
 use opentelemetry::KeyValue;
 use opentelemetry::global::{self, BoxedTracer};
-use opentelemetry::logs::{LoggerProvider, NoopLoggerProvider};
-use opentelemetry::trace::TracerProvider;
-use opentelemetry_appender_log::OpenTelemetryLogBridge;
+// use opentelemetry::logs::{LoggerProvider, NoopLoggerProvider};
+// use opentelemetry::trace::TracerProvider;
+// use opentelemetry_appender_log::OpenTelemetryLogBridge;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
+#[allow(unused_imports)]
 use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
-use opentelemetry_stdout::{LogExporter, SpanExporter};
+// use opentelemetry_stdout::{LogExporter, SpanExporter};
 use tracing::debug;
-use tracing::instrument::WithSubscriber;
+// use tracing::instrument::WithSubscriber;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -68,6 +72,7 @@ impl Drop for Logger {
     }
 }
 
+#[allow(unused)]
 fn prepare_tracing() -> Logger {
     let span_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()

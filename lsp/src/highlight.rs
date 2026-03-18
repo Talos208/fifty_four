@@ -5,7 +5,7 @@ use lindera::mode::Mode;
 use lindera::tokenizer::TokenizerBuilder;
 use strum_macros::EnumIter;
 
-use crate::LineData;
+use crate::types::{CachedLinderaToken, LineData, TokenStatus};
 
 /// 会話ハイライト用のトークナイザ・ユーティリティ
 ///
@@ -63,6 +63,7 @@ pub enum SemanticTokenType {
 
 impl SemanticToken {
     /// 新しいトークンを作成する簡易コンストラクタ
+    #[allow(dead_code)]
     pub fn new(start: u32, length: u32, token_type: u32, modifier: u32) -> Self {
         Self {
             start,
@@ -115,23 +116,6 @@ impl SemanticToken {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenStatus {
-    Normal,
-    InBracket,
-}
-
-/// Linderaトークンの必要情報をOwned形式でキャッシュするための型。
-/// tagはclassify_cached_tokens()によって設定される。
-#[derive(Debug, Clone, PartialEq)]
-pub struct CachedLinderaToken {
-    /// 品詞情報（details[0]="名詞", details[1]="固有名詞", ...）
-    pub details: Vec<String>,
-    pub byte_start: usize,
-    pub byte_end: usize,
-    pub tag: TokenStatus,
-}
-
 // #[derive(Debug)]
 pub struct Highlighter {
     tokenizer: lindera::tokenizer::Tokenizer,
@@ -177,13 +161,12 @@ impl Highlighter {
     ///
     /// Lindera を用いて形態素解析を行い、語種に基づくトークン種別を生成します。
     pub fn tokenize(&self, line: &mut LineData) -> Vec<SemanticToken> {
-        let lindera_tokens = if line.tokens.is_empty() {
-            // self.lindera_tokenize(line)
-            let tkn = self
+        // 遅延解析
+        if line.tokens.is_empty() {
+            line.tokens = self
                 .tokenizer
                 .tokenize(line.text.as_str())
-                .expect("failed to tokenize text");
-            let mut tkn = tkn
+                .expect("failed to tokenize text")
                 .into_iter()
                 .map(|mut t| CachedLinderaToken {
                     details: t.details().iter().map(|s| s.to_string()).collect(),
@@ -191,20 +174,12 @@ impl Highlighter {
                     byte_end: t.byte_end,
                     tag: TokenStatus::Normal,
                 })
-                .collect::<Vec<_>>();
-
-            line.tokens = tkn.clone();
-
-            tkn
-        } else {
-            line.tokens.clone()
+                .collect();
         };
 
         let mut result = Vec::new();
-        for (ix, token) in lindera_tokens.iter().enumerate() {
+        line.tokens.iter_mut().for_each(|token| {
             let details = token.details.clone();
-
-            let mut tag = TokenStatus::Normal;
 
             // 括弧開閉はモード dispatch の外で処理する（常に括弧外扱い）。
             // 括弧開: kind確定("comment") → depth加算（自身はまだ外側）
@@ -212,24 +187,26 @@ impl Highlighter {
             // それ以外: 現在のdepthでモードを決定し classify へ委譲
             let kind = match (details[0].as_str(), details.get(1).map(|d| d.as_str())) {
                 ("記号", Some("括弧開")) => {
-                    self.bracket_depth.fetch_add(1, Relaxed);
+                    let d = self.bracket_depth.load(Relaxed);
+                    if d > 0 {
+                        token.tag = TokenStatus::InBracket;
+                    }
+                    self.bracket_depth.store(d + 1, Relaxed);
                     Some("comment")
                 }
                 ("記号", Some("括弧閉")) => {
-                    let d = self.bracket_depth.load(Relaxed);
-                    self.bracket_depth.store(d.saturating_sub(1), Relaxed);
+                    let d = self.bracket_depth.load(Relaxed).saturating_sub(1);
+                    self.bracket_depth.store(d, Relaxed);
+                    if d > 0 {
+                        token.tag = TokenStatus::InBracket;
+                    }
                     Some("comment")
                 }
-                _ => {
-                    if self.bracket_depth.load(Relaxed) > 0 {
-                        if let Some(t) = line.tokens.get_mut(ix) {
-                            t.tag = TokenStatus::InBracket;
-                        }
-                        Self::classify_bracket(&details)
-                    } else {
-                        Self::classify_normal(&details)
-                    }
+                _ if self.bracket_depth.load(Relaxed) > 0 => {
+                    token.tag = TokenStatus::InBracket;
+                    Self::classify_bracket(&details)
                 }
+                _ => Self::classify_normal(&details),
             };
 
             if let Some(k) = kind {
@@ -241,7 +218,7 @@ impl Highlighter {
 
                 result.push(SemanticToken::from_kind(start as u32, length as u32, k));
             }
-        }
+        });
 
         result
     }
@@ -490,7 +467,8 @@ mod tests {
     fn test_bracket_open_and_close_are_comment() {
         // 括弧開・括弧閉自体は括弧外扱いで "comment"
         let h = Highlighter::new();
-        let tokens = h.tokenize(&mut LineData::from_str("「テスト」").unwrap());
+        let mut l = LineData::from_str("「テスト」").unwrap();
+        let tokens = h.tokenize(&mut l);
         // [「(comment), テスト(keyword/名詞), 」(comment)]
         assert_eq!(tokens.len(), 3, "「テスト」 should produce 3 tokens");
         assert_eq!(
@@ -499,14 +477,29 @@ mod tests {
             "括弧開「 should be comment (bracket-external)"
         );
         assert_eq!(
+            l.tokens[0].tag,
+            TokenStatus::Normal,
+            "括弧開「 should be out of bracket"
+        );
+        assert_eq!(
             tokens[1].token_type,
             SemanticTokenType::Decorator as u32,
             "テスト(名詞) inside bracket should be keyword"
         );
         assert_eq!(
+            l.tokens[1].tag,
+            TokenStatus::InBracket,
+            "テスト(名詞) should be inside bracket"
+        );
+        assert_eq!(
             tokens[2].token_type,
             SemanticTokenType::Comment as u32,
             "括弧閉」 should be comment (bracket-external)"
+        );
+        assert_eq!(
+            l.tokens[2].tag,
+            TokenStatus::Normal,
+            "括弧閉」 should be out of bracket"
         );
     }
 

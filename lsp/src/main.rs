@@ -1,30 +1,32 @@
 // シンプルな LSP サーバの実装例（tower-lsp を利用）
 // このファイルは最小限の動作をする "何もしない" サーバを提供します。
-use tower_lsp::jsonrpc::{Error, ErrorCode, Result};
+use tower_lsp::jsonrpc::{ErrorCode, Result};
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, async_trait};
 // use tracing::{debug, info, instrument, span, warn};
 mod highlight;
 use crate::highlight::Highlighter;
 mod logging;
-use crate::highlight::CachedLinderaToken;
+mod types;
+use crate::types::{CursorContext, LineData};
 use dashmap::DashMap;
 use std::str::FromStr;
+mod cursor_context;
 mod llm;
 use crate::llm::{Content, LlmClient, LlmClientBuilder};
 use rusqlite;
 use std::panic;
-use std::path::{Display, Path, PathBuf};
+use std::path::Path;
 mod migrations {
     use refinery::embed_migrations;
     embed_migrations!("migrations");
 }
 use env_logger;
-use indoc::{formatdoc, indoc};
+use indoc::indoc;
+#[allow(unused_imports)]
 use log::{debug, error, info, warn};
 use rust_embed::Embed;
-use std::fmt::Write;
-use std::ops::{Deref, DerefMut};
+use std::ops::DerefMut;
 
 /// 直近のcompletion候補を記録する構造体（デバッグビルドのみ）
 #[cfg(debug_assertions)]
@@ -32,29 +34,6 @@ use std::ops::{Deref, DerefMut};
 struct PendingCandidate {
     db_id: i64,
     candidate: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct LineData {
-    text: String,
-    tokens: Vec<CachedLinderaToken>,
-}
-
-impl FromStr for LineData {
-    type Err = std::convert::Infallible;
-
-    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
-        Ok(Self {
-            text: text.to_string(),
-            tokens: Vec::new(),
-        })
-    }
-}
-
-impl LineData {
-    pub fn surface(&self, ptr: &CachedLinderaToken) -> &str {
-        &self.text[ptr.byte_start..ptr.byte_end].as_ref()
-    }
 }
 
 /// `Backend` はサーバの状態を保持する構造体です。
@@ -221,34 +200,20 @@ impl LanguageServer for Backend {
     /*
        #[instrument(ret)]
        async fn did_change_configuration(&self, param: DidChangeConfigurationParams) {
-           self.client
-               .log_message(MessageType::INFO, "did_change_configuration")
-               .await;
-           self.client
-               .log_message(
-                   MessageType::INFO,
-                   format!("{:?}", param.settings.as_object()),
-               )
-               .await;
+           info!("did_change_configuration: {:?}", param.settings);
 
            // エディタ側の設定を読む
-           /*
            let params = vec![ConfigurationItem {
                scope_uri: None,
                section: Some("settings".to_string()),
            }];
 
-           let mut msg = vec![];
+           debug!("client.configuration");
            let _ = self.client.configuration(params).await.map(|i| {
-               i.iter().for_each(|j| {
-                   msg.push(format!("{:?}", j));
-                   ()
+               i.iter().inspect(|j| {
+                   debug!("\t{:?}", j);
                });
            });
-           self.client
-               .log_message(MessageType::INFO, msg.join("\n"))
-               .await;
-               */
        }
     */
     // #[instrument(ret)]
@@ -395,7 +360,7 @@ impl LanguageServer for Backend {
         }
 
         let uri = params.text_document_position.text_document.uri.as_str();
-        let text = self.text.get(uri).unwrap().value().to_owned();
+        let mut text = self.text.get(uri).unwrap().value().to_owned();
         let line_no = params.text_document_position.position.line as usize;
         let offset = params.text_document_position.position.character as usize;
 
@@ -409,9 +374,15 @@ impl LanguageServer for Backend {
         let line: &str = &text[line_no].text.as_str();
         let left: String = line.chars().take(offset).collect();
 
+        // カーソルコンテキスト分類
+        let context =
+            cursor_context::classify_complesion_mode(&mut text, line_no, offset, &self.highliter);
+        debug!("CursorContext: {:?}", context);
+
+        let prompt_file = Backend::ctx_to_prompt_name(context);
         let prompt = String::from_utf8_lossy(
-            Asset::get("prompt_completion.md")
-                .expect("prompt_completion.md not found")
+            Asset::get(prompt_file)
+                .unwrap_or_else(|| panic!("{} not found", prompt_file))
                 .data
                 .as_ref(),
         )
@@ -680,6 +651,17 @@ impl Backend {
                 apply_changes(rv.deref_mut(), text, *change);
             });
     }
+
+    fn ctx_to_prompt_name(ctx: CursorContext) -> &'static str {
+        match ctx {
+            CursorContext::AfterClosingBracket => "prompt_completion_after_bracket.md",
+            CursorContext::AfterSentenceEnd => "prompt_completion_after_sentence.md",
+            CursorContext::BeforeClosingBracket => "prompt_completion_before_bracket.md",
+            CursorContext::EmptyBracket => "prompt_completion_empty_bracket.md",
+            CursorContext::InBracketOther => "prompt_completion_in_bracket.md",
+            CursorContext::Other => "prompt_completion.md",
+        }
+    }
 }
 
 #[derive(Embed)]
@@ -759,15 +741,7 @@ async fn main() {
 mod tests {
     use super::*;
     use indoc::indoc;
-    use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
-
-    fn change(range: Option<Range>, text: &str) -> TextDocumentContentChangeEvent {
-        TextDocumentContentChangeEvent {
-            range,
-            range_length: None,
-            text: text.to_string(),
-        }
-    }
+    use tower_lsp::lsp_types::{Position, Range};
 
     fn range(sl: u32, sc: u32, el: u32, ec: u32) -> Range {
         Range {

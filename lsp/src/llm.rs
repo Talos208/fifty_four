@@ -4,6 +4,7 @@ use genai::adapter::AdapterKind;
 use genai::chat::{ChatMessage, ChatOptions, ChatRequest};
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ModelName, ServiceTarget};
+#[allow(unused_imports)]
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::error::Error;
@@ -37,6 +38,7 @@ impl Provider {
         }
     }
 
+    #[allow(unused)]
     pub fn from_name(name: &str) -> Result<Self, String> {
         let (mut prov, model) = if let Some((prov, model)) = name.split_once('/') {
             (prov, model)
@@ -75,6 +77,7 @@ impl Provider {
         }
     }
 
+    #[allow(unused)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Provider::Google(s) => write!(f, "Google({})", s.to_string()),
@@ -105,6 +108,7 @@ impl Provider {
 /// これにより、具体的なLLMプロバイダ（Google, OpenAIなど）の実装を
 /// アプリケーションのコアロジックから切り離すことができます。
 #[derive(Debug, Clone)]
+#[allow(unused)]
 pub enum Content {
     Text(String),
     CacheEntry(String),
@@ -129,6 +133,7 @@ impl AsRef<String> for Content {
 }
 
 #[async_trait]
+#[allow(unused)]
 pub trait LlmClient: Send + Sync + std::fmt::Debug {
     //+ MaybeUninit {
     /// LLMとチャットセッションを実行する
@@ -179,6 +184,7 @@ pub struct LlmClientBuilder {
 
 impl LlmClientBuilder {
     /// LLMビルダーを構築する
+    #[allow(unused)]
     fn new(_provider: Provider) -> LlmClientBuilder {
         LlmClientBuilder {
             provider: _provider.clone(),
@@ -187,6 +193,7 @@ impl LlmClientBuilder {
         }
     }
 
+    #[allow(unused)]
     pub fn from_name(name: &str) -> Self {
         LlmClientBuilder {
             provider: Provider::from_name(name).unwrap(),
