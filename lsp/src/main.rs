@@ -16,7 +16,7 @@ mod cursor_context;
 mod llm;
 use crate::llm::{Content, LlmClient, LlmClientBuilder};
 use std::panic;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 mod migrations {
     use refinery::embed_migrations;
     embed_migrations!("migrations");
@@ -36,6 +36,154 @@ struct PendingCandidate {
     candidate: String,
 }
 
+/// デバッグビルド専用のDB操作をカプセル化する構造体
+#[cfg(debug_assertions)]
+#[derive(Debug)]
+struct CompletionDb {
+    conn: std::sync::Mutex<rusqlite::Connection>,
+    pending_completions: std::sync::Mutex<Option<(String, Vec<PendingCandidate>)>>,
+}
+
+#[cfg(debug_assertions)]
+impl CompletionDb {
+    fn new(path: &PathBuf) -> Self {
+        // マイグレーションも済ませてしまう
+        let mut c = rusqlite::Connection::open(path).expect("Fail to open database");
+        match migrations::migrations::runner().run(&mut c) {
+            Ok(_) => {}
+            Err(e) => {
+                panic!("Fail to migrate: {:?}", e);
+            }
+        }
+
+        Self {
+            conn: std::sync::Mutex::new(c),
+            pending_completions: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// INSERT INTO completions ... RETURNING id。失敗時は 0 を返す。
+    fn record_completion(
+        &self,
+        uri: &str,
+        line_no: usize,
+        offset: usize,
+        model: &str,
+        prompt: &str,
+    ) -> u32 {
+        let db = self.conn.lock().unwrap();
+        match db.query_row(
+            indoc!(
+                "INSERT INTO completions
+                (document_uri, cursor_line, cursor_character, model_name, prompt)
+                VALUES (?,?,?,?,?) RETURNING id;"
+            ),
+            rusqlite::params![
+                uri,
+                line_no.to_string().as_str(),
+                offset.to_string().as_str(),
+                model,
+                prompt,
+            ],
+            |row| row.get(0),
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                error!("Failed to insert completion: {:?}", e);
+                0
+            }
+        }
+    }
+
+    /// INSERT INTO completion_candidates ... RETURNING id。成功時に pending に push。
+    fn record_candidate(
+        &self,
+        completion_id: u32,
+        candidate_text: &str,
+        display_text: &str,
+        pending: &mut Vec<PendingCandidate>,
+    ) {
+        let db = self.conn.lock().unwrap();
+        match db.query_row(
+            indoc!(
+                "INSERT INTO completion_candidates
+                    (completion_id, rank, candidate)
+                    VALUES (?,?,?) RETURNING id;"
+            ),
+            rusqlite::params![completion_id, 0, candidate_text],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(id) => pending.push(PendingCandidate {
+                db_id: id,
+                candidate: display_text.to_string(),
+            }),
+            Err(err) => debug!("Failed to insert completion_candidate: {}", err),
+        }
+    }
+
+    fn set_completions(&self, uri: String, candidates: Vec<PendingCandidate>) {
+        *self.pending_completions.lock().unwrap() = Some((uri, candidates));
+    }
+
+    fn mark_selected_completion(
+        &self,
+        uri: &str,
+        content_changes: &[TextDocumentContentChangeEvent],
+    ) {
+        let (pending_uri, candidates) = self.pending_completions.lock().unwrap().take().unwrap();
+
+        if pending_uri == uri {
+            for change in content_changes {
+                if let Some(c) = candidates.iter().find(|c| c.candidate == change.text) {
+                    let db = self.conn.lock().unwrap();
+                    if let Err(e) = db.execute(
+                        "UPDATE completion_candidates SET selected = true WHERE id = ?;",
+                        rusqlite::params![c.db_id],
+                    ) {
+                        debug!("Failed to update completion_candidates: {}", e);
+                    }
+
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+struct CompletionDb {}
+
+#[cfg(not(debug_assertions))]
+impl CompletionDb {
+    fn new() -> Self {
+        Self {}
+    }
+
+    fn record_completion(
+        &self,
+        uri: &str,
+        line_no: usize,
+        offset: usize,
+        model: &str,
+        prompt: &str,
+    ) -> u32 {
+        0
+    }
+
+    fn record_candidate(
+        &self,
+        completion_id: u32,
+        candidate_text: &str,
+        display_text: &str,
+        pending: &mut Vec<PendingCandidate>,
+    ) {
+    }
+
+    fn set_pending(&self, uri: String, candidates: Vec<PendingCandidate>) {}
+
+    fn mark_selected(&self, uri: &str, content_changes: &[TextDocumentContentChangeEvent]) {}
+}
+
 /// `Backend` はサーバの状態を保持する構造体です。
 ///
 /// 現在は `Client` を保持しており、サーバからクライアントへログや通知を送信する際に使用します。
@@ -49,12 +197,9 @@ struct Backend {
     llm: tokio::sync::Mutex<Option<Box<dyn LlmClient>>>,
 
     highliter: Highlighter,
-    // 記録用DBへのコネクション
+    // デバッグビルド専用のDB操作
     #[cfg(debug_assertions)]
-    conn: Option<std::sync::Mutex<rusqlite::Connection>>,
-    // 直近のcompletion候補（URI, 候補リスト）
-    #[cfg(debug_assertions)]
-    pending_completions: std::sync::Mutex<Option<(String, Vec<PendingCandidate>)>>,
+    db: CompletionDb,
 }
 
 /// `LanguageServer` トレイトの実装。
@@ -234,29 +379,10 @@ impl LanguageServer for Backend {
     async fn did_change(&self, param: DidChangeTextDocumentParams) {
         debug!("did_change");
 
-        #[cfg(debug_assertions)]
-        {
-            let uri = param.text_document.uri.as_str();
-            let taken = self.pending_completions.lock().unwrap().take();
-            if let Some((pending_uri, candidates)) = taken
-                && pending_uri == uri
-            {
-                for change in &param.content_changes {
-                    if let Some(c) = candidates.iter().find(|c| c.candidate == change.text) {
-                        if let Some(db) = self.conn.as_ref() {
-                            let db = db.lock().unwrap();
-                            if let Err(e) = db.execute(
-                                "UPDATE completion_candidates SET selected = true WHERE id = ?;",
-                                rusqlite::params![c.db_id],
-                            ) {
-                                debug!("Failed to update completion_candidates: {}", e);
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
+        self.db.mark_selected_completion(
+            param.text_document.uri.as_str(),
+            param.content_changes.as_slice(),
+        );
 
         // 全体が送られて来た時
         if param.content_changes.iter().all(|c| c.range.is_none()) {
@@ -414,57 +540,65 @@ impl LanguageServer for Backend {
 
         let mut completion_id = 0u32;
         let raw = self
-                .use_llm(
-                    async |l| {
-                        if let Some(data) = options {
-                            if let Some(v) = data.get("max_tokens") && let Ok(n) = v.parse::<u32>() { l.max_tokens(n); }
-                            if let Some(v) = data.get("temperature") && let Ok(n) = v.parse::<f64>() { l.temperature(n); }
-                            if let Some(v) = data.get("top_p") && let Ok(n) = v.parse::<f64>() { l.top_p(n); }
-                            if let Some(v) = data.get("stop_sequences") { l.stop_sequences(v.split(',').map(|s| s.to_string()).collect()); }
-                            if let Some(v) = data.get("seed") && let Ok(n) = v.parse::<u64>() { l.seed(n); }
-                            if let Some(v) = data.get("reasoning_effort") && let Ok(n) = v.parse::<ReasoningEffort>() { l.reasoning_effort(n); }
-                            // if let Some(v) = data.get("response_format") { ... }
-                            if let Some(v) = data.get("service_tier") && let Ok(n) = v.parse::<ServiceTier>() { l.service_tier(n); }
-                            if let Some(v) = data.get("verbosity") && let Ok(n) = v.parse::<Verbosity>() { l.verbosity(n); }
-                        }
+            .use_llm(async |l| {
+                if let Some(data) = options {
+                    if let Some(v) = data.get("max_tokens")
+                        && let Ok(n) = v.parse::<u32>()
+                    {
+                        l.max_tokens(n);
+                    }
+                    if let Some(v) = data.get("temperature")
+                        && let Ok(n) = v.parse::<f64>()
+                    {
+                        l.temperature(n);
+                    }
+                    if let Some(v) = data.get("top_p")
+                        && let Ok(n) = v.parse::<f64>()
+                    {
+                        l.top_p(n);
+                    }
+                    if let Some(v) = data.get("stop_sequences") {
+                        l.stop_sequences(v.split(',').map(|s| s.to_string()).collect());
+                    }
+                    if let Some(v) = data.get("seed")
+                        && let Ok(n) = v.parse::<u64>()
+                    {
+                        l.seed(n);
+                    }
+                    if let Some(v) = data.get("reasoning_effort")
+                        && let Ok(n) = v.parse::<ReasoningEffort>()
+                    {
+                        l.reasoning_effort(n);
+                    }
+                    // if let Some(v) = data.get("response_format") { ... }
+                    if let Some(v) = data.get("service_tier")
+                        && let Ok(n) = v.parse::<ServiceTier>()
+                    {
+                        l.service_tier(n);
+                    }
+                    if let Some(v) = data.get("verbosity")
+                        && let Ok(n) = v.parse::<Verbosity>()
+                    {
+                        l.verbosity(n);
+                    }
+                }
 
-                        l.add(Content::Text(prompt));
-                        l.add(Content::Text(before));
-                        l.add(Content::Text(left));
+                l.add(Content::Text(prompt));
+                l.add(Content::Text(before));
+                l.add(Content::Text(left));
 
-                        #[cfg(debug_assertions)]
-                        {
-                            if let Some(db) = self.conn.as_ref() {
-                                let db = db.lock().unwrap();
-                                let prompt = l.build_content();
-                                match db.query_row(
-                                    indoc!(
-                                        "INSERT INTO completions
-                                        (document_uri, cursor_line, cursor_character, model_name, prompt)
-                                        VALUES (?,?,?,?,?) RETURNING id;"
-                                    ),
-                                    rusqlite::params![
-                                        uri,
-                                        line_no.to_string().as_str(),
-                                        offset.to_string().as_str(),
-                                        l.get_model(),
-                                        prompt.as_str(),
-                                    ],
-                                    |row| row.get(0),
-                                ) {
-                                    Ok(r) => {
-                                        completion_id = r;
-                                    }
-                                    Err(e) => error!("Failed to insert completion: {:?}", e),
-                                };
-                            }
-                        }
+                completion_id = self.db.record_completion(
+                    uri,
+                    line_no,
+                    offset,
+                    l.get_model(),
+                    l.build_content().as_str(),
+                );
 
-                        debug!("Before chat.");
-                        l.chat().await
-                    },
-                )
-                .await;
+                debug!("Before chat.");
+                l.chat().await
+            })
+            .await;
 
         debug!(
             "{}",
@@ -507,29 +641,9 @@ impl LanguageServer for Backend {
                             }
                         };
 
-                        #[cfg(debug_assertions)]
-                        {
-                            if let Some(db) = self.conn.as_ref() {
-                                let db = db.lock().unwrap();
-                                match db.query_row(
-                                    indoc!(
-                                        "INSERT INTO completion_candidates
-                                            (completion_id, rank, candidate)
-                                            VALUES (?,?,?) RETURNING id;"
-                                    ),
-                                    rusqlite::params![completion_id, 0, sr],
-                                    |row| row.get::<_, i64>(0),
-                                ) {
-                                    Ok(id) => pending.push(PendingCandidate {
-                                        db_id: id,
-                                        candidate: r.to_string(),
-                                    }),
-                                    Err(err) => {
-                                        debug!("Failed to insert completion_candidate: {}", err)
-                                    }
-                                }
-                            }
-                        }
+                        self.db
+                            .record_candidate(completion_id, &sr, r, &mut pending);
+
                         if sr.chars().count() > 25 {
                             CompletionItem {
                                 label: sr.chars().take(23).collect::<String>() + "……",
@@ -551,10 +665,8 @@ impl LanguageServer for Backend {
                     })
                     .collect();
 
-                #[cfg(debug_assertions)]
-                {
-                    *self.pending_completions.lock().unwrap() = Some((uri.to_string(), pending));
-                }
+                self.db.set_completions(uri.to_string(), pending);
+
                 let list = CompletionList {
                     is_incomplete: false,
                     items,
@@ -765,22 +877,6 @@ async fn main() {
         .target(env_logger::Target::Stderr)
         .init();
 
-    // DBマイグレーション
-    #[cfg(debug_assertions)]
-    let conn = {
-        let mut c = rusqlite::Connection::open(path.join("data").join("fifty_four.db"))
-            .expect("Fail to open database");
-        match migrations::migrations::runner().run(&mut c) {
-            Ok(_) => {}
-            Err(e) => {
-                panic!("Fail to migrate: {:?}", e);
-            }
-        }
-        Some(std::sync::Mutex::new(c))
-    };
-    #[cfg(not(debug_assertions))]
-    let conn = None;
-
     // LspService を構築し、`Backend` をクライアントハンドルで初期化する
     info!("initialize lsp service");
     let none: Option<Box<dyn LlmClient>> = None;
@@ -789,9 +885,8 @@ async fn main() {
         text: DashMap::new(),
         llm: tokio::sync::Mutex::new(none),
         highliter: Highlighter::new(),
-        conn,
         #[cfg(debug_assertions)]
-        pending_completions: std::sync::Mutex::new(None),
+        db: CompletionDb::new(&path.join("data").join("fifty_four.db")),
     })
     .finish();
 
