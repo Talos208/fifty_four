@@ -1,3 +1,6 @@
+/// 会話ハイライト用のトークナイザ・ユーティリティ
+///
+/// `lindera` を使って形態素解析を行い、会話テキストをハイライトします。
 use std::fmt::{Debug, Formatter};
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -6,10 +9,8 @@ use lindera::tokenizer::TokenizerBuilder;
 use strum_macros::EnumIter;
 
 use crate::types::{CachedLinderaToken, LineData, TokenStatus};
-
-/// 会話ハイライト用のトークナイザ・ユーティリティ
-///
-/// `lindera` を使って形態素解析を行い、会話テキストをハイライトします。
+#[allow(unused_imports)]
+use log::{debug, trace};
 
 /// ハイライト用トークンを表す型。
 ///
@@ -116,7 +117,6 @@ impl SemanticToken {
     }
 }
 
-// #[derive(Debug)]
 pub struct Highlighter {
     tokenizer: lindera::tokenizer::Tokenizer,
     bracket_depth: std::sync::atomic::AtomicU32,
@@ -163,19 +163,32 @@ impl Highlighter {
     pub fn tokenize(&self, line: &mut LineData) -> Vec<SemanticToken> {
         // 遅延解析
         if line.tokens.is_empty() {
+            trace!("lazy tokenize");
             line.tokens = self
                 .tokenizer
                 .tokenize(line.text.as_str())
                 .expect("failed to tokenize text")
                 .into_iter()
-                .map(|mut t| CachedLinderaToken {
-                    details: t.details().iter().map(|s| s.to_string()).collect(),
-                    byte_start: t.byte_start,
-                    byte_end: t.byte_end,
-                    tag: TokenStatus::Normal,
+                .filter_map(|mut t| {
+                    let d = t.details();
+                    if d[6] == "*" {
+                        trace!("\t{:?} {:?}", d[6], d[0..=3].to_vec());
+                        if d[0] == "名詞" && d[1] == "サ変接続" {
+                            // 不正なtokenはしまっちゃう
+                            return None;
+                        }
+                    }
+
+                    Some(CachedLinderaToken {
+                        details: t.details().iter().map(|s| s.to_string()).collect(),
+                        byte_start: t.byte_start,
+                        byte_end: t.byte_end,
+                        tag: TokenStatus::Normal,
+                    })
                 })
                 .collect();
         };
+        trace!("{}", line.tokens.len());
 
         let mut result = Vec::new();
         line.tokens.iter_mut().for_each(|token| {

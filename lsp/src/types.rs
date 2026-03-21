@@ -1,9 +1,19 @@
+use std::fmt::Debug;
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TokenStatus {
     Normal,
     InBracket,
+}
+
+impl Debug for TokenStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokenStatus::Normal => write!(f, "Normal"),
+            TokenStatus::InBracket => write!(f, "InBracket"),
+        }
+    }
 }
 
 /// Linderaトークンの必要情報をOwned形式でキャッシュするための型。
@@ -15,15 +25,6 @@ pub struct CachedLinderaToken {
     pub byte_start: usize,
     pub byte_end: usize,
     pub tag: TokenStatus,
-}
-
-impl CachedLinderaToken {
-    pub const EOT: &'static CachedLinderaToken = &CachedLinderaToken {
-        details: vec![],
-        byte_start: usize::MAX,
-        byte_end: usize::MAX,
-        tag: TokenStatus::Normal,
-    };
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,7 +47,7 @@ impl FromStr for LineData {
 impl LineData {
     #[allow(dead_code)]
     pub fn surface(&self, ptr: &CachedLinderaToken) -> &str {
-        &self.text[ptr.byte_start..ptr.byte_end].as_ref()
+        self.text[ptr.byte_start..ptr.byte_end].as_ref()
     }
 }
 

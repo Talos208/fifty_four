@@ -45,7 +45,7 @@ use opentelemetry::global::{self, BoxedTracer};
 // use opentelemetry::trace::TracerProvider;
 // use opentelemetry_appender_log::OpenTelemetryLogBridge;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp;
+// use opentelemetry_otlp;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 #[allow(unused_imports)]

@@ -1,7 +1,9 @@
 use async_trait::async_trait;
-use farmhash;
 use genai::adapter::AdapterKind;
-use genai::chat::{ChatMessage, ChatOptions, ChatRequest};
+use genai::chat::{
+    ChatMessage, ChatOptions, ChatRequest, ChatResponseFormat, ReasoningEffort, ServiceTier,
+    Verbosity,
+};
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ModelName, ServiceTarget};
 #[allow(unused_imports)]
@@ -60,11 +62,11 @@ impl Provider {
         };
 
         let mut url = "localhost:1234";
-        if prov.starts_with("lmstudio") {
-            if let Some((p, u)) = prov.split_once('@') {
-                prov = p;
-                url = u;
-            }
+        if prov.starts_with("lmstudio")
+            && let Some((p, u)) = prov.split_once('@')
+        {
+            prov = p;
+            url = u;
         }
 
         match prov {
@@ -80,7 +82,7 @@ impl Provider {
     #[allow(unused)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Provider::Google(s) => write!(f, "Google({})", s.to_string()),
+            Provider::Google(s) => write!(f, "Google({})", s),
             Provider::OpenAI(s) => write!(f, "OpenAI({})", s),
             Provider::Anthropic(s) => write!(f, "Anthropic({})", s),
             Provider::XAi(s) => write!(f, "XAi({})", s),
@@ -149,7 +151,7 @@ pub trait LlmClient: Send + Sync + std::fmt::Debug {
     fn add(&mut self, prompt: Content);
 
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "LlmClient")
+        write!(f, "LlmClient {}", self.get_model())
     }
 
     async fn get_service_target(&self) -> String {
@@ -168,11 +170,22 @@ pub trait LlmClient: Send + Sync + std::fmt::Debug {
     /// このプロンプトは、`chat`が呼び出されるたびに再利用されます。
     fn cache(&mut self, prompt: Content) -> Result<String, genai::Error>;
 
-    fn fetch(&self, hash: &String) -> Option<&Content>;
+    fn fetch(&self, hash: &str) -> Option<&Content>;
 
     fn fetch_all(&self) -> Vec<Content>;
 
     fn remove(&mut self, hash: String);
+
+    // オプション設定
+    fn max_tokens(&mut self, n: u32);
+    fn temperature(&mut self, v: f64);
+    fn top_p(&mut self, v: f64);
+    fn stop_sequences(&mut self, seqs: Vec<String>);
+    fn seed(&mut self, v: u64);
+    fn reasoning_effort(&mut self, effort: ReasoningEffort);
+    fn response_format(&mut self, fmt: ChatResponseFormat);
+    fn service_tier(&mut self, tier: ServiceTier);
+    fn verbosity(&mut self, v: Verbosity);
 }
 
 #[derive(Debug, Clone)]
@@ -260,7 +273,7 @@ impl LlmClientBuilder {
             _ => panic!("Unsupported provider"),
         };
 
-        let mdl_name = self.model.as_ref().unwrap_or(&mdl_name);
+        let mdl_name = self.model.as_ref().unwrap_or(mdl_name);
         let model_iden = ModelIden {
             adapter_kind: kind,
             model_name: ModelName::from(mdl_name),
@@ -298,6 +311,7 @@ impl LlmClientBuilder {
             model: mdl_name.clone(),
             cache: HashMap::new(),
             prompts: vec![],
+            options: ChatOptions::default(),
         })
     }
 }
@@ -306,10 +320,11 @@ impl LlmClientBuilder {
 ///
 /// `genai::Client`を内部的に利用し、特定のLLMプロバイダに依存しない形で
 /// チャット機能を提供します。プロンプトの管理には`Cache`トレイトを利用します。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct GenericLlmClient {
     /// `genai`ライブラリのコアクライアント
     inner_client: Client,
+    options: ChatOptions,
     /// 使用するLLMのモデル名
     model: String,
     /// プロンプトを永続的に保持するためのキャッシュ
@@ -331,23 +346,24 @@ impl LlmClient for GenericLlmClient {
             .append_messages(self.fetch_all().iter().filter_map(|c| {
                 Some(ChatMessage::system(match c {
                     Content::Text(s) => s,
-                    Content::CacheEntry(h) => &self.fetch(h).unwrap().as_ref(),
+                    Content::CacheEntry(h) => self.fetch(h)?.as_ref(),
                 }))
             }))
             .append_messages(self.prompts.iter().filter_map(|c| {
                 Some(ChatMessage::user(match c {
                     Content::Text(s) => s,
-                    Content::CacheEntry(h) => &self.fetch(h).unwrap().as_ref(),
+                    Content::CacheEntry(h) => self.fetch(h)?.as_ref(),
                 }))
             }));
-        let chat_opt = Some(&ChatOptions::default());
+
         let response = self
             .inner_client
-            .exec_chat(model, chat_req, chat_opt)
+            .exec_chat(model, chat_req, Some(&self.options))
             .await?;
         let content = response.content.texts().join("");
 
         self.prompts.clear(); // promptはクリア、キャッシュは保存
+        self.options = ChatOptions::default();
 
         Ok(content)
     }
@@ -386,12 +402,12 @@ impl LlmClient for GenericLlmClient {
         }
     }
 
-    fn fetch(&self, hash: &String) -> Option<&Content> {
+    fn fetch(&self, hash: &str) -> Option<&Content> {
         self.cache.get(hash)
     }
 
     fn fetch_all(&self) -> Vec<Content> {
-        self.cache.values().map(|c| c.clone()).collect()
+        self.cache.values().cloned().collect()
     }
 
     fn clear(&mut self) {
@@ -410,5 +426,41 @@ impl LlmClient for GenericLlmClient {
             .unwrap();
 
         format!("{:?} {:?}", st.model, st.endpoint)
+    }
+
+    fn max_tokens(&mut self, n: u32) {
+        self.options = std::mem::take(&mut self.options).with_max_tokens(n);
+    }
+
+    fn temperature(&mut self, v: f64) {
+        self.options = std::mem::take(&mut self.options).with_temperature(v);
+    }
+
+    fn top_p(&mut self, v: f64) {
+        self.options = std::mem::take(&mut self.options).with_top_p(v);
+    }
+
+    fn stop_sequences(&mut self, seqs: Vec<String>) {
+        self.options = std::mem::take(&mut self.options).with_stop_sequences(seqs);
+    }
+
+    fn seed(&mut self, v: u64) {
+        self.options = std::mem::take(&mut self.options).with_seed(v);
+    }
+
+    fn reasoning_effort(&mut self, effort: ReasoningEffort) {
+        self.options = std::mem::take(&mut self.options).with_reasoning_effort(effort);
+    }
+
+    fn response_format(&mut self, fmt: ChatResponseFormat) {
+        self.options = std::mem::take(&mut self.options).with_response_format(fmt);
+    }
+
+    fn service_tier(&mut self, tier: ServiceTier) {
+        self.options = std::mem::take(&mut self.options).with_service_tier(tier);
+    }
+
+    fn verbosity(&mut self, v: Verbosity) {
+        self.options = std::mem::take(&mut self.options).with_verbosity(v);
     }
 }

@@ -10,18 +10,18 @@ mod logging;
 mod types;
 use crate::types::{CursorContext, LineData};
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::str::FromStr;
 mod cursor_context;
 mod llm;
 use crate::llm::{Content, LlmClient, LlmClientBuilder};
-use rusqlite;
 use std::panic;
 use std::path::Path;
 mod migrations {
     use refinery::embed_migrations;
     embed_migrations!("migrations");
 }
-use env_logger;
+use genai::chat::{ReasoningEffort, ServiceTier, Verbosity};
 use indoc::indoc;
 #[allow(unused_imports)]
 use log::{debug, error, info, warn};
@@ -76,31 +76,29 @@ impl LanguageServer for Backend {
             debug!("Client_info: {:?}", info);
         }
 
-        if let Some(opt) = _param.initialization_options {
-            if let Some(llm) = opt.get("llm") {
-                // LLMクライアントを初期化
-                let mut builder = LlmClientBuilder::from_value(llm);
+        if let Some(opt) = _param.initialization_options
+            && let Some(llm) = opt.get("llm")
+        {
+            // LLMクライアントを初期化
+            let mut builder = LlmClientBuilder::from_value(llm);
 
-                llm.get("model").and_then(|v| {
-                    builder.model(v.as_str().unwrap());
-                    Some(v)
-                });
+            llm.get("model").inspect(|v| {
+                builder.model(v.as_str().unwrap());
+            });
 
-                llm.get("url").and_then(|v| {
-                    builder.url(v.as_str().unwrap());
-                    Some(v)
-                });
+            llm.get("url").inspect(|v| {
+                builder.url(v.as_str().unwrap());
+            });
 
-                let cl = builder.build();
+            let cl = builder.build();
 
-                debug!(
-                    "LLM built.\tmodel: {:?}\n\tservice_target: {}",
-                    cl,
-                    cl.get_service_target().await
-                );
+            debug!(
+                "LLM built.\tmodel: {:?}\n\tservice_target: {}",
+                cl,
+                cl.get_service_target().await
+            );
 
-                self.llm.lock().await.replace(cl);
-            }
+            self.llm.lock().await.replace(cl);
         }
 
         let capabilities = ServerCapabilities {
@@ -240,21 +238,21 @@ impl LanguageServer for Backend {
         {
             let uri = param.text_document.uri.as_str();
             let taken = self.pending_completions.lock().unwrap().take();
-            if let Some((pending_uri, candidates)) = taken {
-                if pending_uri == uri {
-                    for change in &param.content_changes {
-                        if let Some(c) = candidates.iter().find(|c| c.candidate == change.text) {
-                            if let Some(db) = self.conn.as_ref() {
-                                let db = db.lock().unwrap();
-                                if let Err(e) = db.execute(
-                                    "UPDATE completion_candidates SET selected = true WHERE id = ?;",
-                                    rusqlite::params![c.db_id],
-                                ) {
-                                    debug!("Failed to update completion_candidates: {}", e);
-                                }
+            if let Some((pending_uri, candidates)) = taken
+                && pending_uri == uri
+            {
+                for change in &param.content_changes {
+                    if let Some(c) = candidates.iter().find(|c| c.candidate == change.text) {
+                        if let Some(db) = self.conn.as_ref() {
+                            let db = db.lock().unwrap();
+                            if let Err(e) = db.execute(
+                                "UPDATE completion_candidates SET selected = true WHERE id = ?;",
+                                rusqlite::params![c.db_id],
+                            ) {
+                                debug!("Failed to update completion_candidates: {}", e);
                             }
-                            break;
                         }
+                        break;
                     }
                 }
             }
@@ -364,6 +362,8 @@ impl LanguageServer for Backend {
         let line_no = params.text_document_position.position.line as usize;
         let offset = params.text_document_position.position.character as usize;
 
+        // 対象行と前後をtokenize
+        self.highliter.initialize(); // TODO 正しいdepthを割り当てたい
         let before = text
             .iter()
             .take(line_no)
@@ -371,28 +371,63 @@ impl LanguageServer for Backend {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let line: &str = &text[line_no].text.as_str();
+        if offset > 0 && before.is_empty() {
+            return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                "offset > 0 && before.is_empty()",
+            ));
+        }
+
+        let line: &str = text[line_no].text.as_str();
         let left: String = line.chars().take(offset).collect();
 
         // カーソルコンテキスト分類
-        let context =
-            cursor_context::classify_complesion_mode(&mut text, line_no, offset, &self.highliter);
+        let context = cursor_context::classify_complesion_mode(&mut text, line_no, offset, |ln| {
+            self.tokenize_line(uri, ln);
+        });
         debug!("CursorContext: {:?}", context);
 
-        let prompt_file = Backend::ctx_to_prompt_name(context);
+        let prompt_fn = Backend::ctx_to_prompt_name(context);
+        debug!("Prompt: {}", prompt_fn);
         let prompt = String::from_utf8_lossy(
-            Asset::get(prompt_file)
-                .unwrap_or_else(|| panic!("{} not found", prompt_file))
+            Asset::get(prompt_fn)
+                .unwrap_or_else(|| panic!("{} not found", prompt_fn))
                 .data
                 .as_ref(),
         )
         .to_string();
 
-        if offset > 0 || !before.is_empty() {
-            let mut completion_id = 0u32;
-            let raw = self
+        // front matter処理
+        let options = if let Ok(path) = params
+            .text_document_position
+            .text_document
+            .uri
+            .to_file_path()
+            && let Some(ext) = path.extension()
+            && ext.to_string_lossy() == ".md"
+        {
+            let matter = gray_matter::Matter::<gray_matter::engine::YAML>::new();
+            let parsed_matter = matter.parse::<HashMap<String, String>>(prompt.as_str());
+            parsed_matter.map(|entry| entry.data).unwrap()
+        } else {
+            None
+        };
+
+        let mut completion_id = 0u32;
+        let raw = self
                 .use_llm(
                     async |l| {
+                        if let Some(data) = options {
+                            if let Some(v) = data.get("max_tokens") && let Ok(n) = v.parse::<u32>() { l.max_tokens(n); }
+                            if let Some(v) = data.get("temperature") && let Ok(n) = v.parse::<f64>() { l.temperature(n); }
+                            if let Some(v) = data.get("top_p") && let Ok(n) = v.parse::<f64>() { l.top_p(n); }
+                            if let Some(v) = data.get("stop_sequences") { l.stop_sequences(v.split(',').map(|s| s.to_string()).collect()); }
+                            if let Some(v) = data.get("seed") && let Ok(n) = v.parse::<u64>() { l.seed(n); }
+                            if let Some(v) = data.get("reasoning_effort") && let Ok(n) = v.parse::<ReasoningEffort>() { l.reasoning_effort(n); }
+                            // if let Some(v) = data.get("response_format") { ... }
+                            if let Some(v) = data.get("service_tier") && let Ok(n) = v.parse::<ServiceTier>() { l.service_tier(n); }
+                            if let Some(v) = data.get("verbosity") && let Ok(n) = v.parse::<Verbosity>() { l.verbosity(n); }
+                        }
+
                         l.add(Content::Text(prompt));
                         l.add(Content::Text(before));
                         l.add(Content::Text(left));
@@ -431,87 +466,106 @@ impl LanguageServer for Backend {
                 )
                 .await;
 
-            debug!(
-                "{}",
-                format!("{:?}", raw).chars().take(30).collect::<String>()
-            );
-            match raw {
-                Ok(response) => {
-                    debug!("raw Ok.");
+        debug!(
+            "{}",
+            format!("{:?}", raw).chars().take(30).collect::<String>()
+        );
+        match raw {
+            Ok(response) => {
+                debug!("raw Ok.");
 
-                    #[cfg(debug_assertions)]
-                    let mut pending: Vec<PendingCandidate> = Vec::new();
+                #[cfg(debug_assertions)]
+                let mut pending: Vec<PendingCandidate> = Vec::new();
 
-                    let items = response
-                        .lines()
-                        .map(|r| {
-                            #[cfg(debug_assertions)]
-                            {
-                                if let Some(db) = self.conn.as_ref() {
-                                    let db = db.lock().unwrap();
-                                    match db.query_row(
-                                        indoc!(
-                                            "INSERT INTO completion_candidates
+                let items = response
+                    .lines()
+                    .map(|r| {
+                        let sr = match context {
+                            CursorContext::BeforeClosingBracket => {
+                                if !r.starts_with('。') {
+                                    "。".to_string() + r
+                                } else if r.ends_with('。') {
+                                    r.strip_suffix("。").unwrap_or(r).to_string()
+                                } else {
+                                    r.to_string()
+                                }
+                            }
+                            CursorContext::EmptyBracket => {
+                                if r.ends_with('。') {
+                                    r.strip_suffix("。").unwrap_or(r).to_string()
+                                } else {
+                                    r.to_string()
+                                }
+                            }
+                            CursorContext::AfterClosingBracket => "\n".to_string() + r,
+                            _ => {
+                                if !r.ends_with('。') {
+                                    r.to_string() + "。"
+                                } else {
+                                    r.to_string()
+                                }
+                            }
+                        };
+
+                        #[cfg(debug_assertions)]
+                        {
+                            if let Some(db) = self.conn.as_ref() {
+                                let db = db.lock().unwrap();
+                                match db.query_row(
+                                    indoc!(
+                                        "INSERT INTO completion_candidates
                                             (completion_id, rank, candidate)
                                             VALUES (?,?,?) RETURNING id;"
-                                        ),
-                                        rusqlite::params![completion_id, 0, r],
-                                        |row| row.get::<_, i64>(0),
-                                    ) {
-                                        Ok(id) => pending.push(PendingCandidate {
-                                            db_id: id,
-                                            candidate: r.to_string(),
-                                        }),
-                                        Err(err) => {
-                                            debug!("Failed to insert completion_candidate: {}", err)
-                                        }
+                                    ),
+                                    rusqlite::params![completion_id, 0, sr],
+                                    |row| row.get::<_, i64>(0),
+                                ) {
+                                    Ok(id) => pending.push(PendingCandidate {
+                                        db_id: id,
+                                        candidate: r.to_string(),
+                                    }),
+                                    Err(err) => {
+                                        debug!("Failed to insert completion_candidate: {}", err)
                                     }
                                 }
                             }
-                            if r.chars().count() > 20 {
-                                CompletionItem {
-                                    label: r.chars().take(18).collect::<String>() + "……",
-                                    kind: Some(CompletionItemKind::TEXT),
-                                    documentation: Some(Documentation::MarkupContent(
-                                        MarkupContent {
-                                            kind: MarkupKind::Markdown,
-                                            value: r.to_string(),
-                                        },
-                                    )),
-                                    insert_text: Some(r.to_string()),
-                                    ..Default::default()
-                                }
-                            } else {
-                                CompletionItem {
-                                    label: r.to_string(),
-                                    kind: Some(CompletionItemKind::TEXT),
-                                    ..Default::default()
-                                }
+                        }
+                        if sr.chars().count() > 25 {
+                            CompletionItem {
+                                label: sr.chars().take(23).collect::<String>() + "……",
+                                kind: Some(CompletionItemKind::TEXT),
+                                documentation: Some(Documentation::MarkupContent(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value: sr.clone(),
+                                })),
+                                insert_text: Some(sr),
+                                ..Default::default()
                             }
-                        })
-                        .collect();
+                        } else {
+                            CompletionItem {
+                                label: sr,
+                                kind: Some(CompletionItemKind::TEXT),
+                                ..Default::default()
+                            }
+                        }
+                    })
+                    .collect();
 
-                    #[cfg(debug_assertions)]
-                    {
-                        *self.pending_completions.lock().unwrap() =
-                            Some((uri.to_string(), pending));
-                    }
-                    let list = CompletionList {
-                        is_incomplete: false,
-                        items,
-                    };
+                #[cfg(debug_assertions)]
+                {
+                    *self.pending_completions.lock().unwrap() = Some((uri.to_string(), pending));
+                }
+                let list = CompletionList {
+                    is_incomplete: false,
+                    items,
+                };
 
-                    Ok(Some(CompletionResponse::List(list)))
-                }
-                Err(err) => {
-                    error!("Error on completion: {:?}", err);
-                    Err(tower_lsp::jsonrpc::Error::invalid_params(err.to_string()))
-                }
+                Ok(Some(CompletionResponse::List(list)))
             }
-        } else {
-            Err(tower_lsp::jsonrpc::Error::invalid_params(
-                "offset <= 0 && before.is_empty()",
-            ))
+            Err(err) => {
+                error!("Error on completion: {:?}", err);
+                Err(tower_lsp::jsonrpc::Error::invalid_params(err.to_string()))
+            }
         }
     }
 
@@ -644,8 +698,8 @@ impl Backend {
         let mut rv = self.text.get_mut(uri).unwrap();
 
         texts
-            .into_iter()
-            .zip(changes.into_iter())
+            .iter()
+            .zip(changes)
             .rev() // 後ろから突っ込んで、改行による行数の変更で矛盾が生じないように
             .for_each(|(text, change)| {
                 apply_changes(rv.deref_mut(), text, *change);
@@ -661,6 +715,20 @@ impl Backend {
             CursorContext::InBracketOther => "prompt_completion_in_bracket.md",
             CursorContext::Other => "prompt_completion.md",
         }
+    }
+
+    pub fn tokenize_line(&self, url: &str, line_no: usize) {
+        if !self.text.get(url).unwrap()[line_no].tokens.is_empty() {
+            return;
+        }
+        self.highliter.tokenize(
+            self.text
+                .get_mut(&url.to_string())
+                .unwrap()
+                .value_mut()
+                .get_mut(line_no)
+                .unwrap(),
+        );
     }
 }
 
@@ -685,7 +753,7 @@ async fn main() {
     #[cfg(debug_assertions)]
     {
         // こやつパス間違っててもエラーを返さない
-        if let Err(err) = dotenvx_rs::dotenvx::from_path(&path.join(".env")) {
+        if let Err(err) = dotenvx_rs::dotenvx::from_path(path.join(".env")) {
             eprintln!("Failed to load environment variables: {}", err);
 
             eprintln!("{:?}", std::env::vars());
