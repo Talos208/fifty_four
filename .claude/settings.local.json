@@ -3,7 +3,9 @@
     "allow": [
       "WebFetch(domain:crates.io)",
       "Skill(commit-commands:commit)",
-      "Skill(commit-commands:commit:*)"
+      "Skill(commit-commands:commit:*)",
+      "Bash(cargo test cursor_context)"
     ]
-  }
+  },
+  "outputStyle": "default"
 }

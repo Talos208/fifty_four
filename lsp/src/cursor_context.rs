@@ -1,6 +1,7 @@
 use crate::types::{CachedLinderaToken, CursorContext, LineData, TokenStatus};
 #[allow(unused_imports)]
 use log::{debug, error, trace};
+use std::cmp::max;
 use std::cmp::min;
 
 fn is_bracket_open(token: &CachedLinderaToken) -> bool {
@@ -19,39 +20,57 @@ fn is_whitespace(token: &CachedLinderaToken) -> bool {
     token.details[0] == "記号" && token.details.get(1).map(|s| s.as_str()) == Some("空白")
 }
 
+fn before_token_inline(
+    line: &LineData,
+    token_index: usize,
+    predicate: impl Fn(CachedLinderaToken) -> bool,
+) -> (usize, Option<CachedLinderaToken>) {
+    let mut tkn_ix = token_index as i64;
+    loop {
+        tkn_ix -= 1;
+        // debug!("\t\t{}", tkn_ix);
+        if let Some(tkn) = line.tokens.get(tkn_ix as usize) {
+            trace!("\t{}: {}-{}", tkn.details[6], tkn.byte_start, tkn.byte_end);
+            if predicate(tkn.clone()) {
+                trace!("\tfound");
+                return (tkn_ix as usize, Some(tkn.clone()));
+            }
+        } else {
+            break;
+        }
+    }
+
+    (0, None)
+}
+
 fn before_token(
     texts: &[LineData],
     line_no: usize,
     token_index: usize,
     mut tokenize_line_no: impl FnMut(usize),
-    predicate: impl Fn(&CachedLinderaToken) -> bool,
-) -> Option<&CachedLinderaToken> {
+    predicate: impl Fn(CachedLinderaToken) -> bool,
+) -> (usize, usize, Option<CachedLinderaToken>) {
     debug!("before_tkn");
     let mut tkn_ix = token_index as i64;
     let mut ln = line_no as i64;
 
     loop {
-        // debug!("\t{},{}", ln, tkn_ix);
-        let line = texts.get(ln as usize)?;
+        let line = texts.get(ln as usize);
+        let Some(line) = line else {
+            return (max(0, ln) as usize, 0, None);
+        };
         if line.tokens.is_empty() {
             tokenize_line_no(ln as usize);
         }
         tkn_ix = min(tkn_ix, line.tokens.len() as i64);
         trace!("\t{},({} / {})", ln, tkn_ix, line.tokens.len() as i64);
 
-        loop {
-            tkn_ix -= 1;
-            debug!("\t\t{}", tkn_ix);
-            if let Some(tkn) = line.tokens.get(tkn_ix as usize) {
-                debug!("\t{}: {}-{}", tkn.details[6], tkn.byte_start, tkn.byte_end);
-                if predicate(tkn) {
-                    debug!("\tfound");
-                    return Some(tkn);
-                }
-            } else {
+        let (tix, tkn) = before_token_inline(line, tkn_ix as usize, &predicate);
+        match tkn {
+            Some(tkn) => return (ln as usize, tix, Some(tkn)),
+            None => {
                 ln -= 1;
                 tkn_ix = i64::MAX;
-                break;
             }
         }
     }
@@ -62,7 +81,7 @@ fn next_token(
     line_no: usize,
     token_index: usize,
     mut tokenize_line_no: impl FnMut(usize),
-    predicate: impl Fn(&CachedLinderaToken) -> bool,
+    predicate: impl Fn(CachedLinderaToken) -> bool,
 ) -> Option<&CachedLinderaToken> {
     debug!("next_token");
     let mut tkn_ix: i64 = token_index as i64;
@@ -78,7 +97,7 @@ fn next_token(
             tkn_ix += 1;
             if let Some(tkn) = line.tokens.get(tkn_ix as usize) {
                 trace!("\t{}: {}-{}", ln, tkn.byte_start, tkn.byte_end);
-                if predicate(tkn) {
+                if predicate(tkn.clone()) {
                     debug!("\tfound");
                     return Some(tkn);
                 }
@@ -97,6 +116,72 @@ pub fn classify_complesion_mode(
     char_offset: usize,
     mut tokenize_line_no: impl FnMut(usize),
 ) -> CursorContext {
+    let (line_no, cursor_ix, cursor_tkn) = {
+        let (l, i, c) = cursor_tkn(texts, line_no, char_offset, &mut tokenize_line_no);
+        (l, i, c.clone())
+    };
+
+    cursor_tkn.as_ref().inspect(|t| {
+        trace!(
+            "current: {:?},{:?},{:?}",
+            t.details[6].as_str(),
+            t.details[0..=3].to_vec(),
+            t.tag
+        )
+    });
+
+    // カーソル前の最後の非空白トークンを後方探索
+    let (_, _, before_tkn) = before_token(texts, line_no, cursor_ix, tokenize_line_no, |tkn| {
+        !is_whitespace(&tkn)
+    });
+
+    before_tkn.as_ref().inspect(|t| {
+        trace!(
+            "before: {:?},{:?},{:?}",
+            t.details[6].as_str(),
+            t.details[0..=3].to_vec(),
+            t.tag
+        )
+    });
+
+    // tag ~~ とdepth ~~ を使って括弧の内外を判定
+    // - tag == InBracket: 通常のトークンが括弧内にある
+    // - is_bracket_open: 開き括弧の直後（自身はNormalだが直後は括弧内）
+    // - depth > 0: ネストした括弧閉の直後でまだ外側の括弧内にいる場合
+    let in_bracket = if let Some(tkn) = before_tkn.as_ref() {
+        tkn.tag == TokenStatus::InBracket || is_bracket_open(tkn)
+    } else {
+        false
+    };
+
+    if !in_bracket {
+        if before_tkn.as_ref().is_some_and(is_bracket_close) {
+            return CursorContext::AfterClosingBracket;
+        }
+        if before_tkn.as_ref().is_some_and(is_sentence_end) {
+            return CursorContext::AfterSentenceEnd;
+        }
+        return CursorContext::Other;
+    }
+
+    // 括弧内
+    if before_tkn.as_ref().is_some_and(is_bracket_open)
+        && cursor_tkn.as_ref().is_some_and(is_bracket_close)
+    {
+        return CursorContext::EmptyBracket;
+    }
+    if cursor_tkn.as_ref().is_some_and(is_bracket_close) {
+        return CursorContext::BeforeClosingBracket;
+    }
+    CursorContext::InBracketOther
+}
+
+fn cursor_tkn(
+    texts: &mut [LineData],
+    line_no: usize,
+    char_offset: usize,
+    mut tokenize_line_no: &mut impl FnMut(usize),
+) -> (usize, usize, Option<CachedLinderaToken>) {
     // カーソル位置のトークンを取得
     let cursor_line = &texts[line_no];
     if !cursor_line.text.is_empty() && cursor_line.tokens.is_empty() {
@@ -107,76 +192,128 @@ pub fn classify_complesion_mode(
     let byte_offset: usize = cursor_line_text
         .chars()
         .take(char_offset)
-        .map(|c| c.len_utf8())
-        .sum();
+        .fold(0, |a, c| a + c.len_utf8());
 
-    debug!(
+    trace!(
         "line_no: {}, char_offset: {}, byte_offset: {}",
         line_no, char_offset, byte_offset
     );
-    debug!("{}", cursor_line_text.chars().take(60).collect::<String>());
+    trace!("{}", cursor_line_text.chars().take(60).collect::<String>());
 
     let (cursor_ix, cursor_tkn) = cursor_line
         .tokens // Linderaは半角スペースをtokenにしない
         .iter()
         .enumerate()
         .find(|(_ix, tkn)| tkn.byte_start <= byte_offset && byte_offset < tkn.byte_end)
-        .map(|(ix, tkn)| (ix, Some(tkn)))
+        .map(|(ix, tkn)| (ix, Some(tkn.clone())))
         .unwrap_or_else(|| {
             debug!("Not found");
-            let ix = cursor_line.tokens.len() - 1;
+            let ix = cursor_line.tokens.len();
             if let Some(tkn) = next_token(texts, line_no, ix, &mut tokenize_line_no, |tkn| {
-                !is_whitespace(tkn)
+                !is_whitespace(&tkn)
             }) {
-                (ix, Some(tkn))
+                (ix, Some(tkn.clone()))
             } else {
                 (cursor_line.tokens.len(), None)
             }
         });
+    (line_no, cursor_ix, cursor_tkn)
+}
 
-    debug!(
-        "current: {:?}",
-        cursor_tkn.map(|t| (t.details[6].as_str(), t.details[0..=3].to_vec(), t.tag))
-    );
+fn is_end_of_sentence(tkn: &CachedLinderaToken) -> bool {
+    tkn.details[0] == "記号"
+        && match tkn.details.get(1).map(|s| s.as_str()) {
+            Some("句点") => true,
+            Some("括弧閉") => true,
+            _ => false,
+        }
+}
 
-    // カーソル前の最後の非空白トークンを後方探索
-    let before_tkn = before_token(texts, line_no, cursor_ix, tokenize_line_no, |tkn| {
-        !is_whitespace(tkn)
-    });
+pub fn before_sentences_upto(
+    texts: &mut [LineData],
+    line_no: usize,
+    char_offset: usize,
+    len: usize,
+    mut tokenize_line_no: impl FnMut(usize),
+) -> Vec<String> {
+    // char_offsetrからtoken_indexに変換
+    let mut last_byte = texts[line_no]
+        .text
+        .chars()
+        .take(char_offset)
+        .fold(0, |acc, c| acc + c.len_utf8());
 
-    debug!(
-        "before: {:?}",
-        before_tkn.map(|t| (t.details[6].as_str(), t.details[0..=3].to_vec(), t.tag))
-    );
-
-    // tag ~~ とdepth ~~ を使って括弧の内外を判定
-    // - tag == InBracket: 通常のトークンが括弧内にある
-    // - is_bracket_open: 開き括弧の直後（自身はNormalだが直後は括弧内）
-    // - depth > 0: ネストした括弧閉の直後でまだ外側の括弧内にいる場合
-    let in_bracket = if let Some(tkn) = before_tkn {
-        tkn.tag == TokenStatus::InBracket || is_bracket_open(tkn)
+    let mut tkn_ix: i64 = if let Some((token_index, tkn)) = texts[line_no]
+        .tokens
+        .iter()
+        .enumerate()
+        .find(|(_, tkn)| tkn.byte_start <= last_byte && last_byte < tkn.byte_end)
+    {
+        last_byte = tkn.byte_end;
+        token_index as i64
     } else {
-        false
+        texts[line_no].tokens.len() as i64
     };
 
-    if !in_bracket {
-        if before_tkn.is_some_and(is_bracket_close) {
-            return CursorContext::AfterClosingBracket;
+    let mut line_buf = String::new();
+    let mut ln = line_no as i64;
+    let mut result = vec![];
+
+    'outer: loop {
+        // 行のループ
+        let Some(line) = texts.get(ln as usize) else {
+            break;
+        };
+        if line.tokens.is_empty() {
+            tokenize_line_no(ln as usize);
         }
-        if before_tkn.is_some_and(is_sentence_end) {
-            return CursorContext::AfterSentenceEnd;
+
+        if tkn_ix > line.tokens.len() as i64 {
+            tkn_ix = line.tokens.len() as i64;
+            last_byte = texts[ln as usize].text.len()
         }
-        return CursorContext::Other;
+        let (token_index, tkn) =
+            before_token_inline(&texts[ln as usize], tkn_ix as usize, |_| true); // before_tokenが行を超えて探しに行っちゃうのがまずい
+
+        last_byte = if let Some(tkn) = tkn {
+            line_buf.push_str(&texts[ln as usize].text[tkn.byte_start..last_byte]);
+            tkn.byte_start
+        } else {
+            texts[ln as usize].text.len()
+        };
+        tkn_ix = token_index as i64;
+        trace!("\t{},({} / {})", ln, tkn_ix, line.tokens.len() as i64);
+
+        loop {
+            // トークンのループ
+            tkn_ix -= 1;
+            trace!("\t\t{}", tkn_ix);
+            if let Some(tkn) = line.tokens.get(tkn_ix as usize) {
+                trace!("\t{}: {}-{}", tkn.details[6], tkn.byte_start, tkn.byte_end);
+                if is_end_of_sentence(tkn) {
+                    result.insert(0, line_buf.clone());
+                    line_buf.clear();
+                    if result.len() >= len {
+                        break 'outer;
+                    }
+                }
+                line_buf.insert_str(0, &line.text[tkn.byte_start..last_byte]);
+                last_byte = tkn.byte_start;
+            } else {
+                ln -= 1;
+                tkn_ix = i64::MAX;
+                result.insert(0, line_buf.clone());
+                line_buf.clear();
+                break;
+            }
+        }
     }
 
-    // 括弧内
-    if before_tkn.is_some_and(is_bracket_open) && cursor_tkn.is_some_and(is_bracket_close) {
-        return CursorContext::EmptyBracket;
+    if !line_buf.is_empty() {
+        result.insert(0, line_buf);
     }
-    if cursor_tkn.is_some_and(is_bracket_close) {
-        return CursorContext::BeforeClosingBracket;
-    }
-    CursorContext::InBracketOther
+
+    result
 }
 
 #[cfg(test)]
@@ -184,7 +321,9 @@ mod tests {
     use crate::CursorContext;
     use crate::Highlighter;
     use crate::LineData;
+    use crate::cursor_context::before_sentences_upto;
     use crate::cursor_context::classify_complesion_mode;
+    // use indoc::indoc;
     use regex::Regex;
     use std::str::FromStr;
 
@@ -195,21 +334,23 @@ mod tests {
             .collect()
     }
 
-    struct TestData<'a> {
-        texts: &'a mut Vec<LineData>,
+    struct TestData {
+        texts: *mut Vec<LineData>,
         hl: Highlighter,
     }
 
-    impl TestData<'_> {
-        fn build<'a>(texts: &'a mut Vec<LineData>) -> Self {
+    impl TestData {
+        fn build(texts: &mut Vec<LineData>) -> Self {
             Self {
-                texts,
+                texts: texts as *mut _,
                 hl: Highlighter::new(),
             }
         }
 
         fn tokenize(&mut self, line_no: usize) {
-            self.hl.tokenize(&mut self.texts[line_no]);
+            unsafe {
+                self.hl.tokenize(&mut (&mut *self.texts)[line_no]);
+            }
         }
     }
 
@@ -392,4 +533,50 @@ mod tests {
             CursorContext::BeforeClosingBracket
         );
     }
+
+    #[test]
+    fn sentences_upto_single() {
+        let (mut texts, _) = tokenize("一文目です。");
+        let offset = texts[0].text.chars().count();
+        let result = before_sentences_upto(&mut texts, 0, offset, 10, |_| {});
+        assert_eq!(result.len(), 1);
+        assert!(result.iter().any(|s| s.contains("。")));
+    }
+
+    #[test]
+    fn sentences_upto_multiple() {
+        let (mut texts, _) = tokenize("一文目です。二文目です。");
+        let offset = texts[0].text.chars().count();
+        let result = before_sentences_upto(&mut texts, 0, offset, 10, |_| {});
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn sentences_upto_len_limit() {
+        let (mut texts, _) = tokenize("一文目。二文目。三文目。");
+        let offset = texts[0].text.chars().count();
+        let result = before_sentences_upto(&mut texts, 0, offset, 2, |_| {});
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn sentences_upto_multiline() {
+        let (mut texts, _) = tokenize("一文目。\n\n二文目。");
+        let offset = texts[2].text.chars().count();
+        // 0行目末尾のカーソル → 0行目の文のみ
+        let result = before_sentences_upto(&mut texts, 2, offset, 10, |_| {});
+        assert_eq!(result.len(), 3);
+    }
+
+    // #[test]
+    // fn sentences_upto_multiline2() {
+    //     let (mut texts, _) = tokenize(indoc!(
+    //         "通信回線を開いた。やがてスピーカーから微かな通信音が響き渡った。
+    //         「応答せよ、グラナダ管制、これより進入を開始する」
+    //         「こちらサイド・スリー防衛艦隊所属、認識番号を確認されたし」"
+    //     ));
+    //     let offset = texts[2].text.chars().count() - 1;
+    //     let result = before_sentences_upto(&mut texts, 2, offset, 10, |_| {});
+    //     assert_eq!(result.len(), 4);
+    // }
 }

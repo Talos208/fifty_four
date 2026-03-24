@@ -25,6 +25,7 @@ pub struct CachedLinderaToken {
     pub byte_start: usize,
     pub byte_end: usize,
     pub tag: TokenStatus,
+    // TODO line_noも記録したほうがいいかも
 }
 
 #[derive(Debug, Clone, PartialEq)]

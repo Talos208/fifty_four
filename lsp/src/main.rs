@@ -24,13 +24,13 @@ mod migrations {
 use genai::chat::{ReasoningEffort, ServiceTier, Verbosity};
 use indoc::indoc;
 #[allow(unused_imports)]
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use rust_embed::Embed;
 use std::ops::DerefMut;
 
 /// 直近のcompletion候補を記録する構造体（デバッグビルドのみ）
 #[cfg(debug_assertions)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PendingCandidate {
     db_id: i64,
     candidate: String,
@@ -39,13 +39,13 @@ struct PendingCandidate {
 /// デバッグビルド専用のDB操作をカプセル化する構造体
 #[cfg(debug_assertions)]
 #[derive(Debug)]
-struct CompletionDb {
-    conn: std::sync::Mutex<rusqlite::Connection>,
-    pending_completions: std::sync::Mutex<Option<(String, Vec<PendingCandidate>)>>,
+struct FlightRecorder {
+    conn: parking_lot::Mutex<rusqlite::Connection>,
+    pending_completions: parking_lot::Mutex<Option<(String, Vec<PendingCandidate>)>>,
 }
 
 #[cfg(debug_assertions)]
-impl CompletionDb {
+impl FlightRecorder {
     fn new(path: &PathBuf) -> Self {
         // マイグレーションも済ませてしまう
         let mut c = rusqlite::Connection::open(path).expect("Fail to open database");
@@ -57,8 +57,8 @@ impl CompletionDb {
         }
 
         Self {
-            conn: std::sync::Mutex::new(c),
-            pending_completions: std::sync::Mutex::new(None),
+            conn: parking_lot::Mutex::new(c),
+            pending_completions: parking_lot::Mutex::new(None),
         }
     }
 
@@ -71,27 +71,27 @@ impl CompletionDb {
         model: &str,
         prompt: &str,
     ) -> u32 {
-        let db = self.conn.lock().unwrap();
-        match db.query_row(
-            indoc!(
-                "INSERT INTO completions
-                (document_uri, cursor_line, cursor_character, model_name, prompt)
-                VALUES (?,?,?,?,?) RETURNING id;"
-            ),
-            rusqlite::params![
-                uri,
-                line_no.to_string().as_str(),
-                offset.to_string().as_str(),
-                model,
-                prompt,
-            ],
-            |row| row.get(0),
-        ) {
-            Ok(id) => id,
-            Err(e) => {
-                error!("Failed to insert completion: {:?}", e);
-                0
-            }
+        use std::time::Duration;
+
+        if let Some(db) = self.conn.try_lock_for(Duration::from_secs(1)) {
+            db.query_row(
+                indoc!(
+                    "INSERT INTO completions
+                    (document_uri, cursor_line, cursor_character, model_name, prompt)
+                    VALUES (?,?,?,?,?) RETURNING id;"
+                ),
+                rusqlite::params![
+                    uri,
+                    line_no.to_string().as_str(),
+                    offset.to_string().as_str(),
+                    model,
+                    prompt,
+                ],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+        } else {
+            0
         }
     }
 
@@ -103,26 +103,34 @@ impl CompletionDb {
         display_text: &str,
         pending: &mut Vec<PendingCandidate>,
     ) {
-        let db = self.conn.lock().unwrap();
-        match db.query_row(
-            indoc!(
-                "INSERT INTO completion_candidates
+        if let Some(db) = self.conn.try_lock_for(std::time::Duration::from_secs(1)) {
+            match db.query_row(
+                indoc!(
+                    "INSERT INTO completion_candidates
                     (completion_id, rank, candidate)
                     VALUES (?,?,?) RETURNING id;"
-            ),
-            rusqlite::params![completion_id, 0, candidate_text],
-            |row| row.get::<_, i64>(0),
-        ) {
-            Ok(id) => pending.push(PendingCandidate {
-                db_id: id,
-                candidate: display_text.to_string(),
-            }),
-            Err(err) => debug!("Failed to insert completion_candidate: {}", err),
+                ),
+                rusqlite::params![completion_id, 0, candidate_text],
+                |row| row.get::<_, i64>(0),
+            ) {
+                Ok(id) => pending.push(PendingCandidate {
+                    db_id: id,
+                    candidate: display_text.to_string(),
+                }),
+                Err(err) => debug!("Failed to insert completion_candidate: {}", err),
+            }
         }
     }
 
     fn set_completions(&self, uri: String, candidates: Vec<PendingCandidate>) {
-        *self.pending_completions.lock().unwrap() = Some((uri, candidates));
+        use std::time::Duration;
+
+        if let Some(mut cmp) = self
+            .pending_completions
+            .try_lock_for(Duration::from_secs(1))
+        {
+            *cmp = Some((uri, candidates));
+        }
     }
 
     fn mark_selected_completion(
@@ -130,21 +138,36 @@ impl CompletionDb {
         uri: &str,
         content_changes: &[TextDocumentContentChangeEvent],
     ) {
-        let (pending_uri, candidates) = self.pending_completions.lock().unwrap().take().unwrap();
+        let (pending_uri, candidates) = {
+            let Some(cmp) = self
+                .pending_completions
+                .try_lock_for(std::time::Duration::from_secs(1))
+            else {
+                return;
+            };
 
-        if pending_uri == uri {
-            for change in content_changes {
-                if let Some(c) = candidates.iter().find(|c| c.candidate == change.text) {
-                    let db = self.conn.lock().unwrap();
-                    if let Err(e) = db.execute(
-                        "UPDATE completion_candidates SET selected = true WHERE id = ?;",
-                        rusqlite::params![c.db_id],
-                    ) {
-                        debug!("Failed to update completion_candidates: {}", e);
-                    }
+            cmp.clone().unwrap_or(("".to_string(), vec![]))
+        };
 
-                    break;
+        if pending_uri != uri {
+            return;
+        }
+
+        for change in content_changes {
+            if let Some(c) = candidates.iter().find(|c| c.candidate == change.text) {
+                use std::time::Duration;
+
+                let Some(db) = self.conn.try_lock_for(Duration::from_secs(1)) else {
+                    return;
+                };
+                if let Err(e) = db.execute(
+                    "UPDATE completion_candidates SET selected = true WHERE id = ?;",
+                    rusqlite::params![c.db_id],
+                ) {
+                    debug!("Failed to update completion_candidates: {}", e);
                 }
+
+                break;
             }
         }
     }
@@ -154,7 +177,7 @@ impl CompletionDb {
 struct CompletionDb {}
 
 #[cfg(not(debug_assertions))]
-impl CompletionDb {
+impl FlightRecorder {
     fn new() -> Self {
         Self {}
     }
@@ -199,7 +222,7 @@ struct Backend {
     highliter: Highlighter,
     // デバッグビルド専用のDB操作
     #[cfg(debug_assertions)]
-    db: CompletionDb,
+    db: FlightRecorder,
 }
 
 /// `LanguageServer` トレイトの実装。
@@ -464,18 +487,28 @@ impl LanguageServer for Backend {
 
     // #[instrument(ret, err)]
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        debug!("completion");
+        debug!(
+            "completion: partial({:?}), progress({:?})",
+            params.partial_result_params.partial_result_token,
+            params.work_done_progress_params.work_done_token
+        );
 
         if let Some(context) = params.context {
             match context.trigger_kind {
                 CompletionTriggerKind::INVOKED => {
                     // Handle completion triggered by user input
+                    debug!("triggered by user input");
                 }
                 CompletionTriggerKind::TRIGGER_CHARACTER => {
                     // Handle completion triggered by a specific character
+                    debug!(
+                        "trigger by '{}'",
+                        context.trigger_character.unwrap_or("※".to_string())
+                    );
                 }
                 CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS => {
                     // Handle completion triggered for incomplete completion
+                    debug!("trigger for incomplete completion");
                 }
                 _ => {
                     // Handle other trigger kinds
@@ -488,23 +521,18 @@ impl LanguageServer for Backend {
         let line_no = params.text_document_position.position.line as usize;
         let offset = params.text_document_position.position.character as usize;
 
-        // 対象行と前後をtokenize
         self.highliter.initialize(); // TODO 正しいdepthを割り当てたい
-        let before = text
-            .iter()
-            .take(line_no)
-            .map(|l| l.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+
+        let before =
+            cursor_context::before_sentences_upto(text.as_mut_slice(), line_no, offset, 10, |ln| {
+                self.tokenize_line(uri, ln);
+            });
 
         if offset > 0 && before.is_empty() {
             return Err(tower_lsp::jsonrpc::Error::invalid_params(
                 "offset > 0 && before.is_empty()",
             ));
         }
-
-        let line: &str = text[line_no].text.as_str();
-        let left: String = line.chars().take(offset).collect();
 
         // カーソルコンテキスト分類
         let context = cursor_context::classify_complesion_mode(&mut text, line_no, offset, |ln| {
@@ -514,7 +542,7 @@ impl LanguageServer for Backend {
 
         let prompt_fn = Backend::ctx_to_prompt_name(context);
         debug!("Prompt: {}", prompt_fn);
-        let prompt = String::from_utf8_lossy(
+        let mut prompt = String::from_utf8_lossy(
             Asset::get(prompt_fn)
                 .unwrap_or_else(|| panic!("{} not found", prompt_fn))
                 .data
@@ -523,69 +551,33 @@ impl LanguageServer for Backend {
         .to_string();
 
         // front matter処理
-        let options = if let Ok(path) = params
-            .text_document_position
-            .text_document
-            .uri
-            .to_file_path()
-            && let Some(ext) = path.extension()
-            && ext.to_string_lossy() == ".md"
+        let options = if let Some(ext) = Path::new(prompt_fn).extension()
+            && ext.to_string_lossy() == "md"
         {
+            debug!("Front matter...");
             let matter = gray_matter::Matter::<gray_matter::engine::YAML>::new();
             let parsed_matter = matter.parse::<HashMap<String, String>>(prompt.as_str());
-            parsed_matter.map(|entry| entry.data).unwrap()
+            parsed_matter
+                .map(|v| {
+                    debug!("\tparsed {}", v.excerpt.unwrap_or_default());
+                    prompt = v.content;
+                    v.data
+                })
+                .unwrap_or({
+                    debug!("\tNo front matter.");
+                    None
+                })
         } else {
+            debug!("No ext. on file");
             None
-        };
+        }
+        .unwrap_or(HashMap::new());
 
         let mut completion_id = 0u32;
         let raw = self
-            .use_llm(async |l| {
-                if let Some(data) = options {
-                    if let Some(v) = data.get("max_tokens")
-                        && let Ok(n) = v.parse::<u32>()
-                    {
-                        l.max_tokens(n);
-                    }
-                    if let Some(v) = data.get("temperature")
-                        && let Ok(n) = v.parse::<f64>()
-                    {
-                        l.temperature(n);
-                    }
-                    if let Some(v) = data.get("top_p")
-                        && let Ok(n) = v.parse::<f64>()
-                    {
-                        l.top_p(n);
-                    }
-                    if let Some(v) = data.get("stop_sequences") {
-                        l.stop_sequences(v.split(',').map(|s| s.to_string()).collect());
-                    }
-                    if let Some(v) = data.get("seed")
-                        && let Ok(n) = v.parse::<u64>()
-                    {
-                        l.seed(n);
-                    }
-                    if let Some(v) = data.get("reasoning_effort")
-                        && let Ok(n) = v.parse::<ReasoningEffort>()
-                    {
-                        l.reasoning_effort(n);
-                    }
-                    // if let Some(v) = data.get("response_format") { ... }
-                    if let Some(v) = data.get("service_tier")
-                        && let Ok(n) = v.parse::<ServiceTier>()
-                    {
-                        l.service_tier(n);
-                    }
-                    if let Some(v) = data.get("verbosity")
-                        && let Ok(n) = v.parse::<Verbosity>()
-                    {
-                        l.verbosity(n);
-                    }
-                }
-
+            .use_llm_with_option(options, async |l| {
                 l.add(Content::Text(prompt));
-                l.add(Content::Text(before));
-                l.add(Content::Text(left));
+                l.add(Content::Text(before.join("")));
 
                 completion_id = self.db.record_completion(
                     uri,
@@ -594,21 +586,33 @@ impl LanguageServer for Backend {
                     l.get_model(),
                     l.build_content().as_str(),
                 );
+                trace!("Completion {}", completion_id);
 
-                debug!("Before chat.");
                 l.chat().await
             })
             .await;
 
         debug!(
-            "{}",
-            format!("{:?}", raw).chars().take(30).collect::<String>()
+            "{:?}",
+            if let Ok(s) = raw.as_ref() {
+                if s.chars().count() > 40 {
+                    s.chars().take(18).collect::<String>()
+                        + "……"
+                        + s.chars()
+                            .skip(s.chars().count() - 18)
+                            .collect::<String>()
+                            .as_str()
+                } else {
+                    s.to_string()
+                }
+            } else {
+                "".to_string()
+            }
         );
         match raw {
             Ok(response) => {
                 debug!("raw Ok.");
 
-                #[cfg(debug_assertions)]
                 let mut pending: Vec<PendingCandidate> = Vec::new();
 
                 let items = response
@@ -641,9 +645,11 @@ impl LanguageServer for Backend {
                             }
                         };
 
+                        debug!("record candidate");
                         self.db
                             .record_candidate(completion_id, &sr, r, &mut pending);
 
+                        debug!("Completion Item");
                         if sr.chars().count() > 25 {
                             CompletionItem {
                                 label: sr.chars().take(23).collect::<String>() + "……",
@@ -665,6 +671,7 @@ impl LanguageServer for Backend {
                     })
                     .collect();
 
+                debug!("set completions");
                 self.db.set_completions(uri.to_string(), pending);
 
                 let list = CompletionList {
@@ -672,10 +679,12 @@ impl LanguageServer for Backend {
                     items,
                 };
 
+                debug!("Ok completions");
                 Ok(Some(CompletionResponse::List(list)))
             }
             Err(err) => {
                 error!("Error on completion: {:?}", err);
+
                 Err(tower_lsp::jsonrpc::Error::invalid_params(err.to_string()))
             }
         }
@@ -770,6 +779,7 @@ fn apply_changes<T: AsRef<str>>(lines: &mut Vec<LineData>, text: T, range: Range
 }
 
 impl Backend {
+    #[allow(unused)]
     async fn use_llm<F>(&self, proc: F) -> core::result::Result<String, Box<dyn core::error::Error>>
     where
         F: for<'b, 'a> AsyncFnOnce(
@@ -783,6 +793,71 @@ impl Backend {
             let ret = proc(llm).await;
             debug!("After use_llm.");
             return ret;
+        }
+
+        core::result::Result::Err(Box::new(tower_lsp::jsonrpc::Error {
+            code: ErrorCode::ServerError(-32002),
+            message: std::borrow::Cow::Borrowed("LLM not initialized"),
+            data: None,
+        }))
+    }
+
+    async fn use_llm_with_option<F>(
+        &self,
+        option: HashMap<String, String>,
+        proc: F,
+    ) -> core::result::Result<String, Box<dyn core::error::Error>>
+    where
+        F: for<'b, 'a> AsyncFnOnce(
+            &'b mut Box<dyn LlmClient + 'a>,
+        )
+            -> core::result::Result<String, Box<dyn core::error::Error>>,
+    {
+        debug!("Options {:?}", option);
+        let mut ref_llm = self.llm.lock().await;
+
+        if let Some(llm) = ref_llm.deref_mut() {
+            if let Some(v) = option.get("max_tokens")
+                && let Ok(n) = v.parse::<u32>()
+            {
+                llm.max_tokens(n);
+            }
+            if let Some(v) = option.get("temperature")
+                && let Ok(n) = v.parse::<f64>()
+            {
+                llm.temperature(n);
+            }
+            if let Some(v) = option.get("top_p")
+                && let Ok(n) = v.parse::<f64>()
+            {
+                llm.top_p(n);
+            }
+            if let Some(v) = option.get("stop_sequences") {
+                llm.stop_sequences(v.split(',').map(|s| s.to_string()).collect());
+            }
+            if let Some(v) = option.get("seed")
+                && let Ok(n) = v.parse::<u64>()
+            {
+                llm.seed(n);
+            }
+            if let Some(v) = option.get("reasoning_effort")
+                && let Ok(n) = v.parse::<ReasoningEffort>()
+            {
+                llm.reasoning_effort(n);
+            }
+            // if let Some(v) = data.get("response_format") { ... }
+            if let Some(v) = option.get("service_tier")
+                && let Ok(n) = v.parse::<ServiceTier>()
+            {
+                llm.service_tier(n);
+            }
+            if let Some(v) = option.get("verbosity")
+                && let Ok(n) = v.parse::<Verbosity>()
+            {
+                llm.verbosity(n);
+            }
+
+            return proc(llm).await;
         }
 
         core::result::Result::Err(Box::new(tower_lsp::jsonrpc::Error {
@@ -886,7 +961,7 @@ async fn main() {
         llm: tokio::sync::Mutex::new(none),
         highliter: Highlighter::new(),
         #[cfg(debug_assertions)]
-        db: CompletionDb::new(&path.join("data").join("fifty_four.db")),
+        db: FlightRecorder::new(&path.join("data").join("fifty_four.db")),
     })
     .finish();
 
@@ -1067,11 +1142,6 @@ mod tests {
         assert_eq!(ls[0].tokens.len(), 0); // 変更された行のtokenは空になる
 
         assert_eq!(ls[2].tokens.len(), 23); // 改行分後ろにずれるけどtokenはそのまま
-
-        // let mut s = String::new();
-        // ls[1].tokens.iter().for_each(|t| {
-        //     let _ = writeln!(s, "{:?}:\t{:?}", ls[1].surface(&t), t.details.split_at(4).0);
-        // });
     }
     /*
     size=2*/

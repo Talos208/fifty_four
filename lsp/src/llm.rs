@@ -356,10 +356,31 @@ impl LlmClient for GenericLlmClient {
                 }))
             }));
 
-        let response = self
+        let res = self
             .inner_client
             .exec_chat(model, chat_req, Some(&self.options))
-            .await?;
+            .await;
+        let Ok(response) = res else {
+            let err = res.unwrap_err();
+            match err {
+                genai::Error::WebModelCall {
+                    model_iden: _,
+                    webc_error: ref e,
+                } => {
+                    error!("{:?}", e)
+                }
+                genai::Error::ChatResponseGeneration {
+                    model_iden: _,
+                    request_payload: _,
+                    response_body: _,
+                    cause: ref c,
+                } => {
+                    error!("{:?}", c.clone())
+                }
+                _ => {}
+            };
+            return Err(Box::new(err));
+        };
         let content = response.content.texts().join("");
 
         self.prompts.clear(); // promptはクリア、キャッシュは保存
