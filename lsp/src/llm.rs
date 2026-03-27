@@ -1,16 +1,17 @@
 use async_trait::async_trait;
+use derive_more::Display;
 use genai::adapter::AdapterKind;
 use genai::chat::{
-    ChatMessage, ChatOptions, ChatRequest, ChatResponseFormat, ReasoningEffort, ServiceTier,
-    Verbosity,
+    ChatMessage, ChatOptions, ChatRequest, ChatResponseFormat, ReasoningEffort, ServiceTier, Tool,
+    ToolCall, ToolResponse, Verbosity,
 };
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ModelName, ServiceTarget};
 #[allow(unused_imports)]
 use log::{debug, error, info, warn};
+use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::error::Error;
-use std::fmt::{self, Display};
+use std::fmt::{self, Debug, Display};
 
 /// LLMプロバイダを表すenum
 #[derive(Debug, Clone)]
@@ -134,6 +135,24 @@ impl AsRef<String> for Content {
     }
 }
 
+#[derive(Debug, Display)]
+pub enum LlmError {
+    #[display("LLM is not initialized")]
+    NotInitialized,
+    #[display("Cache \"{}\" is not found", key)]
+    #[allow(unused)]
+    CacheNotFound { key: String },
+    #[display("LLM is busy, retry after {} seconds", retry_after)]
+    LlmBusy { retry_after: u32 },
+    #[display("Generation error: {}", message)]
+    GenericError { message: String },
+    #[display("Not implemented")]
+    #[allow(unused)]
+    NotImplemented,
+}
+
+impl std::error::Error for LlmError {}
+
 #[async_trait]
 #[allow(unused)]
 pub trait LlmClient: Send + Sync + std::fmt::Debug {
@@ -141,12 +160,12 @@ pub trait LlmClient: Send + Sync + std::fmt::Debug {
     /// LLMとチャットセッションを実行する
     ///
     /// 現在のプロンプトを基にLLMにリクエストを送信し、応答を文字列として返します。
-    async fn chat(&mut self) -> Result<String, Box<dyn Error>>;
+    async fn chat(&mut self) -> Result<String, LlmError>;
 
-    async fn with_model(&mut self, model: &str) -> Result<String, Box<dyn Error>>;
+    async fn with_model(&mut self, model: &str) -> Result<String, LlmError>;
 
     /// 一時的なプロンプトを現在のセッションに追加する
-    ///
+    /// TODO Sessionを作ってそっちに持たせる
     /// このプロンプトは、次回の`chat`呼び出しでのみ使用され、その後クリアされます。
     fn add(&mut self, prompt: Content);
 
@@ -168,7 +187,7 @@ pub trait LlmClient: Send + Sync + std::fmt::Debug {
     /// プロンプトを永続的なキャッシュに追加する
     ///
     /// このプロンプトは、`chat`が呼び出されるたびに再利用されます。
-    fn cache(&mut self, prompt: Content) -> Result<String, genai::Error>;
+    fn cache(&mut self, prompt: Content) -> Result<String, LlmError>;
 
     fn fetch(&self, hash: &str) -> Option<&Content>;
 
@@ -186,13 +205,19 @@ pub trait LlmClient: Send + Sync + std::fmt::Debug {
     fn response_format(&mut self, fmt: ChatResponseFormat);
     fn service_tier(&mut self, tier: ServiceTier);
     fn verbosity(&mut self, v: Verbosity);
+
+    // Tool calling
+    fn add_tool(&mut self, tool: Box<dyn LlmTool>);
+    async fn respond_tool(&self, tools: &[ToolCall]) -> Result<ChatRequest, LlmError>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LlmClientBuilder {
     provider: Provider,
     model: Option<String>,
     url: Option<String>,
+    tools: Vec<Box<dyn LlmTool>>,
+    sys_prompt: String,
 }
 
 impl LlmClientBuilder {
@@ -203,6 +228,8 @@ impl LlmClientBuilder {
             provider: _provider.clone(),
             model: None,
             url: None,
+            tools: vec![],
+            sys_prompt: String::new(),
         }
     }
 
@@ -212,34 +239,49 @@ impl LlmClientBuilder {
             provider: Provider::from_name(name).unwrap(),
             model: None,
             url: None,
+            tools: vec![],
+            sys_prompt: String::new(),
         }
     }
 
     pub fn from_value(value: &serde_json::Value) -> Self {
+        debug!("value: {:?}", value);
         LlmClientBuilder {
             provider: Provider::from_str(value["provider"].as_str().unwrap()).unwrap(),
             model: value.get("model").map(|v| v.as_str().unwrap().to_string()),
             url: value.get("url").map(|v| v.as_str().unwrap().to_string()),
+            tools: vec![],
+            sys_prompt: String::new(),
         }
     }
 
-    pub fn model(&mut self, model: &str) -> Self {
-        Self {
-            model: Some(model.to_string()),
-            provider: self.provider.clone(),
-            url: self.url.clone(),
-        }
+    pub fn model(&mut self, model: &str) -> &Self {
+        self.model = Some(model.to_string());
+        self
     }
 
-    pub fn url(&mut self, url: &str) -> Self {
-        Self {
-            url: Some(url.to_string()),
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-        }
+    pub fn url(&mut self, url: &str) -> &Self {
+        self.url = Some(url.to_string());
+        self
     }
 
-    pub fn build(&self) -> Box<dyn LlmClient> {
+    #[allow(unused)]
+    pub fn add_tool(mut self, tool: Box<dyn LlmTool>) -> Self {
+        self.tools.push(tool);
+        debug!("Tool added to builder {:?}", self.tools);
+
+        self
+    }
+
+    pub fn sys_prompt(mut self, prompt: Option<String>) -> Self {
+        if let Some(p) = prompt {
+            self.sys_prompt = p;
+        }
+
+        self
+    }
+
+    pub fn build(self) -> Box<dyn LlmClient> {
         let mut u_from_prov = None;
         let (auth, kind, mdl_name) = match &self.provider {
             Provider::Google(mdl) => (
@@ -293,7 +335,10 @@ impl LlmClientBuilder {
                 } else {
                     endpoint
                 };
-                debug!("{:?}, {:?}, {:?}", e, auth, model_iden);
+                debug!(
+                    "ServiceTarget ( endpoint:{:?}, auth:{:?}, model:{:?} )",
+                    e, auth, model_iden
+                );
                 Ok(ServiceTarget {
                     endpoint: e,
                     auth,
@@ -312,8 +357,23 @@ impl LlmClientBuilder {
             cache: HashMap::new(),
             prompts: vec![],
             options: ChatOptions::default(),
+            tools: HashMap::from_iter(self.tools.into_iter().map(|t| {
+                let n = t.name().to_string();
+                (n, t)
+            })),
+            sys_prompt: self.sys_prompt,
         })
     }
+}
+
+/// Toolcall 関連
+#[async_trait]
+pub trait LlmTool: Send + Sync + Debug {
+    fn schema(&self) -> serde_json::Value;
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+
+    async fn invoke(&self, args: &serde_json::Map<String, Value>) -> Result<String, LlmError>;
 }
 
 /// `LlmClient`トレイトの汎用的な実装
@@ -331,18 +391,27 @@ pub struct GenericLlmClient {
     cache: HashMap<String, Content>,
     /// 現在のチャットセッションでのみ使用される一時的なプロンプト
     prompts: Vec<Content>,
+    /// 利用可能なツール
+    tools: HashMap<String, Box<dyn LlmTool>>,
+    /// システムプロンプト
+    sys_prompt: String,
 }
 
 #[async_trait]
 impl LlmClient for GenericLlmClient {
-    async fn chat(&mut self) -> Result<String, Box<dyn Error>> {
+    async fn chat(&mut self) -> Result<String, LlmError> {
         let model = self.model.clone();
         self.with_model(model.as_str()).await
     }
 
-    async fn with_model(&mut self, model: &str) -> Result<String, Box<dyn Error>> {
+    fn add_tool(&mut self, tool: Box<dyn LlmTool>) {
+        self.tools.insert(tool.as_ref().name().to_string(), tool);
+        debug!("Tool added to backend {:?}", self.tools);
+    }
+
+    async fn with_model(&mut self, model: &str) -> Result<String, LlmError> {
         // TODO AGENTS.mdをfrom_system()で投入
-        let chat_req = ChatRequest::from_messages(vec![])
+        let mut chat_req = ChatRequest::from_system(&self.sys_prompt)
             .append_messages(self.fetch_all().iter().filter_map(|c| {
                 Some(ChatMessage::system(match c {
                     Content::Text(s) => s,
@@ -354,39 +423,131 @@ impl LlmClient for GenericLlmClient {
                     Content::Text(s) => s,
                     Content::CacheEntry(h) => self.fetch(h)?.as_ref(),
                 }))
+            }))
+            // Tool call 準備
+            .with_tools(self.tools.values().map(|t| {
+                Tool::new(t.name())
+                    .with_description(t.description())
+                    .with_schema(t.schema())
             }));
 
-        let res = self
-            .inner_client
-            .exec_chat(model, chat_req, Some(&self.options))
-            .await;
-        let Ok(response) = res else {
-            let err = res.unwrap_err();
-            match err {
-                genai::Error::WebModelCall {
-                    model_iden: _,
-                    webc_error: ref e,
-                } => {
-                    error!("{:?}", e)
-                }
-                genai::Error::ChatResponseGeneration {
-                    model_iden: _,
-                    request_payload: _,
-                    response_body: _,
-                    cause: ref c,
-                } => {
-                    error!("{:?}", c.clone())
-                }
-                _ => {}
-            };
-            return Err(Box::new(err));
-        };
-        let content = response.content.texts().join("");
+        let content = loop {
+            let res = self
+                .inner_client
+                .exec_chat(model, chat_req, Some(&self.options))
+                .await;
 
-        self.prompts.clear(); // promptはクリア、キャッシュは保存
-        self.options = ChatOptions::default();
+            let Ok(response) = res else {
+                let err = res.unwrap_err();
+                match err {
+                    genai::Error::WebModelCall {
+                        model_iden: _,
+                        webc_error: ref e,
+                    } => match e {
+                        genai::webc::Error::ResponseFailedStatus {
+                            status,
+                            body: _,
+                            headers,
+                        } if *status == http::StatusCode::SERVICE_UNAVAILABLE => {
+                            error!("Web error{:?} {:?}", status, headers);
+                            let after = headers
+                                .get("Retry-After")
+                                .map(|v| v.to_str().unwrap_or("0").parse::<u32>().unwrap())
+                                .unwrap_or(0u32);
+                            return Err(LlmError::LlmBusy { retry_after: after });
+                        }
+                        _ => {
+                            error!("{:?}", e)
+                        }
+                    },
+                    genai::Error::ChatResponseGeneration {
+                        model_iden: _,
+                        request_payload: _,
+                        response_body: _,
+                        cause: ref c,
+                    } => {
+                        let msg = format!("{:?}", c.clone());
+                        error!("{}", msg);
+                        return Err(LlmError::GenericError { message: msg });
+                    }
+                    _ => {
+                        error!("{:?}", err)
+                    }
+                };
+                return Err(LlmError::GenericError {
+                    message: err.to_string(),
+                });
+            };
+
+            self.prompts.clear(); // promptはクリア、キャッシュは保存
+            self.options = ChatOptions::default();
+
+            if response.tool_calls().is_empty() {
+                break response.content.texts().join("");
+            }
+
+            // Toolcallが無くなるまでループ
+            let tc = response.into_tool_calls();
+            match self.respond_tool(tc.as_slice()).await {
+                Ok(ret) => chat_req = ret,
+                Err(e) => {
+                    return Result::Err(e);
+                }
+            }
+        };
 
         Ok(content)
+    }
+
+    async fn respond_tool(&self, tool_calls: &[ToolCall]) -> Result<ChatRequest, LlmError> {
+        let mut result_tc = vec![];
+        let mut result_tr = vec![];
+
+        for tc in tool_calls {
+            let Some(t) = self.tools.get(&tc.fn_name) else {
+                continue;
+            };
+
+            let arg = tc
+                .fn_arguments
+                .as_object()
+                .cloned()
+                .unwrap_or(Map::default());
+            info!("tool call {}({:?})", t.name(), arg);
+            match t.invoke(&arg).await {
+                // ツールコールの結果を返す
+                Ok(ret) => {
+                    result_tr.push(ToolResponse::new(tc.call_id.clone(), ret));
+                }
+                Err(e) => {
+                    // ツールコールのエラーも返す
+                    warn!("Fail to tool call: {:?}", e);
+                    result_tr.push(ToolResponse::new(
+                        tc.call_id.clone(),
+                        format!("Error: {}", e),
+                    ));
+                }
+            }
+            result_tc.push(tc.clone());
+        }
+
+        let chat_req = ChatRequest::from_messages(vec![])
+            .append_message(ChatMessage {
+                role: genai::chat::ChatRole::Assistant,
+                content: genai::chat::MessageContent::from_tool_calls(result_tc),
+                options: None,
+            })
+            .append_message(ChatMessage {
+                role: genai::chat::ChatRole::User,
+                content: genai::chat::MessageContent::from_parts(
+                    result_tr
+                        .into_iter()
+                        .map(genai::chat::ContentPart::ToolResponse)
+                        .collect::<Vec<_>>(),
+                ),
+                options: None,
+            });
+        Ok(chat_req)
     }
 
     fn add(&mut self, prompt: Content) {
@@ -406,7 +567,7 @@ impl LlmClient for GenericLlmClient {
         &self.model
     }
 
-    fn cache(&mut self, prompt: Content) -> Result<String, genai::Error> {
+    fn cache(&mut self, prompt: Content) -> Result<String, LlmError> {
         match prompt {
             Content::Text(s) => {
                 let key = format!("{:016x}", farmhash::hash64(s.as_bytes()));
@@ -417,7 +578,7 @@ impl LlmClient for GenericLlmClient {
                 if self.cache.contains_key(&key) {
                     Ok(key.clone())
                 } else {
-                    Err(genai::Error::Internal("cache not found".to_string()))
+                    Err(LlmError::CacheNotFound { key })
                 }
             }
         }

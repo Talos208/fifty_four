@@ -1,6 +1,10 @@
 // シンプルな LSP サーバの実装例（tower-lsp を利用）
 // このファイルは最小限の動作をする "何もしない" サーバを提供します。
-use tower_lsp::jsonrpc::{ErrorCode, Result};
+use comrak::arena_tree::NodeEdge;
+use comrak::nodes::{AstNode, NodeValue};
+use comrak::{Arena, options};
+use dashmap::mapref::one::RefMut;
+use std::sync::Arc;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, async_trait};
 // use tracing::{debug, info, instrument, span, warn};
@@ -14,25 +18,29 @@ use std::collections::HashMap;
 use std::str::FromStr;
 mod cursor_context;
 mod llm;
-use crate::llm::{Content, LlmClient, LlmClientBuilder};
+use crate::llm::{Content, LlmClient, LlmClientBuilder, LlmError, LlmTool};
 use std::panic;
 use std::path::{Path, PathBuf};
 mod migrations {
     use refinery::embed_migrations;
     embed_migrations!("migrations");
 }
+use dashmap::try_result::TryResult;
 use genai::chat::{ReasoningEffort, ServiceTier, Verbosity};
+#[allow(unused_imports)]
 use indoc::indoc;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use rust_embed::Embed;
+use serde_json::{Value, json};
 use std::ops::DerefMut;
 
 /// 直近のcompletion候補を記録する構造体（デバッグビルドのみ）
-#[cfg(debug_assertions)]
 #[derive(Debug, Clone)]
 struct PendingCandidate {
+    #[cfg(debug_assertions)]
     db_id: i64,
+    #[cfg(debug_assertions)]
     candidate: String,
 }
 
@@ -174,37 +182,470 @@ impl FlightRecorder {
 }
 
 #[cfg(not(debug_assertions))]
-struct CompletionDb {}
+#[derive(Debug)]
+struct FlightRecorder {}
 
 #[cfg(not(debug_assertions))]
 impl FlightRecorder {
-    fn new() -> Self {
+    fn new(_path: &PathBuf) -> Self {
         Self {}
     }
 
     fn record_completion(
         &self,
-        uri: &str,
-        line_no: usize,
-        offset: usize,
-        model: &str,
-        prompt: &str,
+        _uri: &str,
+        _line_no: usize,
+        _offset: usize,
+        _model: &str,
+        _prompt: &str,
     ) -> u32 {
-        0
+        0u32
     }
 
     fn record_candidate(
         &self,
-        completion_id: u32,
-        candidate_text: &str,
-        display_text: &str,
-        pending: &mut Vec<PendingCandidate>,
+        _completion_id: u32,
+        _candidate_text: &str,
+        _display_text: &str,
+        _pending: &mut Vec<PendingCandidate>,
     ) {
     }
 
-    fn set_pending(&self, uri: String, candidates: Vec<PendingCandidate>) {}
+    fn set_completions(&self, _uri: String, _candidates: Vec<PendingCandidate>) {}
 
-    fn mark_selected(&self, uri: &str, content_changes: &[TextDocumentContentChangeEvent]) {}
+    fn mark_selected_completion(
+        &self,
+        _uri: &str,
+        _content_changes: &[TextDocumentContentChangeEvent],
+    ) {
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum CharacterAttribute {
+    Appearance,
+    Background,
+    Expression,
+    Personality,
+    Relationship,
+    Role,
+    Style,
+    Weakness,
+}
+
+impl TryFrom<&str> for CharacterAttribute {
+    type Error = String;
+    fn try_from(s: &str) -> std::result::Result<Self, Self::Error> {
+        match s {
+            "appearance" | "容姿" | "特徴" | "外見" | "体格" | "風貌" | "風体" | "顔立ち"
+            | "印象" | "身体的特徴" => Ok(Self::Appearance),
+            "background" | "出自" | "出身" | "生い立ち" | "家庭環境" | "ルーツ" | "血筋"
+            | "背景" | "経歴" | "来歴" | "過去" | "前歴" | "履歴" => {
+                Ok(Self::Background)
+            }
+            "expression" | "口調" | "話し方" | "語調" | "言葉遣い" | "一人称" | "台詞" | "癖"
+            | "仕草" | "習慣" | "ルーティン" | "口癖" => Ok(Self::Expression),
+            "personality" | "性格" | "気質" | "人柄" | "気性" | "内面" | "人間性" | "価値観"
+            | "信条" | "信念" | "哲学" | "美学" | "動機" => Ok(Self::Personality),
+            "relationship" | "関係" | "交友" | "因縁" | "絆" | "家族" => {
+                Ok(Self::Relationship)
+            }
+            "role" | "立場" | "地位" | "身分" | "階級" | "役職" | "肩書" | "職務" | "役割"
+            | "任務" | "所属" => Ok(Self::Role),
+            "style" | "描写" | "文体" | "視点" | "表現" => Ok(Self::Style),
+            "weakness" | "弱点" | "急所" | "脆さ" | "欠点" | "短所" | "難点" | "問題点" => {
+                Ok(Self::Weakness)
+            }
+            _ => Err(format!("No such attribute {}", s)),
+        }
+    }
+}
+
+/// タグ付きコンテンツ。1つの見出しセクション（属性）に対応する。
+#[derive(Debug, Clone)]
+struct TaggedContent {
+    /// 見出しを「・」で分割したタグ群
+    tags: Vec<CharacterAttribute>,
+    /// セクションのプレーンテキスト
+    text: String,
+}
+
+/// 1キャラクター分のキャッシュ
+#[derive(Debug, Clone)]
+struct CharacterEntry {
+    sections: Vec<TaggedContent>,
+}
+
+/// 1ファイル分のキャッシュ
+#[derive(Debug)]
+struct FileCacheEntry {
+    modified: std::time::SystemTime,
+    /// key: heading 全文（部分一致検索用）
+    characters: HashMap<String, CharacterEntry>,
+}
+
+/// 全ファイルのキャッシュ (Arc で複数の CharacterInfoTool インスタンス間で共有)
+#[derive(Debug, Clone)]
+struct CharacterCache(Arc<parking_lot::Mutex<HashMap<PathBuf, FileCacheEntry>>>);
+
+impl CharacterCache {
+    fn new() -> Self {
+        Self(Arc::new(parking_lot::Mutex::new(HashMap::new())))
+    }
+}
+
+#[derive(Debug)]
+struct CharacterInfoTool {
+    workspace: PathBuf,
+    cache: CharacterCache,
+}
+
+#[async_trait]
+impl LlmTool for CharacterInfoTool {
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "character_name": {
+                    "type": "string",
+                    "description": "設定を取得したいキャラクターの名前"
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {
+                        "enum": ["role", "appearance", "personality", "expression", "background", "relationship", "weakness", "style"],
+                    },
+                    "uniqueItems": true,
+                    "minItems": 1,
+                    "description": "取得したい属性のタグ"
+                }
+            },
+            "required": ["character_name", "tags"],
+        })
+    }
+
+    fn name(&self) -> &str {
+        "character_info"
+    }
+
+    fn description(&self) -> &str {
+        "キャラクターの設定を取得する"
+    }
+
+    async fn invoke(
+        &self,
+        _args: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<String, LlmError> {
+        let name = _args["character_name"].as_str().unwrap_or("");
+        let tags: Vec<String> = _args
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        debug!("CharacterInfoTool({}, {:?})", name, tags);
+
+        let path = self.find_character_file_path(name)?;
+
+        let modified = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+        // キャッシュ確認（ロックは HashMap lookup の間だけ保持）
+        {
+            let cache = self.cache.0.lock();
+            if let Some(entry) = cache.get(&path)
+                && entry.modified == modified
+            {
+                let result = Self::search_cache(entry, name, &tags);
+                debug!("\t{:?}", result.map(|r| shorten_middle(&r, 40)))
+            }
+        }
+
+        // キャッシュミス: ファイルを読んでパース
+        let content =
+            tokio::fs::read_to_string(&path)
+                .await
+                .map_err(|e| LlmError::GenericError {
+                    message: format!("Failed to read {:?}: {}", &path, e),
+                })?;
+        debug!("{}", shorten_middle(&content, 40));
+
+        let characters = parse_all_content(&content);
+        let file_entry = FileCacheEntry {
+            modified,
+            characters,
+        };
+
+        let result = Self::search_cache(&file_entry, name, &tags);
+        self.cache.0.lock().insert(path, file_entry);
+        debug!("\t{:?}", result.as_ref().map(|r| shorten_middle(r, 40)));
+        result
+    }
+}
+
+impl CharacterInfoTool {
+    #[deny(clippy::new_ret_no_self)]
+    fn new(workspace: &Path, cache: CharacterCache) -> Box<dyn LlmTool> {
+        Box::new(Self {
+            workspace: workspace.to_path_buf(),
+            cache,
+        })
+    }
+
+    fn find_character_file_path(&self, name: &str) -> std::result::Result<PathBuf, LlmError> {
+        let single = self.workspace.join("characters").with_extension("md");
+        trace!("{:?}", &single);
+        if single.exists() && single.is_file() {
+            return Ok(single);
+        }
+
+        let dir = self.workspace.join("characters");
+        if !dir.exists() || !dir.is_dir() {
+            return Err(LlmError::GenericError {
+                message: format!("Found no directory {:?}", &dir),
+            });
+        }
+
+        for entry in dir
+            .read_dir()
+            .map_err(|_| LlmError::GenericError {
+                message: format!("Failed to read directory {:?}", &dir),
+            })?
+            .flatten()
+        {
+            debug!("{:?}", entry.file_name());
+            if entry.file_name().to_string_lossy().starts_with(name) {
+                return Ok(entry.path());
+            }
+        }
+
+        Err(LlmError::GenericError {
+            message: format!("Found no file for '{}' in {:?}", name, &dir),
+        })
+    }
+
+    fn search_cache(
+        entry: &FileCacheEntry,
+        name: &str,
+        tags: &[String],
+    ) -> std::result::Result<String, LlmError> {
+        // キャラクター名は部分一致で検索
+        let Some((_, char_entry)) = entry.characters.iter().find(|(k, _)| k.contains(name)) else {
+            return Err(LlmError::GenericError {
+                message: format!("Character '{}' not found", name),
+            });
+        };
+
+        let tag_attrs = tags
+            .iter()
+            .filter_map(|t| CharacterAttribute::try_from(t.as_str()).ok())
+            .collect::<Vec<_>>();
+
+        let matched = char_entry
+            .sections
+            .iter()
+            .filter(|s| tag_attrs.iter().any(|t| s.tags.contains(t)))
+            .map(|s| s.text.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>();
+
+        if matched.is_empty() {
+            Err(LlmError::GenericError {
+                message: format!("No sections matching tags {:?} for '{}'", tags, name),
+            })
+        } else {
+            Ok(matched.join("\n\n"))
+        }
+    }
+}
+
+/// ファイル内の heading 構造からキャラクターを表す heading レベルを推定する。
+///
+/// 各 heading レベルの出現回数と「直後に level+1 の heading が続くか」を調べ、
+/// 最も出現回数が多い「子持ちレベル」を返す。タイ時は低レベル優先。
+fn detect_char_level<'a>(root: &'a AstNode<'a>) -> u8 {
+    let mut counts: HashMap<u8, usize> = HashMap::new();
+    let mut has_sub: Vec<u8> = Vec::new();
+    let mut prev: u8 = 0;
+
+    for node in root.children() {
+        if let NodeValue::Heading(h) = node.data.borrow().value {
+            *counts.entry(h.level).or_default() += 1;
+            if prev > 0 && h.level > prev && !has_sub.contains(&prev) {
+                has_sub.push(prev);
+            }
+            prev = h.level;
+        }
+    }
+
+    counts
+        .iter()
+        .filter(|(l, _)| has_sub.contains(l))
+        .max_by(|(l1, c1), (l2, c2)| c1.cmp(c2).then(l2.cmp(l1)))
+        .map(|(l, _)| *l)
+        .unwrap_or(0)
+}
+
+/// Markdown 文字列をパースし、全キャラクターの全セクションを `HashMap` で返す。
+///
+/// キーは heading 全文（例: "ジェフ・クライン（艦長）"）。
+/// 属性 heading のテキストを「・」で分割してタグ群を生成する。
+fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry> {
+    let arena = Arena::new();
+    let mut options = comrak::Options::default();
+    options.extension = comrak::options::Extension::builder()
+        .cjk_friendly_emphasis(true)
+        .greentext(true)
+        .multiline_block_quotes(true)
+        .table(true)
+        .tasklist(true)
+        .wikilinks_title_before_pipe(true)
+        .build();
+    options.parse = options::Parse::builder()
+        .relaxed_tasklist_matching(true)
+        .smart(true)
+        .tasklist_in_table(true)
+        .build();
+    options.render = options::Render::builder()
+        .gfm_quirks(true)
+        .ignore_empty_links(true)
+        .build();
+
+    let root = comrak::parse_document(&arena, content, &options);
+    let char_level = detect_char_level(root);
+    if char_level == 0 {
+        return HashMap::new();
+    }
+
+    let mut characters: HashMap<String, CharacterEntry> = HashMap::new();
+    let mut current_char: Option<String> = None;
+    let mut current_section: Option<TaggedContent> = None;
+
+    // 現在のセクションをキャラクターエントリに flush するクロージャ相当のマクロ
+    macro_rules! flush_section {
+        () => {
+            if let (Some(ref char_name), Some(section)) =
+                (current_char.as_ref(), current_section.take())
+            {
+                if !section.text.trim().is_empty() {
+                    characters
+                        .entry(char_name.to_string())
+                        .or_insert_with(|| CharacterEntry {
+                            sections: Vec::new(),
+                        })
+                        .sections
+                        .push(section);
+                }
+            }
+        };
+    }
+
+    for node in root.children() {
+        let val = node.data.borrow().value.clone();
+        match val {
+            NodeValue::Heading(h) if h.level <= char_level => {
+                flush_section!();
+                current_section = None;
+                if h.level == char_level {
+                    let t = heading_text(node);
+                    trace!("{}", t);
+                    current_char = Some(t);
+                } else {
+                    // タイトルなどキャラクターレベルより上の heading はスキップ
+                    current_char = None;
+                }
+            }
+            NodeValue::Heading(h) if h.level == char_level + 1 && current_char.is_some() => {
+                flush_section!();
+                let t = heading_text(node);
+                trace!("{}", t);
+                let tags = t
+                    .split(['・', '、', ',', '/', ' '])
+                    .filter_map(|s| CharacterAttribute::try_from(s).ok())
+                    .collect::<Vec<_>>();
+                current_section = Some(TaggedContent {
+                    tags,
+                    text: String::new(),
+                });
+            }
+            _ => {
+                // コンテンツノードおよびそれより深い heading はテキストとして追記
+                if let Some(ref mut section) = current_section {
+                    let text = node_to_plain_text(node);
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        if !section.text.is_empty() {
+                            section.text.push('\n');
+                        }
+                        section.text.push_str(trimmed);
+                    }
+                }
+            }
+        }
+    }
+
+    flush_section!();
+    characters
+}
+
+/// 見出しノードの直接子から `Text` ノードを結合してキャラクター名や属性名を返す。
+fn heading_text<'a>(node: &'a AstNode<'a>) -> String {
+    node.children()
+        .filter_map(|c| {
+            if let NodeValue::Text(ref cow) = c.data.borrow().value {
+                Some(cow.as_ref().to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// ブロックノードを深さ優先で走査してプレーンテキストを返す。
+fn node_to_plain_text<'a>(node: &'a AstNode<'a>) -> String {
+    let mut result = String::new();
+    for edge in node.traverse() {
+        match edge {
+            NodeEdge::Start(n) => match &n.data.borrow().value {
+                NodeValue::Text(cow) => result.push_str(cow.as_ref()),
+                NodeValue::SoftBreak | NodeValue::LineBreak => result.push('\n'),
+                _ => {}
+            },
+            NodeEdge::End(n) => {
+                if let NodeValue::Paragraph = n.data.borrow().value {
+                    result.push('\n');
+                }
+            }
+        }
+    }
+    result
+}
+
+pub fn shorten(s: &str, len: usize) -> String {
+    if s.chars().count() > len {
+        s.chars().take(len - 2).collect::<String>() + "……"
+    } else {
+        s.to_owned()
+    }
+}
+
+pub fn shorten_middle(s: &str, len: usize) -> String {
+    let c = &s.chars();
+    let l = c.clone().count();
+    if l > 25 && l > len {
+        c.clone()
+            .take(len - 12)
+            .chain("……".chars())
+            .chain(c.clone().skip(l - 10))
+            .collect::<String>()
+    } else {
+        s.to_owned()
+    }
 }
 
 /// `Backend` はサーバの状態を保持する構造体です。
@@ -216,13 +657,17 @@ struct Backend {
     client: Client,
     // 文章データ（uri、行ごとのテキスト）
     text: DashMap<String, Vec<LineData>>,
+    //ワークスペース
+    #[allow(unused)]
+    workspace: tokio::sync::Mutex<Vec<WorkspaceFolder>>,
     // LLMクライアントへのハンドル
     llm: tokio::sync::Mutex<Option<Box<dyn LlmClient>>>,
 
-    highliter: Highlighter,
+    highlighter: Highlighter,
     // デバッグビルド専用のDB操作
-    #[cfg(debug_assertions)]
     db: FlightRecorder,
+    // キャラクター設定ファイルのパース結果キャッシュ
+    character_cache: CharacterCache,
 }
 
 /// `LanguageServer` トレイトの実装。
@@ -234,11 +679,18 @@ impl LanguageServer for Backend {
     ///
     /// 返却する `InitializeResult` でサーバの機能（capabilities）をクライアントに伝えます。
     // #[instrument(ret, err)]
-    async fn initialize(&self, _param: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(
+        &self,
+        _param: InitializeParams,
+    ) -> tower_lsp::jsonrpc::Result<InitializeResult> {
         // サーバの機能（capabilities）を構成します。
         // ここでは最小限として semanticTokens の提供（空実装）を宣言します。
+        debug!("initialize");
 
         debug!("Workspace: {:?}", _param.workspace_folders);
+        if let Some(ws) = _param.workspace_folders {
+            self.init_workspace(ws).await;
+        }
 
         if let Some(info) = _param.client_info {
             debug!("Client_info: {:?}", info);
@@ -248,7 +700,10 @@ impl LanguageServer for Backend {
             && let Some(llm) = opt.get("llm")
         {
             // LLMクライアントを初期化
-            let mut builder = LlmClientBuilder::from_value(llm);
+            let mut builder = LlmClientBuilder::from_value(llm).sys_prompt(
+                Asset::get("system.md")
+                    .map(|d| String::from_utf8_lossy(d.data.as_ref()).to_string()),
+            );
 
             llm.get("model").inspect(|v| {
                 builder.model(v.as_str().unwrap());
@@ -257,6 +712,8 @@ impl LanguageServer for Backend {
             llm.get("url").inspect(|v| {
                 builder.url(v.as_str().unwrap());
             });
+
+            // builder.add_tool(CharacterInfoTool::new());
 
             let cl = builder.build();
 
@@ -275,7 +732,6 @@ impl LanguageServer for Backend {
                 TextDocumentSyncKind::INCREMENTAL,
             )),
             selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
-            // document_highlight_provider: Some(OneOf::Left(true)),
             semantic_tokens_provider: Some(
                 SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
                     SemanticTokensRegistrationOptions {
@@ -353,7 +809,7 @@ impl LanguageServer for Backend {
     /// `initialized` はクライアントが初期化完了を通知した際に呼ばれます。
     ///
     // #[instrument(ret)]
-    async fn initialized(&self, _: InitializedParams) {
+    async fn initialized(&self, _params: InitializedParams) {
         debug!("LSP server initialized");
 
         let req = vec![ConfigurationItem {
@@ -363,25 +819,15 @@ impl LanguageServer for Backend {
         let res = self.client.configuration(req).await.unwrap();
         debug!("{:?}", res);
     }
-    /*
-       #[instrument(ret)]
-       async fn did_change_configuration(&self, param: DidChangeConfigurationParams) {
-           info!("did_change_configuration: {:?}", param.settings);
 
-           // エディタ側の設定を読む
-           let params = vec![ConfigurationItem {
-               scope_uri: None,
-               section: Some("settings".to_string()),
-           }];
+    /// サーバのシャットダウン要求を処理します。
+    ///
+    /// 現在は特別なクリーンアップを行わず、即座に成功を返します。
+    // #[instrument(ret, err)]
+    async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
+        Ok(())
+    }
 
-           debug!("client.configuration");
-           let _ = self.client.configuration(params).await.map(|i| {
-               i.iter().inspect(|j| {
-                   debug!("\t{:?}", j);
-               });
-           });
-       }
-    */
     // #[instrument(ret)]
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         debug!("file opened!");
@@ -449,34 +895,27 @@ impl LanguageServer for Backend {
         self.text.remove(params.text_document.uri.as_str());
     }
 
-    /// サーバのシャットダウン要求を処理します。
-    ///
-    /// 現在は特別なクリーンアップを行わず、即座に成功を返します。
-    // #[instrument(ret, err)]
-    async fn shutdown(&self) -> Result<()> {
-        Ok(())
-    }
-
     /// ドキュメント全体に対する semantic tokens の問い合わせに応答します。
     ///
     // #[instrument(ret, err)]
     async fn semantic_tokens_full(
         &self,
         params: SemanticTokensParams,
-    ) -> Result<Option<SemanticTokensResult>> {
+    ) -> tower_lsp::jsonrpc::Result<Option<SemanticTokensResult>> {
         debug!("semantic_token_full");
 
         let uri = params.text_document.uri.as_ref();
-        let mut lines = self.text.get(uri).expect("Failed to get text").to_vec();
 
-        self.highliter.initialize();
+        self.highlighter.initialize();
 
-        let tokens: Vec<_> = lines
-            .iter_mut()
-            .map(|l| self.highliter.tokenize(l))
-            .collect();
-
-        let vec = Highlighter::to_semantic_tokens(tokens);
+        let vec = {
+            let mut lines = self.text.get(uri).expect("Failed to get text").to_vec();
+            let tokens = lines
+                .iter_mut()
+                .map(|l| self.highlighter.tokenize(l))
+                .collect::<Vec<_>>();
+            Highlighter::to_semantic_tokens(tokens)
+        };
 
         let tokens = SemanticTokens {
             result_id: None,
@@ -486,7 +925,10 @@ impl LanguageServer for Backend {
     }
 
     // #[instrument(ret, err)]
-    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+    async fn completion(
+        &self,
+        params: CompletionParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<CompletionResponse>> {
         debug!(
             "completion: partial({:?}), progress({:?})",
             params.partial_result_params.partial_result_token,
@@ -517,28 +959,74 @@ impl LanguageServer for Backend {
         }
 
         let uri = params.text_document_position.text_document.uri.as_str();
-        let mut text = self.text.get(uri).unwrap().value().to_owned();
         let line_no = params.text_document_position.position.line as usize;
         let offset = params.text_document_position.position.character as usize;
+        let (context, before) = {
+            self.highlighter.initialize(); // TODO 正しいdepthを割り当てたい
 
-        self.highliter.initialize(); // TODO 正しいdepthを割り当てたい
+            let before = cursor_context::before_sentences_upto(
+                // tmp.as_mut_slice(),
+                &self.text,
+                uri,
+                line_no,
+                offset,
+                10,
+                |ln| {
+                    let mut t = match self.text.try_get_mut(uri) {
+                        TryResult::Locked => {
+                            debug!("{} is locked", uri);
+                            return;
+                        }
+                        TryResult::Absent => {
+                            debug!("{} is absent", uri);
+                            return;
+                        }
+                        TryResult::Present(t) => t,
+                    };
+                    let l = match t.get_mut(ln) {
+                        None => {
+                            debug!("line {} is absent", ln);
+                            return;
+                        }
+                        Some(l) => l,
+                    };
+                    l.tokens = self.highlighter.text_to_lindera_token(l.text.as_str());
+                },
+            );
 
-        let before =
-            cursor_context::before_sentences_upto(text.as_mut_slice(), line_no, offset, 10, |ln| {
-                self.tokenize_line(uri, ln);
-            });
+            if offset > 0 && before.is_empty() {
+                return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                    "offset > 0 && before.is_empty()",
+                ));
+            }
 
-        if offset > 0 && before.is_empty() {
-            return Err(tower_lsp::jsonrpc::Error::invalid_params(
-                "offset > 0 && before.is_empty()",
-            ));
-        }
+            // カーソルコンテキスト分類
+            let mut tmp: RefMut<_, _> = match self.text.try_get_mut(uri) {
+                TryResult::Locked => {
+                    return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                        "text for uri is locked",
+                    ));
+                }
+                TryResult::Absent => {
+                    return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                        "No text found for uri",
+                    ));
+                }
+                TryResult::Present(t) => t,
+            };
 
-        // カーソルコンテキスト分類
-        let context = cursor_context::classify_complesion_mode(&mut text, line_no, offset, |ln| {
-            self.tokenize_line(uri, ln);
-        });
-        debug!("CursorContext: {:?}", context);
+            let context = cursor_context::classify_complesion_mode(
+                tmp.as_mut_slice(),
+                line_no,
+                offset,
+                |ln| {
+                    let mut t = self.text.get_mut(uri).unwrap();
+                    let l = t.get_mut(ln).unwrap();
+                    l.tokens = self.highlighter.text_to_lindera_token(l.text.as_str());
+                },
+            );
+            (context, before)
+        };
 
         let prompt_fn = Backend::ctx_to_prompt_name(context);
         debug!("Prompt: {}", prompt_fn);
@@ -576,6 +1064,18 @@ impl LanguageServer for Backend {
         let mut completion_id = 0u32;
         let raw = self
             .use_llm_with_option(options, async |l| {
+                l.add_tool(CharacterInfoTool::new(
+                    &self
+                        .client
+                        .workspace_folders()
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or(vec![])
+                        .first()
+                        .map(|v| v.uri.to_file_path().unwrap())
+                        .unwrap_or_default(),
+                    self.character_cache.clone(),
+                ));
                 l.add(Content::Text(prompt));
                 l.add(Content::Text(before.join("")));
 
@@ -592,23 +1092,6 @@ impl LanguageServer for Backend {
             })
             .await;
 
-        debug!(
-            "{:?}",
-            if let Ok(s) = raw.as_ref() {
-                if s.chars().count() > 40 {
-                    s.chars().take(18).collect::<String>()
-                        + "……"
-                        + s.chars()
-                            .skip(s.chars().count() - 18)
-                            .collect::<String>()
-                            .as_str()
-                } else {
-                    s.to_string()
-                }
-            } else {
-                "".to_string()
-            }
-        );
         match raw {
             Ok(response) => {
                 debug!("raw Ok.");
@@ -652,7 +1135,7 @@ impl LanguageServer for Backend {
                         debug!("Completion Item");
                         if sr.chars().count() > 25 {
                             CompletionItem {
-                                label: sr.chars().take(23).collect::<String>() + "……",
+                                label: shorten(&sr, 25),
                                 kind: Some(CompletionItemKind::TEXT),
                                 documentation: Some(Documentation::MarkupContent(MarkupContent {
                                     kind: MarkupKind::Markdown,
@@ -685,9 +1168,36 @@ impl LanguageServer for Backend {
             Err(err) => {
                 error!("Error on completion: {:?}", err);
 
+                if let LlmError::LlmBusy { retry_after: _ } = err {
+                    self.client
+                        .show_message(
+                            MessageType::WARNING,
+                            "現在LLMが混雑しています。しばらくしてから再度試してください",
+                        )
+                        .await;
+                }
+
                 Err(tower_lsp::jsonrpc::Error::invalid_params(err.to_string()))
             }
         }
+    }
+
+    // #[instrument(ret)]
+    async fn did_change_configuration(&self, param: DidChangeConfigurationParams) {
+        info!("did_change_configuration: {:?}", param.settings);
+
+        // エディタ側の設定を読む
+        let params = vec![ConfigurationItem {
+            scope_uri: None,
+            section: Some("settings".to_string()),
+        }];
+
+        debug!("client.configuration");
+        let _ = self.client.configuration(params).await.inspect(|i| {
+            i.iter().for_each(|j| {
+                debug!("\t{:?}", j);
+            });
+        });
     }
 
     // #[instrument(ret, err)]
@@ -737,6 +1247,21 @@ impl LanguageServer for Backend {
 
     //     Ok(result)
     // }
+
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        debug!("did_change_workspace_folders");
+        debug!("\t before {:?}", self.workspace.lock().await);
+        for ws in params.event.removed {
+            let mut w = self.workspace.lock().await;
+            if let Some(ix) = w.iter().position(|v| v.uri == ws.uri) {
+                w.deref_mut().remove(ix);
+            }
+        }
+        for ws in params.event.added {
+            self.workspace.lock().await.deref_mut().push(ws);
+        }
+        debug!("\t after {:?}", self.workspace.lock().await);
+    }
 }
 
 fn apply_changes<T: AsRef<str>>(lines: &mut Vec<LineData>, text: T, range: Range) {
@@ -780,12 +1305,11 @@ fn apply_changes<T: AsRef<str>>(lines: &mut Vec<LineData>, text: T, range: Range
 
 impl Backend {
     #[allow(unused)]
-    async fn use_llm<F>(&self, proc: F) -> core::result::Result<String, Box<dyn core::error::Error>>
+    async fn use_llm<F>(&self, proc: F) -> core::result::Result<String, LlmError>
     where
         F: for<'b, 'a> AsyncFnOnce(
             &'b mut Box<dyn LlmClient + 'a>,
-        )
-            -> core::result::Result<String, Box<dyn core::error::Error>>,
+        ) -> core::result::Result<String, LlmError>,
     {
         let mut ref_llm = self.llm.lock().await;
         if let Some(llm) = ref_llm.deref_mut() {
@@ -795,23 +1319,18 @@ impl Backend {
             return ret;
         }
 
-        core::result::Result::Err(Box::new(tower_lsp::jsonrpc::Error {
-            code: ErrorCode::ServerError(-32002),
-            message: std::borrow::Cow::Borrowed("LLM not initialized"),
-            data: None,
-        }))
+        core::result::Result::Err(LlmError::NotInitialized)
     }
 
     async fn use_llm_with_option<F>(
         &self,
         option: HashMap<String, String>,
         proc: F,
-    ) -> core::result::Result<String, Box<dyn core::error::Error>>
+    ) -> core::result::Result<String, LlmError>
     where
         F: for<'b, 'a> AsyncFnOnce(
             &'b mut Box<dyn LlmClient + 'a>,
-        )
-            -> core::result::Result<String, Box<dyn core::error::Error>>,
+        ) -> core::result::Result<String, LlmError>,
     {
         debug!("Options {:?}", option);
         let mut ref_llm = self.llm.lock().await;
@@ -860,11 +1379,7 @@ impl Backend {
             return proc(llm).await;
         }
 
-        core::result::Result::Err(Box::new(tower_lsp::jsonrpc::Error {
-            code: ErrorCode::ServerError(-32002),
-            message: std::borrow::Cow::Borrowed("LLM not initialized"),
-            data: None,
-        }))
+        core::result::Result::Err(LlmError::NotInitialized)
     }
 
     fn update_all(&self, uri: &str, _offset: u32, texts: Vec<String>) {
@@ -903,19 +1418,49 @@ impl Backend {
             CursorContext::Other => "prompt_completion.md",
         }
     }
+    /*
+       pub fn tokenize_line(&self, url: &str, line_no: usize) {
+           debug!("Backend::tokenize_line({:?}, {:?})", url, line_no);
+           let tmp = self.text.try_get_mut(url); // ここで2重ロック
+           let mut t: RefMut<_, _> = match tmp {
+               TryResult::Locked => {
+                   error!("text is locked");
+                   return;
+               }
+               TryResult::Absent => {
+                   warn!("URL not found in text: {}", url);
+                   return;
+               }
+               TryResult::Present(tmp2) => {
+                   if !tmp2[line_no].tokens.is_empty() {
+                       return;
+                   }
+                   tmp2
+               }
+           };
+           // let mut t: &mut Vec<LineData> = tmp2.as_mut();
+           let mut l = t
+               // .as_mut()
+               // .value_mut()   // この辺で参照でなく値になってしまってる疑い
+               .get_mut(line_no)
+               .unwrap(); //.clone();
+           self.highlighter.tokenize(&mut l);
+           // debug!(
+           //     "\t{:?}",
+           //     l
+           //         .tokens
+           //         .iter()
+           //         .take(1),
+           // );
+       }
 
-    pub fn tokenize_line(&self, url: &str, line_no: usize) {
-        if !self.text.get(url).unwrap()[line_no].tokens.is_empty() {
-            return;
-        }
-        self.highliter.tokenize(
-            self.text
-                .get_mut(&url.to_string())
-                .unwrap()
-                .value_mut()
-                .get_mut(line_no)
-                .unwrap(),
-        );
+       pub fn tokenize_line2(&self, line: &mut LineData) {
+           self.highlighter.tokenize(line);
+       }
+    */
+    async fn init_workspace(&self, mut workspaces: Vec<WorkspaceFolder>) {
+        debug!("init_workspace: {:?}", workspaces);
+        self.workspace.lock().await.append(&mut workspaces);
     }
 }
 
@@ -949,6 +1494,9 @@ async fn main() {
     }
 
     env_logger::Builder::from_default_env()
+        .format_target(false)
+        .format_module_path(false)
+        .format_source_path(true)
         .target(env_logger::Target::Stderr)
         .init();
 
@@ -958,10 +1506,11 @@ async fn main() {
     let (service, socket) = tower_lsp::LspService::build(|client| Backend {
         client,
         text: DashMap::new(),
+        workspace: tokio::sync::Mutex::new(vec![]),
         llm: tokio::sync::Mutex::new(none),
-        highliter: Highlighter::new(),
-        #[cfg(debug_assertions)]
+        highlighter: Highlighter::new(),
         db: FlightRecorder::new(&path.join("data").join("fifty_four.db")),
+        character_cache: CharacterCache::new(),
     })
     .finish();
 
@@ -1184,4 +1733,121 @@ mod tests {
         assert_eq!(ls, lines("Abcd"));
     }
     */
+    const CHARACTERS_MD: &str = indoc!(
+        "# キャラクター記述スタイルガイド
+        ## ジェフ・クライン（艦長）
+        ### 背景・立場
+        - ムサイ艦の艦長。元警備隊員で予備役上がり。
+        ### 性格・口調
+        - 落ち着いていて経験豊富。
+        - 若手を気遣う姿勢があり、柔らかい口調で励ます。
+        - 軽い冗談や皮肉も交えるが、威圧的ではない。
+        ### 描写
+        - 内省的なモノローグを交えることで、過去の経緯や感情を表現。
+        - 視点人物として描かれることが多く、周囲の状況や人物への観察が豊富。
+        - 軍務に対する冷静な視点と、個人的な感慨が混在する。
+        ### 外見・その他
+        - 明確な外見描写はなし。
+        - フォン・ブラウン出身、サイド3に移住経験あり。
+        ## シルビア（航海士）
+        ### 背景・立場
+        - 若手の航海士。高校を飛び出して促成コースで軍に入隊。
+        ### 性格・口調
+        - 真面目で緊張しやすいが、素直で礼儀正しい。
+        - 敬語を使い、上官に対して忠実。
+        ### 描写
+        - 若さと未熟さを強調する描写（肩に力が入る、敬礼、緊張）。
+        - 操縦技術や成長の兆しを描くことで、読者に期待感を持たせる。
+        - 艦長との対話で人間関係や信頼感を表現。
+        ### 外見・その他
+        - 「少女」と形容される。
+        - 操縦桿を握る姿勢や伸びをする仕草など、身体的な動作描写が多い。
+        "
+    );
+
+    fn make_entry(md: &str) -> FileCacheEntry {
+        FileCacheEntry {
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            characters: parse_all_content(md),
+        }
+    }
+
+    #[test]
+    fn test_parse_characters_md_detect_level() {
+        let chars = parse_all_content(CHARACTERS_MD);
+        // level 2 がキャラクターレベルとして正しく検出されること
+        assert!(
+            chars.contains_key("ジェフ・クライン（艦長）"),
+            "キーが存在しない: {:?}",
+            chars.keys().collect::<Vec<_>>()
+        );
+        assert!(chars.contains_key("シルビア（航海士）"));
+    }
+
+    #[test]
+    fn test_parse_characters_md_background() {
+        let entry = make_entry(CHARACTERS_MD);
+        let result = CharacterInfoTool::search_cache(&entry, "クライン", &["背景".to_string()]);
+        assert!(result.is_ok(), "{:?}", result);
+        assert!(result.unwrap().contains("予備役"));
+    }
+
+    #[test]
+    fn test_parse_characters_md_expression() {
+        let entry = make_entry(CHARACTERS_MD);
+        let result = CharacterInfoTool::search_cache(&entry, "シルビア", &["描写".to_string()]);
+        assert!(result.is_ok(), "{:?}", result);
+        assert!(result.unwrap().contains("成長の兆し"));
+    }
+
+    #[test]
+    fn test_parse_characters_md_personality() {
+        let entry = make_entry(CHARACTERS_MD);
+        let result = CharacterInfoTool::search_cache(&entry, "ジェフ", &["性格".to_string()]);
+        assert!(result.is_ok(), "{:?}", result);
+        assert!(result.unwrap().starts_with("落ち着いていて"));
+    }
+
+    #[test]
+    fn test_parse_characters_md_multi_tag_from_heading() {
+        // "性格・口調" heading が ["性格", "口調"] に分割されること
+        let entry = make_entry(CHARACTERS_MD);
+        let by_kuchou = CharacterInfoTool::search_cache(&entry, "ジェフ", &["口調".to_string()]);
+        assert!(
+            by_kuchou.is_ok(),
+            "「口調」タグでヒットしない: {:?}",
+            by_kuchou
+        );
+        let by_seikaku = CharacterInfoTool::search_cache(&entry, "ジェフ", &["性格".to_string()]);
+        assert_eq!(
+            by_kuchou.unwrap(),
+            by_seikaku.unwrap(),
+            "「口調」と「性格」は同じセクションを返すはず"
+        );
+    }
+
+    #[test]
+    fn test_parse_characters_md_or_search() {
+        // 複数タグ OR 検索: 異なるセクションがまとめて返ること
+        let entry = make_entry(CHARACTERS_MD);
+        let result = CharacterInfoTool::search_cache(
+            &entry,
+            "クライン",
+            &["背景".to_string(), "性格".to_string()],
+        );
+        assert!(result.is_ok(), "{:?}", result);
+        let text = result.unwrap();
+        assert!(text.contains("予備役"), "背景セクションが含まれていない");
+        assert!(
+            text.contains("落ち着いていて"),
+            "性格セクションが含まれていない"
+        );
+    }
+
+    #[test]
+    fn test_parse_characters_md_failure() {
+        let entry = make_entry(CHARACTERS_MD);
+        let result = CharacterInfoTool::search_cache(&entry, "ユルゲン", &["性格".to_string()]);
+        assert!(result.is_err(), "存在しないキャラクターでエラーにならない");
+    }
 }

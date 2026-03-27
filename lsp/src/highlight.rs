@@ -157,36 +157,43 @@ impl Highlighter {
         self.bracket_depth.store(0, Relaxed);
     }
 
+    pub fn text_to_lindera_token(&self, text: &str) -> Vec<CachedLinderaToken> {
+        self.tokenizer
+            .tokenize(text)
+            .expect("failed to tokenize text")
+            .into_iter()
+            .filter_map(|mut t| {
+                let d = t.details();
+                if d[6] == "*" {
+                    trace!("\t{:?} {:?}", d[6], d[0..=3].to_vec());
+                    if d[0] == "名詞" && d[1] == "サ変接続" {
+                        // 不正なtokenはしまっちゃう
+                        return None;
+                    }
+                }
+
+                Some(CachedLinderaToken {
+                    details: t.details().iter().map(|s| s.to_string()).collect(),
+                    byte_start: t.byte_start,
+                    byte_end: t.byte_end,
+                    tag: TokenStatus::Normal, // TODO 括弧の深さはどうしようねぇ
+                })
+            })
+            .collect()
+    }
+
     /// テキストを受け取り、ハイライト用トークン列を返す。
     ///
     /// Lindera を用いて形態素解析を行い、語種に基づくトークン種別を生成します。
     pub fn tokenize(&self, line: &mut LineData) -> Vec<SemanticToken> {
+        debug!(
+            "Highlighter::tokenize {}",
+            crate::shorten_middle(line.text.as_str(), 45)
+        );
         // 遅延解析
         if line.tokens.is_empty() {
             trace!("lazy tokenize");
-            line.tokens = self
-                .tokenizer
-                .tokenize(line.text.as_str())
-                .expect("failed to tokenize text")
-                .into_iter()
-                .filter_map(|mut t| {
-                    let d = t.details();
-                    if d[6] == "*" {
-                        trace!("\t{:?} {:?}", d[6], d[0..=3].to_vec());
-                        if d[0] == "名詞" && d[1] == "サ変接続" {
-                            // 不正なtokenはしまっちゃう
-                            return None;
-                        }
-                    }
-
-                    Some(CachedLinderaToken {
-                        details: t.details().iter().map(|s| s.to_string()).collect(),
-                        byte_start: t.byte_start,
-                        byte_end: t.byte_end,
-                        tag: TokenStatus::Normal,
-                    })
-                })
-                .collect();
+            line.tokens = self.text_to_lindera_token(&line.text);
         };
         trace!("{}", line.tokens.len());
 

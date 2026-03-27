@@ -17,5 +17,8 @@ extension\target
 Thumbs.db
 .env*
 
+# Claude
+**/setup*.json
+
 **/extension.wasm
 **/*.db

@@ -26,6 +26,9 @@ rust-embed = { version = "8.11.0", features = ["interpolate-folder-path", "compr
 farmhash = "1.1.5"
 gray_matter = { version = "0.3.2", features = ["yaml"] }
 parking_lot = { version = "0.12.4", features = ["deadlock_detection"] }
+http = "1.4.0"
+derive_more = { version = "2.1.1", features = ["error", "display"] }
+comrak = { version = "0.51.0", features = ["bon","syntect","shortcodes"] }
 
 opentelemetry = "0.31.0"
 opentelemetry_sdk = { version = "0.31.0", features = ["trace", "metrics", "logs"] }

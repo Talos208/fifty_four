@@ -1,3 +1,4 @@
+use log::debug;
 use std::fmt::Debug;
 use std::str::FromStr;
 
@@ -38,6 +39,7 @@ impl FromStr for LineData {
     type Err = std::convert::Infallible;
 
     fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        debug!("LineData::from_str");
         Ok(Self {
             text: text.to_string(),
             tokens: Vec::new(),
