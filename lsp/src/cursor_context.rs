@@ -51,7 +51,7 @@ fn before_token(
     texts: &mut [LineData],
     line_no: usize,
     token_index: usize,
-    mut tokenize_line_no: impl FnMut(usize),
+    mut tokenize_line_no: impl FnMut(&mut LineData),
     predicate: impl Fn(CachedLinderaToken) -> bool,
 ) -> (usize, usize, Option<CachedLinderaToken>) {
     debug!("before_tkn");
@@ -59,17 +59,13 @@ fn before_token(
     let mut ln = line_no as i64;
 
     loop {
-        let mut tmp = texts.as_mut().get(ln as usize);
-        let line = tmp.as_mut();
-        let Some(mut line) = line else {
+        if texts.get(ln as usize).is_none() {
             return (max(0, ln) as usize, 0, None);
-        };
-        if line.tokens.is_empty() {
-            let _ = tmp;
-            tokenize_line_no(ln as usize);
-            tmp = texts.as_mut().get(ln as usize);
-            line = tmp.as_mut().unwrap();
         }
+        if texts[ln as usize].tokens.is_empty() {
+            tokenize_line_no(&mut texts[ln as usize]);
+        }
+        let line = &texts[ln as usize];
         tkn_ix = min(tkn_ix, line.tokens.len() as i64);
         trace!("\t{},({} / {})", ln, tkn_ix, line.tokens.len() as i64);
 
@@ -85,29 +81,25 @@ fn before_token(
 }
 
 fn next_token(
-    texts: &[LineData],
+    texts: &mut [LineData],
     line_no: usize,
     token_index: usize,
-    mut tokenize_line_no: impl FnMut(usize),
+    mut tokenize_line_no: impl FnMut(&mut LineData),
     predicate: impl Fn(CachedLinderaToken) -> bool,
-) -> Option<&CachedLinderaToken> {
+) -> Option<CachedLinderaToken> {
     debug!("next_token");
     let mut tkn_ix: i64 = token_index as i64;
     let mut ln = line_no;
 
     loop {
-        let mut tmp = texts.get(ln);
-        let mut line = tmp.as_mut()?;
-        if line.tokens.is_empty() {
-            let _ = tmp;
-            tokenize_line_no(ln as usize);
-            tmp = texts.get(ln as usize);
-            line = tmp.as_mut().unwrap();
+        texts.get(ln)?;
+        if texts[ln].tokens.is_empty() {
+            tokenize_line_no(&mut texts[ln]);
         }
 
         loop {
             tkn_ix += 1;
-            if let Some(tkn) = line.tokens.get(tkn_ix as usize) {
+            if let Some(tkn) = texts[ln].tokens.get(tkn_ix as usize).cloned() {
                 trace!("\t{}: {}-{}", ln, tkn.byte_start, tkn.byte_end);
                 if predicate(tkn.clone()) {
                     debug!("\tfound");
@@ -126,7 +118,7 @@ pub fn classify_complesion_mode(
     texts: &mut [LineData],
     line_no: usize,
     char_offset: usize,
-    mut tokenize_line_no: impl FnMut(usize),
+    mut tokenize_line_no: impl FnMut(&mut LineData),
 ) -> CursorContext {
     debug!("classify_complesion_mode({},{})", line_no, char_offset);
     let (line_no, cursor_ix, cursor_tkn) = {
@@ -193,19 +185,15 @@ fn cursor_tkn(
     texts: &mut [LineData],
     line_no: usize,
     char_offset: usize,
-    mut tokenize_line_no: &mut impl FnMut(usize),
+    tokenize_line_no: &mut impl FnMut(&mut LineData),
 ) -> (usize, usize, Option<CachedLinderaToken>) {
     debug!("cursor_tkn");
     // カーソル位置のトークンを取得
-    let mut cursor_line = &texts[line_no];
-    if !cursor_line.text.is_empty() && cursor_line.tokens.is_empty() {
-        let _ = cursor_line;
-        tokenize_line_no(line_no);
-        cursor_line = &texts[line_no];
+    if !texts[line_no].text.is_empty() && texts[line_no].tokens.is_empty() {
+        tokenize_line_no(&mut texts[line_no]);
     }
-    let cursor_line_text = &cursor_line.text;
-
-    let byte_offset: usize = cursor_line_text
+    let byte_offset: usize = texts[line_no]
+        .text
         .chars()
         .take(char_offset)
         .fold(0, |a, c| a + c.len_utf8());
@@ -214,25 +202,27 @@ fn cursor_tkn(
         "line_no: {}, char_offset: {}, byte_offset: {}",
         line_no, char_offset, byte_offset
     );
-    trace!("{}", cursor_line_text.chars().take(60).collect::<String>());
+    trace!("{}", texts[line_no].text.chars().take(45).collect::<String>());
 
-    let (cursor_ix, cursor_tkn) = cursor_line
+    let find_result = texts[line_no]
         .tokens // Linderaは半角スペースをtokenにしない
         .iter()
         .enumerate()
         .find(|(_ix, tkn)| tkn.byte_start <= byte_offset && byte_offset < tkn.byte_end)
-        .map(|(ix, tkn)| (ix, Some(tkn.clone())))
-        .unwrap_or_else(|| {
-            debug!("Not found");
-            let ix = cursor_line.tokens.len();
-            if let Some(tkn) = next_token(texts, line_no, ix, &mut tokenize_line_no, |tkn| {
-                !is_whitespace(&tkn)
-            }) {
-                (ix, Some(tkn.clone()))
-            } else {
-                (cursor_line.tokens.len(), None)
-            }
-        });
+        .map(|(ix, tkn)| (ix, Some(tkn.clone())));
+
+    let ix_at_end = texts[line_no].tokens.len();
+
+    let (cursor_ix, cursor_tkn) = find_result.unwrap_or_else(|| {
+        debug!("Not found");
+        if let Some(tkn) = next_token(texts, line_no, ix_at_end, tokenize_line_no, |tkn| {
+            !is_whitespace(&tkn)
+        }) {
+            (ix_at_end, Some(tkn))
+        } else {
+            (ix_at_end, None)
+        }
+    });
     (line_no, cursor_ix, cursor_tkn)
 }
 
@@ -379,22 +369,18 @@ mod tests {
     }
 
     struct TestData {
-        texts: *mut Vec<LineData>,
         hl: Highlighter,
     }
 
     impl TestData {
-        fn build(texts: &mut Vec<LineData>) -> Self {
+        fn new() -> Self {
             Self {
-                texts: texts as *mut _,
                 hl: Highlighter::new(),
             }
         }
 
-        fn tokenize(&mut self, line_no: usize) {
-            unsafe {
-                self.hl.tokenize(&mut (&mut *self.texts)[line_no]);
-            }
+        fn tokenize(&self, line: &mut LineData) {
+            self.hl.tokenize(line);
         }
     }
 
@@ -418,11 +404,10 @@ mod tests {
     #[test]
     fn after_closing_bracket() {
         let mut texts = lines("彼は言った。「こんにちは」");
-        let mut td = TestData::build(&mut texts);
-        let line = &texts[0].text;
-        let offset = line.chars().count(); // カーソルは末尾
+        let td = TestData::new();
+        let offset = texts[0].text.chars().count(); // カーソルは末尾
         assert_eq!(
-            classify_complesion_mode(&mut texts, 0, offset, |ln: usize| td.tokenize(ln)),
+            classify_complesion_mode(&mut texts, 0, offset, |line| td.tokenize(line)),
             CursorContext::AfterClosingBracket
         );
     }
@@ -430,9 +415,9 @@ mod tests {
     #[test]
     fn after_closing_bracket_with_whitespace() {
         let mut text = lines("思い出した。\n「」\n　故郷たる");
-        let mut td = TestData::build(&mut text);
+        let td = TestData::new();
         assert_eq!(
-            classify_complesion_mode(&mut text, 2, 1, |ln: usize| td.tokenize(ln)),
+            classify_complesion_mode(&mut text, 2, 1, |line| td.tokenize(line)),
             CursorContext::AfterClosingBracket
         );
     }
@@ -450,10 +435,10 @@ mod tests {
     #[test]
     fn after_sentence_end() {
         let mut text = lines("これは文章。");
-        let mut td = TestData::build(&mut text);
+        let td = TestData::new();
         let offset = text[0].text.chars().count();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |ln: usize| td.tokenize(ln)),
+            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
             CursorContext::AfterSentenceEnd
         );
     }
@@ -461,9 +446,9 @@ mod tests {
     #[test]
     fn after_sentence_end_with_newline() {
         let mut text = lines("これは文章。\n");
-        let mut td = TestData::build(&mut text);
+        let td = TestData::new();
         assert_eq!(
-            classify_complesion_mode(&mut text, 1, 0, |ln: usize| td.tokenize(ln)),
+            classify_complesion_mode(&mut text, 1, 0, |line| td.tokenize(line)),
             CursorContext::AfterSentenceEnd
         );
     }
@@ -471,9 +456,9 @@ mod tests {
     #[test]
     fn empty_bracket() {
         let mut text = lines("「」");
-        let mut td = TestData::build(&mut text);
+        let td = TestData::new();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, 1, |ln: usize| td.tokenize(ln)),
+            classify_complesion_mode(&mut text, 0, 1, |line| td.tokenize(line)),
             CursorContext::EmptyBracket
         );
     }
@@ -493,10 +478,10 @@ mod tests {
     #[test]
     fn before_closing_bracket() {
         let mut text = lines("「こんにちは」");
-        let mut td = TestData::build(&mut text);
+        let td = TestData::new();
         let offset = "「こんにちは".chars().count();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |ln| td.tokenize(ln)),
+            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
             CursorContext::BeforeClosingBracket
         );
     }
@@ -504,11 +489,11 @@ mod tests {
     #[test]
     fn before_closing_bracket_multiline() {
         let mut text = lines("「こんにちは\n」");
-        let mut td = TestData::build(&mut text);
+        let td = TestData::new();
         // カーソルは1行目の末尾
         let offset = "「こんにちは".chars().count();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |ln| td.tokenize(ln)),
+            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
             CursorContext::BeforeClosingBracket
         );
     }
@@ -516,10 +501,10 @@ mod tests {
     #[test]
     fn in_bracket_other() {
         let mut text = lines("「こんにちは、");
-        let mut td = TestData::build(&mut text);
+        let td = TestData::new();
         let offset = text[0].text.chars().count();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |ln| td.tokenize(ln)),
+            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
             CursorContext::InBracketOther
         );
     }
@@ -527,10 +512,10 @@ mod tests {
     #[test]
     fn other_mid_sentence() {
         let mut text = lines("これは途中");
-        let mut td = TestData::build(&mut text);
+        let td = TestData::new();
         let offset = text[0].text.chars().count();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |ln| td.tokenize(ln)),
+            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
             CursorContext::Other
         );
     }
@@ -538,10 +523,10 @@ mod tests {
     #[test]
     fn other_top_sentence() {
         let mut text = lines("　これは段落頭");
-        let mut td = TestData::build(&mut text);
+        let td = TestData::new();
         let offset = 0;
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |ln| td.tokenize(ln)),
+            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
             CursorContext::Other
         );
     }
@@ -549,9 +534,9 @@ mod tests {
     #[test]
     fn other_empty_document() {
         let mut text = lines("");
-        let mut td = TestData::build(&mut text);
+        let td = TestData::new();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, 0, |ln| td.tokenize(ln)),
+            classify_complesion_mode(&mut text, 0, 0, |line| td.tokenize(line)),
             CursorContext::Other
         );
     }
@@ -560,10 +545,10 @@ mod tests {
     fn nested_brackets() {
         // 「『内側』|外側」 → depth=1なのでInBracketOther
         let mut text = lines("「『内側』外側」");
-        let mut td = TestData::build(&mut text);
+        let td = TestData::new();
         let offset = "「『内側』外側".chars().count();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |ln| td.tokenize(ln)),
+            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
             CursorContext::BeforeClosingBracket
         );
     }
@@ -573,15 +558,15 @@ mod tests {
         // 「『内側』|」 → depth=1, lastが括弧閉(内側の)だが外側はまだ開いている
         // → next_significantが」 → BeforeClosingBracket
         let mut text = lines("「『内側』」");
-        let mut td = TestData::build(&mut text);
+        let td = TestData::new();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, 0, |ln| td.tokenize(ln)),
+            classify_complesion_mode(&mut text, 0, 0, |line| td.tokenize(line)),
             CursorContext::Other
         );
 
         let offset = "「『内側』".chars().count();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |ln| td.tokenize(ln)),
+            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
             CursorContext::BeforeClosingBracket
         );
     }

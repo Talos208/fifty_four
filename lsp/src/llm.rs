@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use bitflags::bitflags;
 use derive_more::Display;
 use genai::adapter::AdapterKind;
 use genai::chat::{
@@ -7,6 +8,17 @@ use genai::chat::{
 };
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ModelName, ServiceTarget};
+
+bitflags! {
+    /// モデルが対応している機能のビットフラグ
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ModelCapability: u32 {
+        /// JsonSpec による構造化出力（genai の response_format が有効）
+        const STRUCTURED_OUTPUT = 1 << 0;
+        /// Tool calling
+        const TOOL_CALLING      = 1 << 1;
+    }
+}
 #[allow(unused_imports)]
 use log::{debug, error, info, warn};
 use serde_json::{Map, Value};
@@ -80,6 +92,16 @@ impl Provider {
         }
     }
 
+    pub fn default_capabilities(&self) -> ModelCapability {
+        match self {
+            Provider::Google(_) | Provider::OpenAI(_) => {
+                ModelCapability::STRUCTURED_OUTPUT | ModelCapability::TOOL_CALLING
+            }
+            Provider::Anthropic(_) | Provider::XAi(_) => ModelCapability::TOOL_CALLING,
+            Provider::LMStudio(..) | Provider::Undefined => ModelCapability::empty(),
+        }
+    }
+
     #[allow(unused)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -146,6 +168,8 @@ pub enum LlmError {
     LlmBusy { retry_after: u32 },
     #[display("Generation error: {}", message)]
     GenericError { message: String },
+    #[display("JSON parse error: {}", message)]
+    JsonParseError { message: String },
     #[display("Not implemented")]
     #[allow(unused)]
     NotImplemented,
@@ -195,6 +219,8 @@ pub trait LlmClient: Send + Sync + std::fmt::Debug {
 
     fn remove(&mut self, hash: String);
 
+    fn capabilities(&self) -> ModelCapability;
+
     // オプション設定
     fn max_tokens(&mut self, n: u32);
     fn temperature(&mut self, v: f64);
@@ -218,6 +244,8 @@ pub struct LlmClientBuilder {
     url: Option<String>,
     tools: Vec<Box<dyn LlmTool>>,
     sys_prompt: String,
+    /// 明示的に指定された capability。None の場合は provider のデフォルトを使う。
+    capabilities: Option<ModelCapability>,
 }
 
 impl LlmClientBuilder {
@@ -230,6 +258,7 @@ impl LlmClientBuilder {
             url: None,
             tools: vec![],
             sys_prompt: String::new(),
+            capabilities: None,
         }
     }
 
@@ -241,17 +270,32 @@ impl LlmClientBuilder {
             url: None,
             tools: vec![],
             sys_prompt: String::new(),
+            capabilities: None,
         }
     }
 
     pub fn from_value(value: &serde_json::Value) -> Self {
         debug!("value: {:?}", value);
+        let provider = Provider::from_str(value["provider"].as_str().unwrap()).unwrap();
+        let capabilities = value
+            .get("capabilities")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().fold(ModelCapability::empty(), |acc, item| {
+                    match item.as_str().unwrap_or("") {
+                        "structured_output" => acc | ModelCapability::STRUCTURED_OUTPUT,
+                        "tool_calling" => acc | ModelCapability::TOOL_CALLING,
+                        _ => acc,
+                    }
+                })
+            });
         LlmClientBuilder {
-            provider: Provider::from_str(value["provider"].as_str().unwrap()).unwrap(),
+            provider,
             model: value.get("model").map(|v| v.as_str().unwrap().to_string()),
             url: value.get("url").map(|v| v.as_str().unwrap().to_string()),
             tools: vec![],
             sys_prompt: String::new(),
+            capabilities,
         }
     }
 
@@ -351,6 +395,10 @@ impl LlmClientBuilder {
             .with_service_target_resolver(proc)
             .build();
 
+        let capabilities = self
+            .capabilities
+            .unwrap_or_else(|| self.provider.default_capabilities());
+
         Box::new(GenericLlmClient {
             inner_client,
             model: mdl_name.clone(),
@@ -362,6 +410,7 @@ impl LlmClientBuilder {
                 (n, t)
             })),
             sys_prompt: self.sys_prompt,
+            capabilities,
         })
     }
 }
@@ -395,6 +444,8 @@ pub struct GenericLlmClient {
     tools: HashMap<String, Box<dyn LlmTool>>,
     /// システムプロンプト
     sys_prompt: String,
+    /// モデルが対応している機能
+    capabilities: ModelCapability,
 }
 
 #[async_trait]
@@ -402,6 +453,10 @@ impl LlmClient for GenericLlmClient {
     async fn chat(&mut self) -> Result<String, LlmError> {
         let model = self.model.clone();
         self.with_model(model.as_str()).await
+    }
+
+    fn capabilities(&self) -> ModelCapability {
+        self.capabilities
     }
 
     fn add_tool(&mut self, tool: Box<dyn LlmTool>) {
@@ -481,6 +536,10 @@ impl LlmClient for GenericLlmClient {
 
             self.prompts.clear(); // promptはクリア、キャッシュは保存
             self.options = ChatOptions::default();
+
+            if let Some(reason) = response.reasoning_content.as_ref() {
+                debug!("reasoning: {}", reason)
+            }
 
             if response.tool_calls().is_empty() {
                 break response.content.texts().join("");

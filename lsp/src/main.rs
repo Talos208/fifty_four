@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use std::str::FromStr;
 mod cursor_context;
 mod llm;
-use crate::llm::{Content, LlmClient, LlmClientBuilder, LlmError, LlmTool};
+use crate::llm::{Content, LlmClient, LlmClientBuilder, LlmError, LlmTool, ModelCapability};
+use genai::chat::{ChatResponseFormat, JsonSpec};
 use std::panic;
 use std::path::{Path, PathBuf};
 mod migrations {
@@ -313,9 +314,9 @@ impl LlmTool for CharacterInfoTool {
                 "tags": {
                     "type": "array",
                     "items": {
+                        "type": "string",
                         "enum": ["role", "appearance", "personality", "expression", "background", "relationship", "weakness", "style"],
                     },
-                    "uniqueItems": true,
                     "minItems": 1,
                     "description": "取得したい属性のタグ"
                 }
@@ -1015,14 +1016,13 @@ impl LanguageServer for Backend {
                 TryResult::Present(t) => t,
             };
 
+            let highlighter = &self.highlighter;
             let context = cursor_context::classify_complesion_mode(
                 tmp.as_mut_slice(),
                 line_no,
                 offset,
-                |ln| {
-                    let mut t = self.text.get_mut(uri).unwrap();
-                    let l = t.get_mut(ln).unwrap();
-                    l.tokens = self.highlighter.text_to_lindera_token(l.text.as_str());
+                |line| {
+                    line.tokens = highlighter.text_to_lindera_token(line.text.as_str());
                 },
             );
             (context, before)
@@ -1364,7 +1364,6 @@ impl Backend {
             {
                 llm.reasoning_effort(n);
             }
-            // if let Some(v) = data.get("response_format") { ... }
             if let Some(v) = option.get("service_tier")
                 && let Ok(n) = v.parse::<ServiceTier>()
             {
@@ -1376,7 +1375,53 @@ impl Backend {
                 llm.verbosity(n);
             }
 
-            return proc(llm).await;
+            // スキーマが frontmatter に指定されている場合、capability に応じて切り替える
+            let has_schema = option.contains_key("schema");
+            if let Some(schema_str) = option.get("schema") {
+                match serde_json::from_str::<serde_json::Value>(schema_str) {
+                    Ok(schema_value) => {
+                        let name = option
+                            .get("schema_name")
+                            .map(|s| s.as_str())
+                            .unwrap_or("output");
+                        if llm
+                            .capabilities()
+                            .contains(ModelCapability::STRUCTURED_OUTPUT)
+                        {
+                            debug!("schema: using JsonSpec (structured output)");
+                            llm.response_format(ChatResponseFormat::JsonSpec(JsonSpec::new(
+                                name,
+                                schema_value,
+                            )));
+                        } else {
+                            debug!("schema: falling back to prompt embedding");
+                            llm.add(Content::Text(format!(
+                                "回答は次のJSON schemaに厳密にしたがって生成せよ。\n\nJSON Schema:\n{}\n\n最終応答は、スキーマに適合するJSONのみを出力し、JSON以外の文字は一切含めないこと。",
+                                schema_str
+                            )));
+                        }
+                    }
+                    Err(e) => {
+                        return core::result::Result::Err(LlmError::JsonParseError {
+                            message: format!("Invalid schema in frontmatter: {}", e),
+                        });
+                    }
+                }
+            }
+
+            let result = proc(llm).await;
+
+            // schema が指定されていた場合、レスポンスが valid JSON であることを検証する
+            if has_schema {
+                return result.and_then(|s| {
+                    serde_json::from_str::<serde_json::Value>(&s)
+                        .map(|_| s)
+                        .map_err(|e| LlmError::JsonParseError {
+                            message: format!("LLM response is not valid JSON: {}", e),
+                        })
+                });
+            }
+            return result;
         }
 
         core::result::Result::Err(LlmError::NotInitialized)
