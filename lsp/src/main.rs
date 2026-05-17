@@ -16,6 +16,8 @@ use crate::types::{CursorContext, LineData};
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::str::FromStr;
+mod character_updater;
+use crate::character_updater::UpdateState;
 mod cursor_context;
 mod llm;
 use crate::llm::{Content, LlmClient, LlmClientBuilder, LlmError, LlmTool, ModelCapability};
@@ -48,7 +50,7 @@ struct PendingCandidate {
 /// デバッグビルド専用のDB操作をカプセル化する構造体
 #[cfg(debug_assertions)]
 #[derive(Debug)]
-struct FlightRecorder {
+pub(crate) struct FlightRecorder {
     conn: parking_lot::Mutex<rusqlite::Connection>,
     pending_completions: parking_lot::Mutex<Option<(String, Vec<PendingCandidate>)>>,
 }
@@ -180,11 +182,59 @@ impl FlightRecorder {
             }
         }
     }
+
+    fn record_character_update(&self, uri: &str, model: &str, prompt: &str) -> i64 {
+        let db = self.conn.lock();
+        db.query_row(
+            "INSERT INTO character_updates (document_uri, model_name, prompt) VALUES (?,?,?) RETURNING id;",
+            rusqlite::params![uri, model, prompt],
+            |row| row.get(0),
+        ).unwrap_or(-1)
+    }
+
+    fn record_character_response(&self, update_id: i64, response: &str) {
+        let db = self.conn.lock();
+        if let Err(e) = db.execute(
+            "UPDATE character_updates SET response = ? WHERE id = ?;",
+            rusqlite::params![response, update_id],
+        ) {
+            debug!("record_character_response failed: {}", e);
+        }
+    }
+
+    fn record_character_section(
+        &self,
+        update_id: i64,
+        name: &str,
+        attr: &str,
+        old_text: Option<&str>,
+        new_text: &str,
+        applied: bool,
+        skip_reason: Option<&str>,
+    ) {
+        let db = self.conn.lock();
+        if let Err(e) = db.execute(
+            "INSERT INTO character_update_sections (update_id, character_name, attribute, old_text, new_text, applied, skip_reason) VALUES (?,?,?,?,?,?,?);",
+            rusqlite::params![update_id, name, attr, old_text, new_text, applied, skip_reason],
+        ) {
+            debug!("record_character_section failed: {}", e);
+        }
+    }
+
+    fn complete_character_update(&self, update_id: i64) {
+        let db = self.conn.lock();
+        if let Err(e) = db.execute(
+            "UPDATE character_updates SET completed_at = datetime('now', 'subsec') WHERE id = ?;",
+            rusqlite::params![update_id],
+        ) {
+            debug!("complete_character_update failed: {}", e);
+        }
+    }
 }
 
 #[cfg(not(debug_assertions))]
 #[derive(Debug)]
-struct FlightRecorder {}
+pub(crate) struct FlightRecorder {}
 
 #[cfg(not(debug_assertions))]
 impl FlightRecorder {
@@ -220,10 +270,24 @@ impl FlightRecorder {
         _content_changes: &[TextDocumentContentChangeEvent],
     ) {
     }
+
+    fn record_character_update(&self, _uri: &str, _model: &str, _prompt: &str) -> i64 { -1 }
+    fn record_character_response(&self, _update_id: i64, _response: &str) {}
+    fn record_character_section(
+        &self,
+        _update_id: i64,
+        _name: &str,
+        _attr: &str,
+        _old_text: Option<&str>,
+        _new_text: &str,
+        _applied: bool,
+        _skip_reason: Option<&str>,
+    ) {}
+    fn complete_character_update(&self, _update_id: i64) {}
 }
 
 #[derive(Debug, PartialEq, Clone)]
-enum CharacterAttribute {
+pub enum CharacterAttribute {
     Appearance,
     Background,
     Expression,
@@ -389,6 +453,39 @@ impl LlmTool for CharacterInfoTool {
     }
 }
 
+/// workspace 内でキャラクター名に対応するファイルパスを解決する自由関数。
+pub fn find_character_file_path(workspace: &Path, name: &str) -> std::result::Result<PathBuf, LlmError> {
+    let single = workspace.join("characters").with_extension("md");
+    trace!("{:?}", &single);
+    if single.exists() && single.is_file() {
+        return Ok(single);
+    }
+
+    let dir = workspace.join("characters");
+    if !dir.exists() || !dir.is_dir() {
+        return Err(LlmError::GenericError {
+            message: format!("Found no directory {:?}", &dir),
+        });
+    }
+
+    for entry in dir
+        .read_dir()
+        .map_err(|_| LlmError::GenericError {
+            message: format!("Failed to read directory {:?}", &dir),
+        })?
+        .flatten()
+    {
+        debug!("{:?}", entry.file_name());
+        if entry.file_name().to_string_lossy().starts_with(name) {
+            return Ok(entry.path());
+        }
+    }
+
+    Err(LlmError::GenericError {
+        message: format!("Found no file for '{}' in {:?}", name, &dir),
+    })
+}
+
 impl CharacterInfoTool {
     #[deny(clippy::new_ret_no_self)]
     fn new(workspace: &Path, cache: CharacterCache) -> Box<dyn LlmTool> {
@@ -399,35 +496,7 @@ impl CharacterInfoTool {
     }
 
     fn find_character_file_path(&self, name: &str) -> std::result::Result<PathBuf, LlmError> {
-        let single = self.workspace.join("characters").with_extension("md");
-        trace!("{:?}", &single);
-        if single.exists() && single.is_file() {
-            return Ok(single);
-        }
-
-        let dir = self.workspace.join("characters");
-        if !dir.exists() || !dir.is_dir() {
-            return Err(LlmError::GenericError {
-                message: format!("Found no directory {:?}", &dir),
-            });
-        }
-
-        for entry in dir
-            .read_dir()
-            .map_err(|_| LlmError::GenericError {
-                message: format!("Failed to read directory {:?}", &dir),
-            })?
-            .flatten()
-        {
-            debug!("{:?}", entry.file_name());
-            if entry.file_name().to_string_lossy().starts_with(name) {
-                return Ok(entry.path());
-            }
-        }
-
-        Err(LlmError::GenericError {
-            message: format!("Found no file for '{}' in {:?}", name, &dir),
-        })
+        find_character_file_path(&self.workspace, name)
     }
 
     fn search_cache(
@@ -496,7 +565,7 @@ fn detect_char_level<'a>(root: &'a AstNode<'a>) -> u8 {
 ///
 /// キーは heading 全文（例: "ジェフ・クライン（艦長）"）。
 /// 属性 heading のテキストを「・」で分割してタグ群を生成する。
-fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry> {
+pub fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry> {
     let arena = Arena::new();
     let mut options = comrak::Options::default();
     options.extension = comrak::options::Extension::builder()
@@ -659,16 +728,17 @@ struct Backend {
     // 文章データ（uri、行ごとのテキスト）
     text: DashMap<String, Vec<LineData>>,
     //ワークスペース
-    #[allow(unused)]
-    workspace: tokio::sync::Mutex<Vec<WorkspaceFolder>>,
-    // LLMクライアントへのハンドル
-    llm: tokio::sync::Mutex<Option<Box<dyn LlmClient>>>,
+    workspace: Arc<tokio::sync::Mutex<Vec<WorkspaceFolder>>>,
+    // LLMクライアントへのハンドル(Arc化: 周期タスクに clone して渡せるようにする)
+    llm: Arc<tokio::sync::Mutex<Option<Box<dyn LlmClient>>>>,
 
     highlighter: Highlighter,
     // デバッグビルド専用のDB操作
-    db: FlightRecorder,
+    db: Arc<FlightRecorder>,
     // キャラクター設定ファイルのパース結果キャッシュ
     character_cache: CharacterCache,
+    // URI ごとのキャラクター更新トリガー状態
+    update_states: DashMap<String, Arc<parking_lot::Mutex<UpdateState>>>,
 }
 
 /// `LanguageServer` トレイトの実装。
@@ -886,6 +956,11 @@ impl LanguageServer for Backend {
                 .as_slice(),
         );
 
+        self.record_change(
+            param.text_document.uri.as_str(),
+            param.content_changes.as_slice(),
+        );
+
         let _ = self.client.semantic_tokens_refresh().await;
     }
 
@@ -894,6 +969,7 @@ impl LanguageServer for Backend {
         debug!("file closed!");
 
         self.text.remove(params.text_document.uri.as_str());
+        self.update_states.remove(params.text_document.uri.as_str());
     }
 
     /// ドキュメント全体に対する semantic tokens の問い合わせに応答します。
@@ -1507,6 +1583,56 @@ impl Backend {
         debug!("init_workspace: {:?}", workspaces);
         self.workspace.lock().await.append(&mut workspaces);
     }
+
+    /// URI がキャラクター設定ファイルかどうかを判定する。
+    /// characters/*.md または characters.md は更新タスクの対象外とする(自己ループ防止)。
+    fn is_character_file(&self, uri: &str) -> bool {
+        uri.contains("/characters/") || uri.ends_with("/characters.md")
+    }
+
+    /// did_change イベントの情報を更新状態に記録する。
+    /// 累積1000字到達かつ pending_task がなければ one-shot 遅延タスクを spawn する。
+    fn record_change(&self, uri: &str, changes: &[TextDocumentContentChangeEvent]) {
+        if self.is_character_file(uri) {
+            return;
+        }
+
+        let state_arc = self
+            .update_states
+            .entry(uri.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(UpdateState::default())))
+            .clone();
+
+        let mut s = state_arc.lock();
+        let now = std::time::Instant::now();
+        s.last_change_at = now;
+        if s.first_dirty_at.is_none() {
+            s.first_dirty_at = Some(now);
+        }
+        for c in changes {
+            if let Some(r) = c.range {
+                for ln in r.start.line..=r.end.line {
+                    s.dirty_lines.insert(ln as usize);
+                }
+            }
+            s.accumulated_chars += c.text.chars().count();
+        }
+
+        if s.accumulated_chars >= character_updater::MIN_CHARS && s.pending_task.is_none() {
+            let wait = character_updater::compute_wait(s.first_dirty_at.unwrap());
+            drop(s); // spawn 前に Mutex を解放する
+            let handle = tokio::spawn(character_updater::run_at(
+                wait,
+                uri.to_string(),
+                self.workspace.clone(),
+                self.text.clone(),
+                self.llm.clone(),
+                self.db.clone(),
+                state_arc.clone(),
+            ));
+            state_arc.lock().pending_task = Some(handle);
+        }
+    }
 }
 
 #[derive(Embed)]
@@ -1548,14 +1674,16 @@ async fn main() {
     // LspService を構築し、`Backend` をクライアントハンドルで初期化する
     info!("initialize lsp service");
     let none: Option<Box<dyn LlmClient>> = None;
+    let db_path = path.join("data").join("fifty_four.db");
     let (service, socket) = tower_lsp::LspService::build(|client| Backend {
         client,
         text: DashMap::new(),
-        workspace: tokio::sync::Mutex::new(vec![]),
-        llm: tokio::sync::Mutex::new(none),
+        workspace: Arc::new(tokio::sync::Mutex::new(vec![])),
+        llm: Arc::new(tokio::sync::Mutex::new(none)),
         highlighter: Highlighter::new(),
-        db: FlightRecorder::new(&path.join("data").join("fifty_four.db")),
+        db: Arc::new(FlightRecorder::new(&db_path)),
         character_cache: CharacterCache::new(),
+        update_states: DashMap::new(),
     })
     .finish();
 
