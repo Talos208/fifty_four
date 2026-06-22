@@ -299,11 +299,13 @@ impl LlmClientBuilder {
         }
     }
 
+    #[allow(dead_code)]
     pub fn model(&mut self, model: &str) -> &Self {
         self.model = Some(model.to_string());
         self
     }
 
+    #[allow(dead_code)]
     pub fn url(&mut self, url: &str) -> &Self {
         self.url = Some(url.to_string());
         self

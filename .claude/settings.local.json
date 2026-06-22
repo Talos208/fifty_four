@@ -4,12 +4,16 @@
       "WebFetch(domain:crates.io)",
       "Skill(commit-commands:commit)",
       "Skill(commit-commands:commit:*)",
-      "Bash(cargo test cursor_context)"
+      "Bash(cargo test cursor_context)",
+      "Bash(cargo build *)",
+      "WebSearch",
+      "WebFetch(domain:zed.dev)",
+      "WebFetch(domain:github.com)"
     ],
     "defaultMode": "plan"
   },
-  "effortLevel": "high",
   "model": "opusplan",
   "outputStyle": "Explanatory",
+  "effortLevel": "high",
   "showThinkingSummaries": true
 }

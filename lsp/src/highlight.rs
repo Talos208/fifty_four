@@ -186,10 +186,10 @@ impl Highlighter {
     ///
     /// Lindera を用いて形態素解析を行い、語種に基づくトークン種別を生成します。
     pub fn tokenize(&self, line: &mut LineData) -> Vec<SemanticToken> {
-        debug!(
-            "Highlighter::tokenize {}",
-            crate::shorten_middle(line.text.as_str(), 45)
-        );
+        // debug!(
+        //     "Highlighter::tokenize {}",
+        //     crate::shorten_middle(line.text.as_str(), 45)
+        // );
         // 遅延解析
         if line.tokens.is_empty() {
             trace!("lazy tokenize");

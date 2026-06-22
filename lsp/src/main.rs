@@ -271,7 +271,9 @@ impl FlightRecorder {
     ) {
     }
 
-    fn record_character_update(&self, _uri: &str, _model: &str, _prompt: &str) -> i64 { -1 }
+    fn record_character_update(&self, _uri: &str, _model: &str, _prompt: &str) -> i64 {
+        -1
+    }
     fn record_character_response(&self, _update_id: i64, _response: &str) {}
     fn record_character_section(
         &self,
@@ -282,7 +284,8 @@ impl FlightRecorder {
         _new_text: &str,
         _applied: bool,
         _skip_reason: Option<&str>,
-    ) {}
+    ) {
+    }
     fn complete_character_update(&self, _update_id: i64) {}
 }
 
@@ -322,6 +325,22 @@ impl TryFrom<&str> for CharacterAttribute {
                 Ok(Self::Weakness)
             }
             _ => Err(format!("No such attribute {}", s)),
+        }
+    }
+}
+
+impl CharacterAttribute {
+    /// 新規セクション/ファイル作成時に使う日本語正規見出しを返す。
+    pub fn canonical_heading(&self) -> &'static str {
+        match self {
+            Self::Appearance => "容姿",
+            Self::Background => "背景",
+            Self::Expression => "口調",
+            Self::Personality => "性格",
+            Self::Relationship => "関係",
+            Self::Role => "役割",
+            Self::Style => "描写",
+            Self::Weakness => "弱点",
         }
     }
 }
@@ -454,7 +473,10 @@ impl LlmTool for CharacterInfoTool {
 }
 
 /// workspace 内でキャラクター名に対応するファイルパスを解決する自由関数。
-pub fn find_character_file_path(workspace: &Path, name: &str) -> std::result::Result<PathBuf, LlmError> {
+pub fn find_character_file_path(
+    workspace: &Path,
+    name: &str,
+) -> std::result::Result<PathBuf, LlmError> {
     let single = workspace.join("characters").with_extension("md");
     trace!("{:?}", &single);
     if single.exists() && single.is_file() {
@@ -537,7 +559,9 @@ impl CharacterInfoTool {
 /// ファイル内の heading 構造からキャラクターを表す heading レベルを推定する。
 ///
 /// 各 heading レベルの出現回数と「直後に level+1 の heading が続くか」を調べ、
-/// 最も出現回数が多い「子持ちレベル」を返す。タイ時は低レベル優先。
+/// 最も出現回数が多い「子持ちレベル」を返す。タイ時は深レベル(より多くの # を持つ)優先。
+/// 例: `# Story / ## キャラ / ### 属性` のように各レベルが 1 件ずつの場合、
+/// タイトル(1)よりキャラクター(2)を選ぶ方が意味的に正しい。
 fn detect_char_level<'a>(root: &'a AstNode<'a>) -> u8 {
     let mut counts: HashMap<u8, usize> = HashMap::new();
     let mut has_sub: Vec<u8> = Vec::new();
@@ -556,17 +580,13 @@ fn detect_char_level<'a>(root: &'a AstNode<'a>) -> u8 {
     counts
         .iter()
         .filter(|(l, _)| has_sub.contains(l))
-        .max_by(|(l1, c1), (l2, c2)| c1.cmp(c2).then(l2.cmp(l1)))
+        .max_by(|(l1, c1), (l2, c2)| c1.cmp(c2).then(l1.cmp(l2)))
         .map(|(l, _)| *l)
         .unwrap_or(0)
 }
 
-/// Markdown 文字列をパースし、全キャラクターの全セクションを `HashMap` で返す。
-///
-/// キーは heading 全文（例: "ジェフ・クライン（艦長）"）。
-/// 属性 heading のテキストを「・」で分割してタグ群を生成する。
-pub fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry> {
-    let arena = Arena::new();
+/// このプロジェクト共通の comrak パースオプションを返す。
+fn comrak_options() -> comrak::Options<'static> {
     let mut options = comrak::Options::default();
     options.extension = comrak::options::Extension::builder()
         .cjk_friendly_emphasis(true)
@@ -585,6 +605,27 @@ pub fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry> {
         .gfm_quirks(true)
         .ignore_empty_links(true)
         .build();
+    options
+}
+
+/// Markdown 文字列からキャラクターレベルを推定する。
+///
+/// `detect_char_level` の文字列入力版。`character_updater` 等で共有する。
+/// 検出できない場合は `0` を返す。
+pub(crate) fn detect_char_level_str(text: &str) -> u8 {
+    let arena = Arena::new();
+    let options = comrak_options();
+    let root = comrak::parse_document(&arena, text, &options);
+    detect_char_level(root)
+}
+
+/// Markdown 文字列をパースし、全キャラクターの全セクションを `HashMap` で返す。
+///
+/// キーは heading 全文（例: "ジェフ・クライン（艦長）"）。
+/// 属性 heading のテキストを「・」で分割してタグ群を生成する。
+pub fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry> {
+    let arena = Arena::new();
+    let options = comrak_options();
 
     let root = comrak::parse_document(&arena, content, &options);
     let char_level = detect_char_level(root);
@@ -729,8 +770,15 @@ struct Backend {
     text: DashMap<String, Vec<LineData>>,
     //ワークスペース
     workspace: Arc<tokio::sync::Mutex<Vec<WorkspaceFolder>>>,
-    // LLMクライアントへのハンドル(Arc化: 周期タスクに clone して渡せるようにする)
+    // 文章補完用 LLM(Arc化: 周期タスクに clone して渡せるようにする)
     llm: Arc<tokio::sync::Mutex<Option<Box<dyn LlmClient>>>>,
+    // バックグラウンド長考タスク用 LLM(補完をブロックしない。現状はキャラ設定収集が利用)
+    background_llm: Arc<tokio::sync::Mutex<Option<Box<dyn LlmClient>>>>,
+    // false にするとキャラクター設定の自動更新タスクを起動しない
+    character_updater_enabled: std::sync::atomic::AtomicBool,
+    character_updater_min_chars: std::sync::atomic::AtomicUsize,
+    character_updater_max_chars: std::sync::atomic::AtomicUsize,
+    character_updater_idle_secs: std::sync::atomic::AtomicU64,
 
     highlighter: Highlighter,
     // デバッグビルド専用のDB操作
@@ -739,6 +787,14 @@ struct Backend {
     character_cache: CharacterCache,
     // URI ごとのキャラクター更新トリガー状態
     update_states: DashMap<String, Arc<parking_lot::Mutex<UpdateState>>>,
+}
+
+fn build_llm_client(cfg: &serde_json::Value) -> Box<dyn LlmClient> {
+    LlmClientBuilder::from_value(cfg)
+        .sys_prompt(
+            Asset::get("system.md").map(|d| String::from_utf8_lossy(d.data.as_ref()).to_string()),
+        )
+        .build()
 }
 
 /// `LanguageServer` トレイトの実装。
@@ -767,34 +823,74 @@ impl LanguageServer for Backend {
             debug!("Client_info: {:?}", info);
         }
 
-        if let Some(opt) = _param.initialization_options
-            && let Some(llm) = opt.get("llm")
-        {
-            // LLMクライアントを初期化
-            let mut builder = LlmClientBuilder::from_value(llm).sys_prompt(
-                Asset::get("system.md")
-                    .map(|d| String::from_utf8_lossy(d.data.as_ref()).to_string()),
-            );
-
-            llm.get("model").inspect(|v| {
-                builder.model(v.as_str().unwrap());
-            });
-
-            llm.get("url").inspect(|v| {
-                builder.url(v.as_str().unwrap());
-            });
-
-            // builder.add_tool(CharacterInfoTool::new());
-
-            let cl = builder.build();
-
+        if let Some(opt) = _param.initialization_options {
+            debug!("initialization_options: {:?}", opt);
+            if let Some(cu) = opt.get("character_updater") {
+                debug!("character_updater config found: {:?}", cu);
+                if cu.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+                    self.character_updater_enabled
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(v) = cu.get("min_chars").and_then(|v| v.as_u64()) {
+                    self.character_updater_min_chars
+                        .store(v as usize, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(v) = cu.get("max_chars").and_then(|v| v.as_u64()) {
+                    self.character_updater_max_chars
+                        .store(v as usize, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(v) = cu.get("idle_timeout_secs").and_then(|v| v.as_u64()) {
+                    self.character_updater_idle_secs
+                        .store(v, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else {
+                debug!("no character_updater config; using defaults");
+            }
+            // 反映後の実効設定を出力(デフォルト/設定値どちらが効いているか確認用)
             debug!(
-                "LLM built.\tmodel: {:?}\n\tservice_target: {}",
-                cl,
-                cl.get_service_target().await
+                "character_updater effective: enabled={} min_chars={} max_chars={} idle_secs={}",
+                self.character_updater_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.character_updater_min_chars
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.character_updater_max_chars
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.character_updater_idle_secs
+                    .load(std::sync::atomic::Ordering::Relaxed),
             );
 
-            self.llm.lock().await.replace(cl);
+            if let Some(llm_root) = opt.get("llm") {
+                // 旧形式互換: llm:{provider,...} → ondemand として扱う。
+                // 新形式は llm:{ondemand:{...}, deferred:{...}}。
+                let ondemand_cfg = llm_root
+                    .get("ondemand")
+                    .or_else(|| if llm_root.get("provider").is_some() { Some(llm_root) } else { None });
+
+                if let Some(cfg) = ondemand_cfg {
+                    let cl = build_llm_client(cfg);
+                    debug!(
+                        "llm.ondemand built.\tmodel: {:?}\n\tservice_target: {}",
+                        cl,
+                        cl.get_service_target().await
+                    );
+                    self.llm.lock().await.replace(cl);
+                } else {
+                    warn!("llm 設定に ondemand キーも provider キーも無いため、補完 LLM は未初期化のままです");
+                }
+                if let Some(cfg) = llm_root
+                    .get("deferred")
+                    .or_else(|| llm_root.get("ondemand"))
+                    .or_else(|| if llm_root.get("provider").is_some() { Some(llm_root) } else { None })
+                {
+                    let cl = build_llm_client(cfg);
+                    debug!(
+                        "llm.deferred built.\tmodel: {:?}\n\tservice_target: {}",
+                        cl,
+                        cl.get_service_target().await
+                    );
+                    self.background_llm.lock().await.replace(cl);
+                }
+            }
         }
 
         let capabilities = ServerCapabilities {
@@ -926,6 +1022,10 @@ impl LanguageServer for Backend {
 
         // 全体が送られて来た時
         if param.content_changes.iter().all(|c| c.range.is_none()) {
+            debug!(
+                "did_change[{}]: full-text sync (no range) -> update_all, record_change SKIPPED",
+                param.text_document.uri.as_str()
+            );
             self.update_all(
                 param.text_document.uri.as_str(),
                 0,
@@ -1106,36 +1206,8 @@ impl LanguageServer for Backend {
 
         let prompt_fn = Backend::ctx_to_prompt_name(context);
         debug!("Prompt: {}", prompt_fn);
-        let mut prompt = String::from_utf8_lossy(
-            Asset::get(prompt_fn)
-                .unwrap_or_else(|| panic!("{} not found", prompt_fn))
-                .data
-                .as_ref(),
-        )
-        .to_string();
-
-        // front matter処理
-        let options = if let Some(ext) = Path::new(prompt_fn).extension()
-            && ext.to_string_lossy() == "md"
-        {
-            debug!("Front matter...");
-            let matter = gray_matter::Matter::<gray_matter::engine::YAML>::new();
-            let parsed_matter = matter.parse::<HashMap<String, String>>(prompt.as_str());
-            parsed_matter
-                .map(|v| {
-                    debug!("\tparsed {}", v.excerpt.unwrap_or_default());
-                    prompt = v.content;
-                    v.data
-                })
-                .unwrap_or({
-                    debug!("\tNo front matter.");
-                    None
-                })
-        } else {
-            debug!("No ext. on file");
-            None
-        }
-        .unwrap_or(HashMap::new());
+        let (prompt, options) =
+            crate::load_prompt(prompt_fn).unwrap_or_else(|| panic!("{} not found", prompt_fn));
 
         let mut completion_id = 0u32;
         let raw = self
@@ -1590,10 +1662,21 @@ impl Backend {
         uri.contains("/characters/") || uri.ends_with("/characters.md")
     }
 
-    /// did_change イベントの情報を更新状態に記録する。
-    /// 累積1000字到達かつ pending_task がなければ one-shot 遅延タスクを spawn する。
+    /// did_change イベントの情報を更新状態に記録し、発火判定を行う。
+    /// 判定は常にこのタイミングのみ(周期タスクは持たない)。
+    /// - 現在の変更を取り込む前に直前バーストの idle 判定(`idle_trigger`)を行い、
+    ///   idle 確定なら `min_chars` 以上で発火・未満でクリア。
+    /// - 現在の変更を取り込んだ後、`max_chars` 以上なら即時発火。
+    /// 発火時に spawn する非同期タスクは `character_updater::run` だけ。
     fn record_change(&self, uri: &str, changes: &[TextDocumentContentChangeEvent]) {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        if !self.character_updater_enabled.load(Relaxed) {
+            debug!("record_change[{}]: disabled, skip", uri);
+            return;
+        }
         if self.is_character_file(uri) {
+            debug!("record_change[{}]: character file, skip", uri);
             return;
         }
 
@@ -1603,34 +1686,108 @@ impl Backend {
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(UpdateState::default())))
             .clone();
 
-        let mut s = state_arc.lock();
         let now = std::time::Instant::now();
-        s.last_change_at = now;
-        if s.first_dirty_at.is_none() {
-            s.first_dirty_at = Some(now);
-        }
-        for c in changes {
-            if let Some(r) = c.range {
-                for ln in r.start.line..=r.end.line {
-                    s.dirty_lines.insert(ln as usize);
+        let delta: usize = changes.iter().map(|c| c.text.chars().count()).sum();
+        debug!(
+            "record_change[{}]: {} changes, delta={} chars",
+            uri,
+            changes.len(),
+            delta
+        );
+
+        // 現在の変更を状態へ取り込む(last_change/first_dirty/accumulated)。
+        let apply = |s: &mut UpdateState| {
+            s.last_change_at = now;
+            if s.first_dirty_at.is_none() {
+                s.first_dirty_at = Some(now);
+            }
+            s.accumulated_chars += delta;
+        };
+
+        // spawn 前に Mutex を解放する必要があるため、発火するテキストをここに退避する。
+        let mut fire_text: Option<String> = None;
+
+        {
+            let mut s = state_arc.lock();
+
+            // 実行中はカウントのみ行い、発火判定はスキップする。
+            if s.running {
+                apply(&mut s);
+                debug!(
+                    "record_change[{}]: run in progress, accumulate only (accumulated={})",
+                    uri, s.accumulated_chars
+                );
+                return;
+            }
+
+            let idle =
+                std::time::Duration::from_secs(self.character_updater_idle_secs.load(Relaxed));
+            let min_chars = self.character_updater_min_chars.load(Relaxed);
+            let max_chars = self.character_updater_max_chars.load(Relaxed);
+
+            // 1. 直前バーストの idle 判定(現在の変更を取り込む前)。
+            let gap = now.duration_since(s.last_change_at);
+            let trigger =
+                character_updater::idle_trigger(s.accumulated_chars, gap, idle, min_chars);
+            debug!(
+                "record_change[{}]: idle_trigger -> {:?} (accumulated={}, gap={:?}, idle={:?}, min={}, max={})",
+                uri, trigger, s.accumulated_chars, gap, idle, min_chars, max_chars
+            );
+            match trigger {
+                character_updater::Trigger::Fire => {
+                    fire_text = Some(character_updater::full_text(&self.text, uri));
+                    s.reset();
+                    s.running = true;
+                    apply(&mut s); // 現在の変更で新バーストを開始
+                    debug!(
+                        "record_change[{}]: FIRE (idle), new burst started with {} chars",
+                        uri, s.accumulated_chars
+                    );
+                }
+                character_updater::Trigger::ClearStale => {
+                    s.reset();
+                    apply(&mut s);
+                    debug!(
+                        "record_change[{}]: ClearStale, restart burst with {} chars",
+                        uri, s.accumulated_chars
+                    );
+                }
+                character_updater::Trigger::None => {
+                    // 2. 打鍵継続中: 現在の変更を取り込み max_chars 即時発火を判定。
+                    apply(&mut s);
+                    if s.accumulated_chars >= max_chars {
+                        fire_text = Some(character_updater::full_text(&self.text, uri));
+                        let fired = s.accumulated_chars;
+                        s.reset();
+                        s.running = true;
+                        debug!(
+                            "record_change[{}]: FIRE (max_chars reached: {} >= {})",
+                            uri, fired, max_chars
+                        );
+                    } else {
+                        debug!(
+                            "record_change[{}]: accumulating ({}/{} for max_chars)",
+                            uri, s.accumulated_chars, max_chars
+                        );
+                    }
                 }
             }
-            s.accumulated_chars += c.text.chars().count();
         }
 
-        if s.accumulated_chars >= character_updater::MIN_CHARS && s.pending_task.is_none() {
-            let wait = character_updater::compute_wait(s.first_dirty_at.unwrap());
-            drop(s); // spawn 前に Mutex を解放する
-            let handle = tokio::spawn(character_updater::run_at(
-                wait,
+        if let Some(text) = fire_text {
+            debug!(
+                "record_change[{}]: spawning character_updater::run ({} chars full text)",
+                uri,
+                text.chars().count()
+            );
+            tokio::spawn(character_updater::run(
                 uri.to_string(),
                 self.workspace.clone(),
-                self.text.clone(),
-                self.llm.clone(),
+                text,
+                self.background_llm.clone(),
                 self.db.clone(),
                 state_arc.clone(),
             ));
-            state_arc.lock().pending_task = Some(handle);
         }
     }
 }
@@ -1638,6 +1795,71 @@ impl Backend {
 #[derive(Embed)]
 #[folder = "../data/"]
 struct Asset;
+
+/// 埋め込みアセットからプロンプトを読み込み、YAML frontmatter を本文と分離して返す。
+///
+/// - アセットが見つからない場合は `None`(欠如時の扱いは呼び出し側に委ねる)。
+/// - frontmatter が無い・パースに失敗した場合は本文をそのまま・空の data を返す。
+pub(crate) fn load_prompt(name: &str) -> Option<(String, HashMap<String, String>)> {
+    let asset = Asset::get(name)?;
+    let template = String::from_utf8_lossy(asset.data.as_ref());
+    let matter = gray_matter::Matter::<gray_matter::engine::YAML>::new();
+    // いったん Pod として受け、スカラー値を文字列へ正規化する。
+    // HashMap<String, String> へ直接デシリアライズすると、frontmatter に数値や真偽値が
+    // 1つでもあると(例: `max_tokens: 4096`)全体のパースが失敗し、`schema` 等も巻き添えで
+    // 失われてしまうため(option は use_llm_with_option 側で文字列から parse し直す前提)。
+    let parsed = match matter.parse::<gray_matter::Pod>(&template) {
+        Ok(p) => p,
+        Err(_) => return Some((template.into_owned(), HashMap::new())),
+    };
+    let body = parsed.content;
+    let mut data = HashMap::new();
+    if let Some(gray_matter::Pod::Hash(hash)) = parsed.data {
+        for (k, v) in hash {
+            if let Some(s) = pod_to_string(&v) {
+                data.insert(k, s);
+            }
+        }
+    }
+    Some((body, data))
+}
+
+/// frontmatter の Pod を文字列へ正規化する。
+///
+/// スカラーはそのまま文字列化し、配列・オブジェクト(JSON schema 等)は JSON 文字列に変換する。
+/// Null のみ `None`(マップから除外)。
+fn pod_to_string(pod: &gray_matter::Pod) -> Option<String> {
+    use gray_matter::Pod;
+    match pod {
+        Pod::String(s) => Some(s.clone()),
+        Pod::Integer(n) => Some(n.to_string()),
+        Pod::Float(f) => Some(f.to_string()),
+        Pod::Boolean(b) => Some(b.to_string()),
+        Pod::Null => None,
+        Pod::Array(_) | Pod::Hash(_) => serde_json::to_string(&pod_to_json_value(pod)).ok(),
+    }
+}
+
+fn pod_to_json_value(pod: &gray_matter::Pod) -> serde_json::Value {
+    use gray_matter::Pod;
+    match pod {
+        Pod::Null => serde_json::Value::Null,
+        Pod::String(s) => serde_json::Value::String(s.clone()),
+        Pod::Integer(n) => serde_json::json!(n),
+        Pod::Float(f) => serde_json::json!(f),
+        Pod::Boolean(b) => serde_json::Value::Bool(*b),
+        Pod::Array(items) => {
+            serde_json::Value::Array(items.iter().map(pod_to_json_value).collect())
+        }
+        Pod::Hash(map) => {
+            let mut obj = serde_json::Map::new();
+            for (k, v) in map {
+                obj.insert(k.clone(), pod_to_json_value(v));
+            }
+            serde_json::Value::Object(obj)
+        }
+    }
+}
 
 /// プログラムのエントリポイント。
 ///
@@ -1673,13 +1895,23 @@ async fn main() {
 
     // LspService を構築し、`Backend` をクライアントハンドルで初期化する
     info!("initialize lsp service");
-    let none: Option<Box<dyn LlmClient>> = None;
     let db_path = path.join("data").join("fifty_four.db");
     let (service, socket) = tower_lsp::LspService::build(|client| Backend {
         client,
         text: DashMap::new(),
         workspace: Arc::new(tokio::sync::Mutex::new(vec![])),
-        llm: Arc::new(tokio::sync::Mutex::new(none)),
+        llm: Arc::new(tokio::sync::Mutex::new(None)),
+        background_llm: Arc::new(tokio::sync::Mutex::new(None)),
+        character_updater_enabled: std::sync::atomic::AtomicBool::new(true),
+        character_updater_min_chars: std::sync::atomic::AtomicUsize::new(
+            character_updater::DEFAULT_MIN_CHARS,
+        ),
+        character_updater_max_chars: std::sync::atomic::AtomicUsize::new(
+            character_updater::DEFAULT_MAX_CHARS,
+        ),
+        character_updater_idle_secs: std::sync::atomic::AtomicU64::new(
+            character_updater::DEFAULT_IDLE_SECS,
+        ),
         highlighter: Highlighter::new(),
         db: Arc::new(FlightRecorder::new(&db_path)),
         character_cache: CharacterCache::new(),
@@ -1718,6 +1950,94 @@ mod tests {
 
     fn lines(s: &str) -> Vec<LineData> {
         s.lines().map(|l| LineData::from_str(l).unwrap()).collect()
+    }
+
+    /// load_prompt と同じ frontmatter 正規化を文字列入力で再現する(Asset 非依存のテスト用)。
+    fn parse_frontmatter(template: &str) -> HashMap<String, String> {
+        let matter = gray_matter::Matter::<gray_matter::engine::YAML>::new();
+        let parsed = matter.parse::<gray_matter::Pod>(template).unwrap();
+        let mut data = HashMap::new();
+        if let Some(gray_matter::Pod::Hash(hash)) = parsed.data {
+            for (k, v) in hash {
+                if let Some(s) = pod_to_string(&v) {
+                    data.insert(k, s);
+                }
+            }
+        }
+        data
+    }
+
+    // frontmatter に数値・真偽値が混在しても、文字列フィールド(schema 等)が
+    // 巻き添えで失われないこと(EOF schema バグの回帰防止)。
+    #[test]
+    fn test_frontmatter_mixed_scalar_types() {
+        let fm = parse_frontmatter(indoc!(
+            r#"---
+            schema: >
+              {"type":"object"}
+            schema_name: character_updates
+            max_tokens: 4096
+            temperature: 0.3
+            enabled: true
+            ---
+            body text"#
+        ));
+        // 数値の隣にあっても schema(文字列)が生き残る
+        assert_eq!(
+            fm.get("schema").map(|s| s.trim()),
+            Some(r#"{"type":"object"}"#)
+        );
+        assert_eq!(
+            fm.get("schema_name").map(|s| s.as_str()),
+            Some("character_updates")
+        );
+        // 数値・真偽値は文字列化されて取得できる(use_llm_with_option が parse し直す)
+        assert_eq!(fm.get("max_tokens").map(|s| s.as_str()), Some("4096"));
+        assert_eq!(fm.get("temperature").map(|s| s.as_str()), Some("0.3"));
+        assert_eq!(fm.get("enabled").map(|s| s.as_str()), Some("true"));
+    }
+
+    #[test]
+    fn test_pod_to_string() {
+        use gray_matter::Pod;
+        assert_eq!(pod_to_string(&Pod::Integer(42)), Some("42".to_string()));
+        assert_eq!(
+            pod_to_string(&Pod::Boolean(false)),
+            Some("false".to_string())
+        );
+        assert_eq!(
+            pod_to_string(&Pod::String("x".into())),
+            Some("x".to_string())
+        );
+        assert_eq!(pod_to_string(&Pod::Null), None);
+        assert_eq!(pod_to_string(&Pod::Array(vec![])), Some("[]".to_string()));
+        let mut schema = Pod::new_hash();
+        schema["type"] = Pod::String("object".into());
+        let s = pod_to_string(&schema).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["type"], "object");
+    }
+
+    // schema を YAML オブジェクトとして書いた場合も JSON 文字列として取得できる。
+    #[test]
+    fn test_frontmatter_schema_as_yaml_object() {
+        let fm = parse_frontmatter(indoc!(
+            r#"---
+            schema:
+              type: object
+              properties:
+                updates:
+                  type: array
+            schema_name: character_updates
+            max_tokens: 4096
+            ---
+            body"#
+        ));
+        let schema_str = fm.get("schema").expect("schema missing");
+        let schema: serde_json::Value = serde_json::from_str(schema_str).unwrap();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["updates"]["type"], "array");
+        assert_eq!(fm.get("max_tokens").map(|s| s.as_str()), Some("4096"));
     }
 
     // 1. 単一文字挿入
