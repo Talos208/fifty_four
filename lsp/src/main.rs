@@ -20,7 +20,7 @@ mod character_updater;
 use crate::character_updater::UpdateState;
 mod cursor_context;
 mod llm;
-use crate::llm::{Content, LlmClient, LlmClientBuilder, LlmError, LlmTool, ModelCapability};
+use crate::llm::{Content, LlmInterface, LlmClientBuilder, LlmError, LlmTool, ModelCapability};
 use genai::chat::{ChatResponseFormat, JsonSpec};
 use std::panic;
 use std::path::{Path, PathBuf};
@@ -771,9 +771,9 @@ struct Backend {
     //ワークスペース
     workspace: Arc<tokio::sync::Mutex<Vec<WorkspaceFolder>>>,
     // 文章補完用 LLM(Arc化: 周期タスクに clone して渡せるようにする)
-    llm: Arc<tokio::sync::Mutex<Option<Box<dyn LlmClient>>>>,
+    llm: Arc<tokio::sync::Mutex<Option<Box<dyn LlmInterface>>>>,
     // バックグラウンド長考タスク用 LLM(補完をブロックしない。現状はキャラ設定収集が利用)
-    background_llm: Arc<tokio::sync::Mutex<Option<Box<dyn LlmClient>>>>,
+    background_llm: Arc<tokio::sync::Mutex<Option<Box<dyn LlmInterface>>>>,
     // false にするとキャラクター設定の自動更新タスクを起動しない
     character_updater_enabled: std::sync::atomic::AtomicBool,
     character_updater_min_chars: std::sync::atomic::AtomicUsize,
@@ -789,7 +789,7 @@ struct Backend {
     update_states: DashMap<String, Arc<parking_lot::Mutex<UpdateState>>>,
 }
 
-fn build_llm_client(cfg: &serde_json::Value) -> Box<dyn LlmClient> {
+fn build_llm_client(cfg: &serde_json::Value) -> Box<dyn LlmInterface> {
     LlmClientBuilder::from_value(cfg)
         .sys_prompt(
             Asset::get("system.md").map(|d| String::from_utf8_lossy(d.data.as_ref()).to_string()),
@@ -862,9 +862,13 @@ impl LanguageServer for Backend {
             if let Some(llm_root) = opt.get("llm") {
                 // 旧形式互換: llm:{provider,...} → ondemand として扱う。
                 // 新形式は llm:{ondemand:{...}, deferred:{...}}。
-                let ondemand_cfg = llm_root
-                    .get("ondemand")
-                    .or_else(|| if llm_root.get("provider").is_some() { Some(llm_root) } else { None });
+                let ondemand_cfg = llm_root.get("ondemand").or_else(|| {
+                    if llm_root.get("provider").is_some() {
+                        Some(llm_root)
+                    } else {
+                        None
+                    }
+                });
 
                 if let Some(cfg) = ondemand_cfg {
                     let cl = build_llm_client(cfg);
@@ -875,12 +879,20 @@ impl LanguageServer for Backend {
                     );
                     self.llm.lock().await.replace(cl);
                 } else {
-                    warn!("llm 設定に ondemand キーも provider キーも無いため、補完 LLM は未初期化のままです");
+                    warn!(
+                        "llm 設定に ondemand キーも provider キーも無いため、補完 LLM は未初期化のままです"
+                    );
                 }
                 if let Some(cfg) = llm_root
                     .get("deferred")
                     .or_else(|| llm_root.get("ondemand"))
-                    .or_else(|| if llm_root.get("provider").is_some() { Some(llm_root) } else { None })
+                    .or_else(|| {
+                        if llm_root.get("provider").is_some() {
+                            Some(llm_root)
+                        } else {
+                            None
+                        }
+                    })
                 {
                     let cl = build_llm_client(cfg);
                     debug!(
@@ -1227,6 +1239,8 @@ impl LanguageServer for Backend {
                 l.add(Content::Text(prompt));
                 l.add(Content::Text(before.join("")));
 
+                l.reasoning_level(0.0); // 速度優先
+
                 completion_id = self.db.record_completion(
                     uri,
                     line_no,
@@ -1456,7 +1470,7 @@ impl Backend {
     async fn use_llm<F>(&self, proc: F) -> core::result::Result<String, LlmError>
     where
         F: for<'b, 'a> AsyncFnOnce(
-            &'b mut Box<dyn LlmClient + 'a>,
+            &'b mut Box<dyn LlmInterface + 'a>,
         ) -> core::result::Result<String, LlmError>,
     {
         let mut ref_llm = self.llm.lock().await;
@@ -1477,7 +1491,7 @@ impl Backend {
     ) -> core::result::Result<String, LlmError>
     where
         F: for<'b, 'a> AsyncFnOnce(
-            &'b mut Box<dyn LlmClient + 'a>,
+            &'b mut Box<dyn LlmInterface + 'a>,
         ) -> core::result::Result<String, LlmError>,
     {
         debug!("Options {:?}", option);
@@ -1507,10 +1521,12 @@ impl Backend {
             {
                 llm.seed(n);
             }
-            if let Some(v) = option.get("reasoning_effort")
-                && let Ok(n) = v.parse::<ReasoningEffort>()
-            {
-                llm.reasoning_effort(n);
+            if let Some(v) = option.get("reasoning_effort") {
+                if let Ok(level) = v.parse::<f64>() {
+                    llm.reasoning_level(level);
+                } else if let Ok(eff) = v.parse::<ReasoningEffort>() {
+                    llm.reasoning_effort(eff);
+                }
             }
             if let Some(v) = option.get("service_tier")
                 && let Ok(n) = v.parse::<ServiceTier>()

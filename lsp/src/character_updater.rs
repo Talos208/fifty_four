@@ -1,4 +1,4 @@
-use crate::llm::{Content, LlmClient, ModelCapability};
+use crate::llm::{Content, LlmInterface, ModelCapability};
 use crate::{CharacterAttribute, FlightRecorder, parse_all_content};
 use dashmap::DashMap;
 use genai::chat::{ChatResponseFormat, JsonSpec};
@@ -247,7 +247,7 @@ fn sanitize_merged_section_text(response: &str) -> String {
 }
 
 async fn merge_section_text_semantically(
-    llm_client: &mut dyn LlmClient,
+    llm_client: &mut dyn LlmInterface,
     char_name: &str,
     attribute: &CharacterAttribute,
     old_body: &str,
@@ -261,6 +261,7 @@ async fn merge_section_text_semantically(
         build_semantic_merge_prompt(char_name, attribute.canonical_heading(), old_body, new_body);
     llm_client.temperature(0.2);
     llm_client.max_tokens(1024);
+    llm_client.reasoning_level(0.0);
     llm_client.add(Content::Text(prompt));
     let merged = sanitize_merged_section_text(&llm_client.chat().await?);
 
@@ -287,7 +288,7 @@ pub async fn run(
     uri: String,
     workspace_arc: Arc<TokioMutex<Vec<WorkspaceFolder>>>,
     full_text: String,
-    llm: Arc<TokioMutex<Option<Box<dyn LlmClient>>>>,
+    llm: Arc<TokioMutex<Option<Box<dyn LlmInterface>>>>,
     recorder: Arc<FlightRecorder>,
     state: Arc<parking_lot::Mutex<UpdateState>>,
 ) {
@@ -377,6 +378,7 @@ pub async fn run(
             )));
         }
         llm_client.add(Content::Text(prompt.clone()));
+        llm_client.reasoning_level(0.8); // 重要なので考える
 
         raw_response = llm_client.chat().await;
 
@@ -443,7 +445,7 @@ async fn apply_updates(
     mut char_files: Vec<PathBuf>,
     workspace: &Path,
     recorder: &FlightRecorder,
-    llm_client: &mut dyn LlmClient,
+    llm_client: &mut dyn LlmInterface,
 ) {
     let parsed: Value = match serde_json::from_str(response) {
         Ok(v) => v,
@@ -779,8 +781,7 @@ fn append_new_character(
 fn sanitize_file_stem(name: &str) -> String {
     name.chars()
         .map(|c| {
-            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
-            {
+            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
                 '_'
             } else {
                 c

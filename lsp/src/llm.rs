@@ -102,6 +102,28 @@ impl Provider {
         }
     }
 
+    /// 正規化 effort (0.0..=1.0) をこのプロバイダの ReasoningEffort 段階へ写像する。
+    /// 0.0 (以下) または reasoning 非対応プロバイダ => None。1.0 => 最上位段。
+    pub fn map_reasoning(&self, norm: f64) -> ReasoningEffort {
+        use ReasoningEffort::*;
+        // 低→高 の順。空 = reasoning 非対応。
+        let ladder: &[ReasoningEffort] = match self {
+            Provider::OpenAI(_)    => &[Low, Medium, High, XHigh],
+            Provider::Anthropic(_) => &[Low, Medium, High, XHigh, Max],
+            Provider::Google(_)    => &[Low, Medium, High],
+            Provider::XAi(_)       => &[Low, High],
+            Provider::LMStudio(..) | Provider::Undefined => &[],
+        };
+        let n = norm.clamp(0.0, 1.0);
+        if n <= 0.0 || ladder.is_empty() {
+            ReasoningEffort::None
+        } else {
+            // 1.0 で必ず末尾(最上位)に到達するよう ceil でインデックス化
+            let idx = ((n * ladder.len() as f64).ceil() as usize).clamp(1, ladder.len()) - 1;
+            ladder[idx].clone()
+        }
+    }
+
     #[allow(unused)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -179,7 +201,7 @@ impl std::error::Error for LlmError {}
 
 #[async_trait]
 #[allow(unused)]
-pub trait LlmClient: Send + Sync + std::fmt::Debug {
+pub trait LlmInterface: Send + Sync + std::fmt::Debug {
     //+ MaybeUninit {
     /// LLMとチャットセッションを実行する
     ///
@@ -228,6 +250,9 @@ pub trait LlmClient: Send + Sync + std::fmt::Debug {
     fn stop_sequences(&mut self, seqs: Vec<String>);
     fn seed(&mut self, v: u64);
     fn reasoning_effort(&mut self, effort: ReasoningEffort);
+    /// 正規化された reasoning/thinking effort を指定する (0.0..=1.0)。
+    /// 0.0 = none、1.0 = そのプロバイダの最高 effort。範囲外は clamp。
+    fn reasoning_level(&mut self, level: f64);
     fn response_format(&mut self, fmt: ChatResponseFormat);
     fn service_tier(&mut self, tier: ServiceTier);
     fn verbosity(&mut self, v: Verbosity);
@@ -327,7 +352,7 @@ impl LlmClientBuilder {
         self
     }
 
-    pub fn build(self) -> Box<dyn LlmClient> {
+    pub fn build(self) -> Box<dyn LlmInterface> {
         let mut u_from_prov = None;
         let (auth, kind, mdl_name) = match &self.provider {
             Provider::Google(mdl) => (
@@ -401,7 +426,8 @@ impl LlmClientBuilder {
             .capabilities
             .unwrap_or_else(|| self.provider.default_capabilities());
 
-        Box::new(GenericLlmClient {
+        Box::new(LlmClient {
+            provider: self.provider.clone(),
             inner_client,
             model: mdl_name.clone(),
             cache: HashMap::new(),
@@ -427,12 +453,13 @@ pub trait LlmTool: Send + Sync + Debug {
     async fn invoke(&self, args: &serde_json::Map<String, Value>) -> Result<String, LlmError>;
 }
 
-/// `LlmClient`トレイトの汎用的な実装
+/// `LlmInterface`トレイトの汎用的な実装
 ///
 /// `genai::Client`を内部的に利用し、特定のLLMプロバイダに依存しない形で
 /// チャット機能を提供します。プロンプトの管理には`Cache`トレイトを利用します。
 #[derive(Debug)]
-pub struct GenericLlmClient {
+pub struct LlmClient {
+    provider: Provider,
     /// `genai`ライブラリのコアクライアント
     inner_client: Client,
     options: ChatOptions,
@@ -451,7 +478,7 @@ pub struct GenericLlmClient {
 }
 
 #[async_trait]
-impl LlmClient for GenericLlmClient {
+impl LlmInterface for LlmClient {
     async fn chat(&mut self) -> Result<String, LlmError> {
         let model = self.model.clone();
         self.with_model(model.as_str()).await
@@ -695,6 +722,11 @@ impl LlmClient for GenericLlmClient {
         self.options = std::mem::take(&mut self.options).with_reasoning_effort(effort);
     }
 
+    fn reasoning_level(&mut self, level: f64) {
+        let effort = self.provider.map_reasoning(level);
+        self.options = std::mem::take(&mut self.options).with_reasoning_effort(effort);
+    }
+
     fn response_format(&mut self, fmt: ChatResponseFormat) {
         self.options = std::mem::take(&mut self.options).with_response_format(fmt);
     }
@@ -705,5 +737,58 @@ impl LlmClient for GenericLlmClient {
 
     fn verbosity(&mut self, v: Verbosity) {
         self.options = std::mem::take(&mut self.options).with_verbosity(v);
+    }
+}
+
+#[cfg(test)]
+mod tests_reasoning {
+    use super::*;
+
+    fn openai() -> Provider { Provider::OpenAI("gpt-5.3".to_string()) }
+    fn anthropic() -> Provider { Provider::Anthropic("claude-opus-4-8".to_string()) }
+    fn google() -> Provider { Provider::Google("gemini-3.1-pro-preview".to_string()) }
+    fn xai() -> Provider { Provider::XAi("grok-4.1".to_string()) }
+    fn lmstudio() -> Provider { Provider::LMStudio("model".to_string(), None) }
+
+    #[test]
+    fn test_zero_is_none() {
+        assert!(matches!(openai().map_reasoning(0.0), ReasoningEffort::None));
+        assert!(matches!(anthropic().map_reasoning(0.0), ReasoningEffort::None));
+        assert!(matches!(google().map_reasoning(0.0), ReasoningEffort::None));
+        assert!(matches!(lmstudio().map_reasoning(0.0), ReasoningEffort::None));
+    }
+
+    #[test]
+    fn test_one_is_max_per_provider() {
+        assert!(matches!(openai().map_reasoning(1.0), ReasoningEffort::XHigh));
+        assert!(matches!(anthropic().map_reasoning(1.0), ReasoningEffort::Max));
+        assert!(matches!(google().map_reasoning(1.0), ReasoningEffort::High));
+        assert!(matches!(xai().map_reasoning(1.0), ReasoningEffort::High));
+    }
+
+    #[test]
+    fn test_openai_midpoints() {
+        // ladder=[Low,Medium,High,XHigh], len=4
+        // 0.25 -> ceil(1.0)=1 -> idx=0 -> Low
+        assert!(matches!(openai().map_reasoning(0.25), ReasoningEffort::Low));
+        // 0.5  -> ceil(2.0)=2 -> idx=1 -> Medium
+        assert!(matches!(openai().map_reasoning(0.5), ReasoningEffort::Medium));
+        // 0.75 -> ceil(3.0)=3 -> idx=2 -> High
+        assert!(matches!(openai().map_reasoning(0.75), ReasoningEffort::High));
+    }
+
+    #[test]
+    fn test_clamp_out_of_range() {
+        // 1.0超 -> clamp to 1.0 -> 最上位
+        assert!(matches!(openai().map_reasoning(1.5), ReasoningEffort::XHigh));
+        // 負数 -> None
+        assert!(matches!(anthropic().map_reasoning(-0.3), ReasoningEffort::None));
+    }
+
+    #[test]
+    fn test_lmstudio_always_none() {
+        for v in [0.0, 0.5, 1.0, 2.0] {
+            assert!(matches!(lmstudio().map_reasoning(v), ReasoningEffort::None));
+        }
     }
 }
