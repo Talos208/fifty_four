@@ -105,15 +105,15 @@ impl LlmTool for CharacterInfoTool {
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
         // キャッシュ確認（ロックは HashMap lookup の間だけ保持）
-        {
-            let cache = self.cache.0.lock();
-            if let Some(entry) = cache.get(&path)
-                && entry.modified == modified
-            {
-                let result = Self::search_cache(entry, name, &tags);
-                debug!("\t{:?}", result.map(|r| shorten_middle(&r, 40)))
-            }
-        }
+        // {
+        //     let cache = self.cache.0.lock();
+        //     if let Some(entry) = cache.get(&path)
+        //         && entry.modified == modified
+        //     {
+        //         let result = Self::search_cache(entry, name, &tags);
+        //         debug!("\t{:?}", result.map(|r| shorten_middle(&r, 40)))
+        //     }
+        // }
 
         // キャッシュミス: ファイルを読んでパース
         let content = tokio::fs::read_to_string(&path)

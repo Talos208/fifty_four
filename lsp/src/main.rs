@@ -21,7 +21,7 @@ use crate::character_updater::UpdateState;
 mod tools;
 mod cursor_context;
 mod llm;
-use crate::llm::{Content, LlmInterface, LlmClientBuilder, LlmError, LlmTool, ModelCapability};
+use crate::llm::{Content, LlmInterface, LlmClientBuilder, LlmError, ModelCapability};
 use genai::chat::{ChatResponseFormat, JsonSpec};
 use std::panic;
 use std::path::{Path, PathBuf};
