@@ -180,8 +180,75 @@ impl CharacterInfoTool {
     }
 }
 
-// ─── PlotInfoTool (future) ───────────────────────────────────────────────────
-// PlotInfoTool will be added here in a later task.
+// ─── PlotInfoTool ────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub(crate) struct PlotInfoTool {
+    workspace: PathBuf,
+}
+
+impl PlotInfoTool {
+    pub(crate) fn new(workspace: &Path) -> Box<dyn LlmTool> {
+        Box::new(Self { workspace: workspace.to_path_buf() })
+    }
+}
+
+#[async_trait]
+impl LlmTool for PlotInfoTool {
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "chapter_name": {
+                    "type": "string",
+                    "description": "プロットを取得したい章の名前（省略時は全章を返す）"
+                }
+            },
+            "required": []
+        })
+    }
+
+    fn name(&self) -> &str { "plot_info" }
+    fn description(&self) -> &str { "章のプロット情報を取得する" }
+
+    async fn invoke(
+        &self,
+        args: &serde_json::Map<String, Value>,
+    ) -> std::result::Result<String, LlmError> {
+        let chapter_name = args.get("chapter_name").and_then(|v| v.as_str());
+
+        let plot_path = self.workspace.join("plot.md");
+        let content = tokio::fs::read_to_string(&plot_path)
+            .await
+            .map_err(|e| LlmError::GenericError {
+                message: format!("plot.md を読み込めませんでした: {}", e),
+            })?;
+
+        let chapters = parse_plot_md(&content);
+
+        match chapter_name {
+            Some(name) => chapters
+                .into_iter()
+                .find(|(ch, _)| ch == name)
+                .map(|(_, body)| body)
+                .ok_or_else(|| LlmError::GenericError {
+                    message: format!("章 '{}' が plot.md に見つかりません", name),
+                }),
+            None => {
+                if chapters.is_empty() {
+                    return Err(LlmError::GenericError {
+                        message: "plot.md に章が見つかりません".to_string(),
+                    });
+                }
+                Ok(chapters
+                    .into_iter()
+                    .map(|(name, body)| format!("# {}\n{}", name, body))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"))
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -1095,6 +1095,17 @@ impl LanguageServer for Backend {
                         .unwrap_or_default(),
                     self.character_cache.clone(),
                 ));
+                l.add_tool(tools::PlotInfoTool::new(
+                    &self
+                        .client
+                        .workspace_folders()
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or(vec![])
+                        .first()
+                        .map(|v| v.uri.to_file_path().unwrap())
+                        .unwrap_or_default(),
+                ));
                 l.add(Content::Text(prompt));
                 l.add(Content::Text(before.join("")));
 
