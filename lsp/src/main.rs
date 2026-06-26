@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 mod character_updater;
 use crate::character_updater::UpdateState;
+mod tools;
 mod cursor_context;
 mod llm;
 use crate::llm::{Content, LlmInterface, LlmClientBuilder, LlmError, LlmTool, ModelCapability};
@@ -347,128 +348,34 @@ impl CharacterAttribute {
 
 /// タグ付きコンテンツ。1つの見出しセクション（属性）に対応する。
 #[derive(Debug, Clone)]
-struct TaggedContent {
+pub(crate) struct TaggedContent {
     /// 見出しを「・」で分割したタグ群
-    tags: Vec<CharacterAttribute>,
+    pub(crate) tags: Vec<CharacterAttribute>,
     /// セクションのプレーンテキスト
-    text: String,
+    pub(crate) text: String,
 }
 
 /// 1キャラクター分のキャッシュ
 #[derive(Debug, Clone)]
-struct CharacterEntry {
-    sections: Vec<TaggedContent>,
+pub(crate) struct CharacterEntry {
+    pub(crate) sections: Vec<TaggedContent>,
 }
 
 /// 1ファイル分のキャッシュ
 #[derive(Debug)]
-struct FileCacheEntry {
-    modified: std::time::SystemTime,
+pub(crate) struct FileCacheEntry {
+    pub(crate) modified: std::time::SystemTime,
     /// key: heading 全文（部分一致検索用）
-    characters: HashMap<String, CharacterEntry>,
+    pub(crate) characters: HashMap<String, CharacterEntry>,
 }
 
 /// 全ファイルのキャッシュ (Arc で複数の CharacterInfoTool インスタンス間で共有)
 #[derive(Debug, Clone)]
-struct CharacterCache(Arc<parking_lot::Mutex<HashMap<PathBuf, FileCacheEntry>>>);
+pub(crate) struct CharacterCache(pub(crate) Arc<parking_lot::Mutex<HashMap<PathBuf, FileCacheEntry>>>);
 
 impl CharacterCache {
     fn new() -> Self {
         Self(Arc::new(parking_lot::Mutex::new(HashMap::new())))
-    }
-}
-
-#[derive(Debug)]
-struct CharacterInfoTool {
-    workspace: PathBuf,
-    cache: CharacterCache,
-}
-
-#[async_trait]
-impl LlmTool for CharacterInfoTool {
-    fn schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "character_name": {
-                    "type": "string",
-                    "description": "設定を取得したいキャラクターの名前"
-                },
-                "tags": {
-                    "type": "array",
-                    "items": {
-                        "type": "string",
-                        "enum": ["role", "appearance", "personality", "expression", "background", "relationship", "weakness", "style"],
-                    },
-                    "minItems": 1,
-                    "description": "取得したい属性のタグ"
-                }
-            },
-            "required": ["character_name", "tags"],
-        })
-    }
-
-    fn name(&self) -> &str {
-        "character_info"
-    }
-
-    fn description(&self) -> &str {
-        "キャラクターの設定を取得する"
-    }
-
-    async fn invoke(
-        &self,
-        _args: &serde_json::Map<String, Value>,
-    ) -> std::result::Result<String, LlmError> {
-        let name = _args["character_name"].as_str().unwrap_or("");
-        let tags: Vec<String> = _args
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        debug!("CharacterInfoTool({}, {:?})", name, tags);
-
-        let path = self.find_character_file_path(name)?;
-
-        let modified = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-
-        // キャッシュ確認（ロックは HashMap lookup の間だけ保持）
-        {
-            let cache = self.cache.0.lock();
-            if let Some(entry) = cache.get(&path)
-                && entry.modified == modified
-            {
-                let result = Self::search_cache(entry, name, &tags);
-                debug!("\t{:?}", result.map(|r| shorten_middle(&r, 40)))
-            }
-        }
-
-        // キャッシュミス: ファイルを読んでパース
-        let content =
-            tokio::fs::read_to_string(&path)
-                .await
-                .map_err(|e| LlmError::GenericError {
-                    message: format!("Failed to read {:?}: {}", &path, e),
-                })?;
-        debug!("{}", shorten_middle(&content, 40));
-
-        let characters = parse_all_content(&content);
-        let file_entry = FileCacheEntry {
-            modified,
-            characters,
-        };
-
-        let result = Self::search_cache(&file_entry, name, &tags);
-        self.cache.0.lock().insert(path, file_entry);
-        debug!("\t{:?}", result.as_ref().map(|r| shorten_middle(r, 40)));
-        result
     }
 }
 
@@ -506,54 +413,6 @@ pub fn find_character_file_path(
     Err(LlmError::GenericError {
         message: format!("Found no file for '{}' in {:?}", name, &dir),
     })
-}
-
-impl CharacterInfoTool {
-    #[deny(clippy::new_ret_no_self)]
-    fn new(workspace: &Path, cache: CharacterCache) -> Box<dyn LlmTool> {
-        Box::new(Self {
-            workspace: workspace.to_path_buf(),
-            cache,
-        })
-    }
-
-    fn find_character_file_path(&self, name: &str) -> std::result::Result<PathBuf, LlmError> {
-        find_character_file_path(&self.workspace, name)
-    }
-
-    fn search_cache(
-        entry: &FileCacheEntry,
-        name: &str,
-        tags: &[String],
-    ) -> std::result::Result<String, LlmError> {
-        // キャラクター名は部分一致で検索
-        let Some((_, char_entry)) = entry.characters.iter().find(|(k, _)| k.contains(name)) else {
-            return Err(LlmError::GenericError {
-                message: format!("Character '{}' not found", name),
-            });
-        };
-
-        let tag_attrs = tags
-            .iter()
-            .filter_map(|t| CharacterAttribute::try_from(t.as_str()).ok())
-            .collect::<Vec<_>>();
-
-        let matched = char_entry
-            .sections
-            .iter()
-            .filter(|s| tag_attrs.iter().any(|t| s.tags.contains(t)))
-            .map(|s| s.text.trim())
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>();
-
-        if matched.is_empty() {
-            Err(LlmError::GenericError {
-                message: format!("No sections matching tags {:?} for '{}'", tags, name),
-            })
-        } else {
-            Ok(matched.join("\n\n"))
-        }
-    }
 }
 
 /// ファイル内の heading 構造からキャラクターを表す heading レベルを推定する。
@@ -745,7 +604,7 @@ pub fn shorten(s: &str, len: usize) -> String {
     }
 }
 
-pub fn shorten_middle(s: &str, len: usize) -> String {
+pub(crate) fn shorten_middle(s: &str, len: usize) -> String {
     let c = &s.chars();
     let l = c.clone().count();
     if l > 25 && l > len {
@@ -1224,7 +1083,7 @@ impl LanguageServer for Backend {
         let mut completion_id = 0u32;
         let raw = self
             .use_llm_with_option(options, async |l| {
-                l.add_tool(CharacterInfoTool::new(
+                l.add_tool(tools::CharacterInfoTool::new(
                     &self
                         .client
                         .workspace_folders()
@@ -1948,6 +1807,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::CharacterInfoTool;
     use indoc::indoc;
     use tower_lsp::lsp_types::{Position, Range};
 
