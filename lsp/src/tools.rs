@@ -116,15 +116,19 @@ impl LlmTool for CharacterInfoTool {
         // }
 
         // キャッシュミス: ファイルを読んでパース
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| LlmError::GenericError {
-                message: format!("Failed to read {:?}: {}", &path, e),
-            })?;
+        let content =
+            tokio::fs::read_to_string(&path)
+                .await
+                .map_err(|e| LlmError::GenericError {
+                    message: format!("Failed to read {:?}: {}", &path, e),
+                })?;
         debug!("{}", shorten_middle(&content, 40));
 
         let characters = parse_all_content(&content);
-        let file_entry = FileCacheEntry { modified, characters };
+        let file_entry = FileCacheEntry {
+            modified,
+            characters,
+        };
 
         let result = Self::search_cache(&file_entry, name, &tags);
         self.cache.0.lock().insert(path, file_entry);
@@ -142,7 +146,7 @@ impl CharacterInfoTool {
     }
 
     fn find_character_file_path(&self, name: &str) -> std::result::Result<PathBuf, LlmError> {
-        find_character_file_path(&self.workspace, name)
+        find_character_file_path(&self.workspace, name) // TODO: キャラクタの呼び方は複数ありうるので、キャラ設定全部をなめないといけない
     }
 
     pub(crate) fn search_cache(
@@ -189,7 +193,9 @@ pub(crate) struct PlotInfoTool {
 
 impl PlotInfoTool {
     pub(crate) fn new(workspace: &Path) -> Box<dyn LlmTool> {
-        Box::new(Self { workspace: workspace.to_path_buf() })
+        Box::new(Self {
+            workspace: workspace.to_path_buf(),
+        })
     }
 }
 
@@ -208,25 +214,32 @@ impl LlmTool for PlotInfoTool {
         })
     }
 
-    fn name(&self) -> &str { "plot_info" }
-    fn description(&self) -> &str { "章のプロット情報を取得する" }
+    fn name(&self) -> &str {
+        "plot_info"
+    }
+    fn description(&self) -> &str {
+        "章のプロット情報を取得する"
+    }
 
     async fn invoke(
         &self,
         args: &serde_json::Map<String, Value>,
     ) -> std::result::Result<String, LlmError> {
         let chapter_name = args.get("chapter_name").and_then(|v| v.as_str());
+        debug!("PlotInfoTool(chapter_name={:?})", chapter_name);
 
         let plot_path = self.workspace.join("plot.md");
-        let content = tokio::fs::read_to_string(&plot_path)
-            .await
-            .map_err(|e| LlmError::GenericError {
-                message: format!("plot.md を読み込めませんでした: {}", e),
-            })?;
+        let content =
+            tokio::fs::read_to_string(&plot_path)
+                .await
+                .map_err(|e| LlmError::GenericError {
+                    message: format!("plot.md を読み込めませんでした: {}", e),
+                })?;
 
         let chapters = parse_plot_md(&content);
+        debug!("PlotInfoTool: {} chapter(s) parsed from plot.md", chapters.len());
 
-        match chapter_name {
+        let result = match chapter_name {
             Some(name) => chapters
                 .into_iter()
                 .find(|(ch, _)| ch == name)
@@ -236,17 +249,24 @@ impl LlmTool for PlotInfoTool {
                 }),
             None => {
                 if chapters.is_empty() {
-                    return Err(LlmError::GenericError {
+                    Err(LlmError::GenericError {
                         message: "plot.md に章が見つかりません".to_string(),
-                    });
+                    })
+                } else {
+                    Ok(chapters
+                        .into_iter()
+                        .map(|(name, body)| format!("# {}\n{}", name, body))
+                        .collect::<Vec<_>>()
+                        .join("\n\n"))
                 }
-                Ok(chapters
-                    .into_iter()
-                    .map(|(name, body)| format!("# {}\n{}", name, body))
-                    .collect::<Vec<_>>()
-                    .join("\n\n"))
             }
+        };
+
+        match &result {
+            Ok(r) => debug!("PlotInfoTool: ok, {}", shorten_middle(r, 40)),
+            Err(e) => debug!("PlotInfoTool: error, {}", e),
         }
+        result
     }
 }
 
@@ -285,7 +305,10 @@ mod tests {
         let md = "# 第1章\n## サブセクション\n本文。\n# 第2章\n内容。\n";
         let chapters = parse_plot_md(md);
         assert_eq!(chapters.len(), 2);
-        assert!(chapters[0].1.contains("本文"), "level-2見出しは本文として扱う");
+        assert!(
+            chapters[0].1.contains("本文"),
+            "level-2見出しは本文として扱う"
+        );
     }
 
     #[test]

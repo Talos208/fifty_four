@@ -9,8 +9,9 @@ sequenceDiagram
     participant Backend as Backend
     participant CC as cursor_context
     participant HL as Highlighter
-    participant LLM as LlmClient
-    participant Tool as CharacterInfoTool
+    participant LLM as LlmInterface
+    participant CTool as CharacterInfoTool
+    participant PTool as PlotInfoTool
 
     User->>Zed: 補完トリガ (、 「 『)
     Zed->>Backend: completion
@@ -18,9 +19,10 @@ sequenceDiagram
     Backend->>CC: classify_complesion_mode()
     Note over CC: AfterSentenceEnd / EmptyBracket / InBracketOther 等
     CC-->>Backend: CursorContext
-    Backend->>Backend: load_prompt(prompt_*.md)
+    Backend->>Backend: load_prompt(prompt_*.md) + {{CHAPTER}}をURIのファイル名で置換
     Backend->>LLM: プロンプト + 直前10文
-    Backend->>Tool: キャラ設定参照 (tool calling)
+    Backend->>CTool: キャラ設定参照 (tool calling)
+    Backend->>PTool: 章のプロット参照 (tool calling)
     LLM-->>Backend: 候補テキスト (行区切り)
     Backend->>Backend: 文脈に応じた句読点調整
     Backend-->>Zed: CompletionList
@@ -58,12 +60,18 @@ LLM 応答（行区切り）を `CursorContext` に応じて整形してから `
 
 25 文字超の候補は短縮ラベル + Markdown ドキュメントとして全文を表示。
 
-## CharacterInfoTool
+## CharacterInfoTool / PlotInfoTool
 
-補完時に LLM へ tool として登録。ワークスペース内のキャラクター MD を参照し、登場人物の設定情報を補完コンテキストに提供する。
+補完時に LLM へ tool として登録(`tools.rs`)。LLM がtool callするかはプロンプト・文脈次第で、必ず呼ばれるとは限らない。
+
+**CharacterInfoTool**: ワークスペース内のキャラクター MD を参照し、登場人物の設定情報を補完コンテキストに提供する。
 
 - キャラ MD は `comrak` + frontmatter でパース（`parse_all_content`）
 - 結果は `CharacterCache` にキャッシュ
+
+**PlotInfoTool**: ワークスペースの `plot.md` を参照し、章のプロット概要を提供する。`chapter_name` 引数(省略可、省略時は全章)で章を指定する。`plot.md` の `# 章名` を章区切りとして `parse_plot_md` でパースする。キャッシュは持たない。
+
+`completion` は現在編集中のファイル名(拡張子抜き)を `{{CHAPTER}}` としてプロンプトへ埋め込むため、LLM が `PlotInfoTool` に渡す `chapter_name` の手がかりになる。
 
 ## debug 記録
 

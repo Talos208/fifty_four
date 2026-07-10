@@ -13,20 +13,21 @@ flowchart TB
         Main["main.rs — Backend (LanguageServer)"]
         HL["highlight.rs — 形態素解析・セマンティックトークン"]
         CC["cursor_context.rs — カーソル文脈分類"]
-        LLM["llm.rs — LLM クライアント (genai)"]
+        LLM["llm.rs — LlmInterface / LlmClient (genai)"]
         CU["character_updater.rs — キャラ設定自動更新"]
+        Tools["tools.rs — CharacterInfoTool / PlotInfoTool"]
         Types["types.rs — LineData / CachedLinderaToken"]
-        Log["logging.rs — OpenTelemetry / tracing"]
-        DB["FlightRecorder (debug) — SQLite"]
+        Log["logging.rs — OpenTelemetry / tracing (未使用、env_logger稼働中)"]
+        DB["FlightRecorder (debug) — SQLite (db/)"]
     end
 
     subgraph External["外部"]
         Lindera["Lindera (IPADIC)"]
         Providers["LLM プロバイダ\n(Google / OpenAI / Anthropic / xAI / LMStudio)"]
-        WS["ワークスペース\n(.txt / .md ファイル)"]
+        WS["ワークスペース\n(.txt / .md / plot.md ファイル)"]
     end
 
-    subgraph Assets["data/ (埋め込みプロンプト)"]
+    subgraph Assets["data/ (プロンプト。実行ファイル隣接優先→埋め込みフォールバック)"]
         Prompts["system.md\nprompt_completion*.md\nprompt_character_update.md"]
     end
 
@@ -36,6 +37,7 @@ flowchart TB
     Main --> CC
     Main --> LLM
     Main --> CU
+    Main --> Tools
     Main --> DB
     HL --> Lindera
     LLM --> Providers
@@ -43,6 +45,7 @@ flowchart TB
     CU --> Prompts
     Main --> WS
     CU --> WS
+    Tools --> WS
 ```
 
 ## Backend コンポーネント
@@ -69,7 +72,7 @@ classDiagram
         +to_semantic_tokens()
     }
 
-    class LlmClient {
+    class LlmInterface {
         <<trait>>
         +chat()
         +add_tool()
@@ -81,6 +84,11 @@ classDiagram
         +キャラ MD 参照
     }
 
+    class PlotInfoTool {
+        +LlmTool
+        +plot.md 参照
+    }
+
     class UpdateState {
         +dirty_lines
         +accumulated_chars
@@ -88,10 +96,11 @@ classDiagram
     }
 
     Backend --> Highlighter
-    Backend --> LlmClient
+    Backend --> LlmInterface
     Backend --> UpdateState
-    LlmClient <|.. GenericLlmClient
+    LlmInterface <|.. LlmClient
     Backend --> CharacterInfoTool
+    Backend --> PlotInfoTool
 ```
 
 ## LLM クライアントの二系統

@@ -1,9 +1,13 @@
 # Rust
 target/
 Cargo.lock
-.cargo/
+.cargo/*
+!.cargo/config.toml
 **/*.rs.bk
 extension\target
+
+# パッケージング成果物(cargo xtask package の出力)
+/dist/
 
 # IDE
 .idea/

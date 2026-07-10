@@ -44,7 +44,7 @@ flowchart TD
 ```
 
 1. 編集中ファイルの全文を取得(発火判定の差分カウントとは独立)
-2. ワークスペース内のキャラ MD ファイルを収集
+2. ワークスペース内のキャラ MD ファイルを収集。1件も無ければ `characters.md` を新規作成して処理を続ける
 3. `prompt_character_update.md` を LLM に送信（全文テキスト）
 4. JSON 応答をパース → 各キャラの `CharacterAttribute` セクションを更新・追記、または新規キャラのファイル/ブロックを作成
 5. debug ビルド時は `character_updates` / `character_update_sections` テーブルに記録

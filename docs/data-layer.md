@@ -10,7 +10,7 @@
 | `character_cache` | `CharacterCache` | キャラ MD のパース結果 | `CharacterInfoTool` / 更新適用 |
 | `update_states` | `DashMap<String, Arc<Mutex<UpdateState>>>` | URI ごとの編集蓄積状態 | キャラ更新の発火判定 |
 | `workspace` | `Arc<Mutex<Vec<WorkspaceFolder>>>` | ワークスペースフォルダ | キャラファイル探索 |
-| `llm` / `background_llm` | `Arc<Mutex<Option<Box<dyn LlmClient>>>>` | LLM クライアント | 補完 / キャラ更新 |
+| `llm` / `background_llm` | `Arc<Mutex<Option<Box<dyn LlmInterface>>>>` | LLM クライアント | 補完 / キャラ更新 |
 
 ## LineData
 
@@ -34,7 +34,7 @@ pub struct CachedLinderaToken {
 
 ## SQLite (debug ビルドのみ)
 
-`FlightRecorder` が `lsp/migrations/` のスキーマで管理。補完とキャラ更新の Flight Recorder として動作。
+`FlightRecorder` が `lsp/migrations/` のスキーマで管理。補完とキャラ更新の Flight Recorder として動作。DBファイルは実行ファイルと同じ階層の `db/fifty_four.db`(`std::env::current_exe()` 基準。コンパイル時固定の `CARGO_MANIFEST_DIR` ではなく実行時に解決するため、配布先のマシンでもそのまま動く)。`db/` ディレクトリが無ければ起動時に自動作成する。
 
 ### completions / completion_candidates
 
@@ -56,14 +56,14 @@ character_update_sections (id, update_id, character_name, attribute, old_text, n
 
 キャラ更新タスクの実行履歴と、セクション単位の適用結果を記録する。
 
-## 埋め込みプロンプト
+## プロンプト読み込み
 
-`data/` 配下の Markdown は `rust-embed` でバイナリに埋め込まれる（`Asset` 構造体）。
+`data/` 配下の Markdown は `rust-embed` でもバイナリに埋め込まれる（`Asset` 構造体）が、`load_prompt(name)` は**実行ファイルと同じ階層の `data/<name>` を優先して読み**、無ければ埋め込みへフォールバックする(`load_prompt_from_disk`)。再ビルドせずにプロンプトを編集して試せるようにするための dev 用フック。
 
 `load_prompt(name)` の処理:
 
-1. 埋め込みファイルを読み込み
+1. `<実行ファイルの隣>/data/<name>` があればそちらを読む。無ければ埋め込みアセット(`Asset::get`)を読む
 2. `gray_matter` で YAML frontmatter を分離
 3. 本文 + frontmatter オプション（`max_tokens`, `temperature`, `schema` 等）を返却
 
-frontmatter のオプションは `use_llm_with_option` が LLM 呼び出し前に適用する。
+frontmatter のオプションは `use_llm_with_option` が LLM 呼び出し前に適用する。同様のロジックは `build_llm_client` のシステムプロンプト読み込み(`system.md`)にも使われる。

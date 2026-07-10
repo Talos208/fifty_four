@@ -4,6 +4,7 @@ use comrak::arena_tree::NodeEdge;
 use comrak::nodes::{AstNode, NodeValue};
 use comrak::{Arena, options};
 use dashmap::mapref::one::RefMut;
+use std::ffi::OsStr;
 use std::sync::Arc;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, async_trait};
@@ -18,10 +19,10 @@ use std::collections::HashMap;
 use std::str::FromStr;
 mod character_updater;
 use crate::character_updater::UpdateState;
-mod tools;
 mod cursor_context;
 mod llm;
-use crate::llm::{Content, LlmInterface, LlmClientBuilder, LlmError, ModelCapability};
+mod tools;
+use crate::llm::{Content, LlmClientBuilder, LlmError, LlmInterface, ModelCapability};
 use genai::chat::{ChatResponseFormat, JsonSpec};
 use std::panic;
 use std::path::{Path, PathBuf};
@@ -371,7 +372,9 @@ pub(crate) struct FileCacheEntry {
 
 /// 全ファイルのキャッシュ (Arc で複数の CharacterInfoTool インスタンス間で共有)
 #[derive(Debug, Clone)]
-pub(crate) struct CharacterCache(pub(crate) Arc<parking_lot::Mutex<HashMap<PathBuf, FileCacheEntry>>>);
+pub(crate) struct CharacterCache(
+    pub(crate) Arc<parking_lot::Mutex<HashMap<PathBuf, FileCacheEntry>>>,
+);
 
 impl CharacterCache {
     fn new() -> Self {
@@ -649,11 +652,15 @@ struct Backend {
 }
 
 fn build_llm_client(cfg: &serde_json::Value) -> Box<dyn LlmInterface> {
-    LlmClientBuilder::from_value(cfg)
-        .sys_prompt(
-            Asset::get("system.md").map(|d| String::from_utf8_lossy(d.data.as_ref()).to_string()),
-        )
-        .build()
+    // prompt 群と同じく exe 隣の data/ を優先し、無ければ埋め込みアセットへフォールバック
+    // (デバッグビルドの埋め込みはビルドマシンの絶対パスを実行時に読むため、転送先では失敗する)。
+    let sys_prompt = load_prompt_from_disk("system.md").or_else(|| {
+        Asset::get("system.md").map(|d| String::from_utf8_lossy(d.data.as_ref()).to_string())
+    });
+    if sys_prompt.is_none() {
+        warn!("system.md not found on disk nor in embedded assets; LLM runs without system prompt");
+    }
+    LlmClientBuilder::from_value(cfg).sys_prompt(sys_prompt).build()
 }
 
 /// `LanguageServer` トレイトの実装。
@@ -739,7 +746,7 @@ impl LanguageServer for Backend {
                     self.llm.lock().await.replace(cl);
                 } else {
                     warn!(
-                        "llm 設定に ondemand キーも provider キーも無いため、補完 LLM は未初期化のままです"
+                        "llm config has neither ondemand nor provider key; completion LLM remains uninitialized"
                     );
                 }
                 if let Some(cfg) = llm_root
@@ -1080,32 +1087,34 @@ impl LanguageServer for Backend {
         let (prompt, options) =
             crate::load_prompt(prompt_fn).unwrap_or_else(|| panic!("{} not found", prompt_fn));
 
+        let workspace = &self
+            .client
+            .workspace_folders()
+            .await
+            .unwrap_or(None)
+            .unwrap_or(vec![])
+            .first()
+            .map(|v| v.uri.to_file_path().unwrap())
+            .unwrap_or_default();
+
+        let chapter = params
+            .text_document_position
+            .text_document
+            .uri
+            .to_file_path()
+            .unwrap();
+        let chapter = chapter.file_prefix().unwrap().to_str().unwrap_or("99");
+        debug!("Prompt: {:?}", chapter);
+        let prompt = prompt.replace("{{CHAPTER}}", chapter);
+
         let mut completion_id = 0u32;
         let raw = self
             .use_llm_with_option(options, async |l| {
                 l.add_tool(tools::CharacterInfoTool::new(
-                    &self
-                        .client
-                        .workspace_folders()
-                        .await
-                        .unwrap_or(None)
-                        .unwrap_or(vec![])
-                        .first()
-                        .map(|v| v.uri.to_file_path().unwrap())
-                        .unwrap_or_default(),
+                    workspace,
                     self.character_cache.clone(),
                 ));
-                l.add_tool(tools::PlotInfoTool::new(
-                    &self
-                        .client
-                        .workspace_folders()
-                        .await
-                        .unwrap_or(None)
-                        .unwrap_or(vec![])
-                        .first()
-                        .map(|v| v.uri.to_file_path().unwrap())
-                        .unwrap_or_default(),
-                ));
+                l.add_tool(tools::PlotInfoTool::new(workspace));
                 l.add(Content::Text(prompt));
                 l.add(Content::Text(before.join("")));
 
@@ -1687,8 +1696,13 @@ struct Asset;
 /// - アセットが見つからない場合は `None`(欠如時の扱いは呼び出し側に委ねる)。
 /// - frontmatter が無い・パースに失敗した場合は本文をそのまま・空の data を返す。
 pub(crate) fn load_prompt(name: &str) -> Option<(String, HashMap<String, String>)> {
-    let asset = Asset::get(name)?;
-    let template = String::from_utf8_lossy(asset.data.as_ref());
+    let template: String = match load_prompt_from_disk(name) {
+        Some(s) => s,
+        None => {
+            let asset = Asset::get(name)?;
+            String::from_utf8_lossy(asset.data.as_ref()).into_owned()
+        }
+    };
     let matter = gray_matter::Matter::<gray_matter::engine::YAML>::new();
     // いったん Pod として受け、スカラー値を文字列へ正規化する。
     // HashMap<String, String> へ直接デシリアライズすると、frontmatter に数値や真偽値が
@@ -1696,7 +1710,7 @@ pub(crate) fn load_prompt(name: &str) -> Option<(String, HashMap<String, String>
     // 失われてしまうため(option は use_llm_with_option 側で文字列から parse し直す前提)。
     let parsed = match matter.parse::<gray_matter::Pod>(&template) {
         Ok(p) => p,
-        Err(_) => return Some((template.into_owned(), HashMap::new())),
+        Err(_) => return Some((template, HashMap::new())),
     };
     let body = parsed.content;
     let mut data = HashMap::new();
@@ -1708,6 +1722,14 @@ pub(crate) fn load_prompt(name: &str) -> Option<(String, HashMap<String, String>
         }
     }
     Some((body, data))
+}
+
+/// 実行ファイルと同じディレクトリの `data/<name>` があれば、そちらを優先して読む
+/// (再ビルドせずにプロンプトを編集して試すための dev 用フック)。無ければ `None`。
+fn load_prompt_from_disk(name: &str) -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    std::fs::read_to_string(dir.join("data").join(name)).ok()
 }
 
 /// frontmatter の Pod を文字列へ正規化する。
@@ -1759,16 +1781,17 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    // .env はローカル開発専用(debugビルドのみ)なので、ソースリポジトリのルート基準で読む。
+    // 無い場合(ビルドマシン外へ転送したデバッグビルド等)は OS の環境変数をそのまま使う。
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     // 環境変数の初期化
     #[cfg(debug_assertions)]
     {
-        // こやつパス間違っててもエラーを返さない
-        if let Err(err) = dotenvx_rs::dotenvx::from_path(path.join(".env")) {
-            eprintln!("Failed to load environment variables: {}", err);
-
-            eprintln!("{:?}", std::env::vars());
-            return;
+        if let Err(err) = dotenvx_rs::dotenvx::from_path(manifest_dir.join(".env")) {
+            eprintln!(
+                "No .env loaded ({}); using process environment variables as-is",
+                err
+            );
         }
     }
 
@@ -1779,9 +1802,21 @@ async fn main() {
         .target(env_logger::Target::Stderr)
         .init();
 
+    // db/ は実行ファイル自身の隣に置く(コピー先のフォルダでもそのまま動くように、
+    // ビルド時に固定される CARGO_MANIFEST_DIR ではなく実行時の current_exe を基準にする)。
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| manifest_dir.to_path_buf());
+
     // LspService を構築し、`Backend` をクライアントハンドルで初期化する
     info!("initialize lsp service");
-    let db_path = path.join("data").join("fifty_four.db");
+    let db_dir = exe_dir.join("db");
+    if let Err(e) = std::fs::create_dir_all(&db_dir) {
+        eprintln!("Failed to create db directory {:?}: {}", db_dir, e);
+        return;
+    }
+    let db_path = db_dir.join("fifty_four.db");
     let (service, socket) = tower_lsp::LspService::build(|client| Backend {
         client,
         text: DashMap::new(),

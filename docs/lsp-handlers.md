@@ -78,4 +78,4 @@ Zed 拡張またはクライアント設定から渡される JSON:
 |---|---|---|
 | `record_change` | `did_change` | 編集量を蓄積 → idle / max_chars でキャラ更新発火 |
 | `update_all` / `update_partial` | `did_open` / `did_change` | `DashMap<uri, Vec<LineData>>` 更新 |
-| `load_prompt` | `completion`, `character_updater` | 埋め込みプロンプト + YAML frontmatter 読み込み |
+| `load_prompt` | `completion`, `character_updater` | プロンプト読み込み(実行ファイル隣接優先→埋め込みフォールバック) + YAML frontmatter |

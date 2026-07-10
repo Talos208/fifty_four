@@ -1,5 +1,5 @@
 use crate::llm::{Content, LlmInterface, ModelCapability};
-use crate::{CharacterAttribute, FlightRecorder, parse_all_content};
+use crate::{CharacterAttribute, FlightRecorder, parse_all_content, shorten_middle};
 use dashmap::DashMap;
 use genai::chat::{ChatResponseFormat, JsonSpec};
 #[allow(unused_imports)]
@@ -314,14 +314,24 @@ pub async fn run(
     };
     debug!("character_updater::run: workspace={:?}", workspace);
 
-    // 1. characters/*.md を全て収集
-    let char_files = collect_character_files(&workspace).await;
+    // 1. characters/*.md を全て収集(1件も無ければ characters.md を新規作成して処理を続ける)
+    let mut char_files = collect_character_files(&workspace).await;
     if char_files.is_empty() {
         debug!(
-            "character_updater: no character files found under {:?}",
+            "character_updater: no character files found under {:?}, creating characters.md",
             workspace
         );
-        return;
+        let new_path = workspace.join("characters.md");
+        match tokio::fs::write(&new_path, "").await {
+            Ok(_) => {
+                info!("character_updater: created {:?}", new_path);
+                char_files.push(new_path);
+            }
+            Err(e) => {
+                error!("character_updater: failed to create characters.md: {}", e);
+                return;
+            }
+        }
     }
     debug!(
         "character_updater::run: {} character file(s) found",
@@ -462,6 +472,7 @@ async fn apply_updates(
             return;
         }
     };
+    debug!("character_updater: {} update(s) received", updates.len());
 
     for item in updates {
         let name = match item.get("name").and_then(|v| v.as_str()) {
@@ -477,9 +488,20 @@ async fn apply_updates(
             None => continue,
         };
 
+        debug!(
+            "character_updater: processing update name={:?} attribute={:?} text={}",
+            name,
+            attr_str,
+            shorten_middle(new_text, 40)
+        );
+
         let attr = match CharacterAttribute::try_from(attr_str) {
             Ok(a) => a,
             Err(_) => {
+                warn!(
+                    "character_updater: unknown attribute {:?} for {:?}, skip",
+                    attr_str, name
+                );
                 recorder.record_character_section(
                     update_id,
                     name,
@@ -500,7 +522,11 @@ async fn apply_updates(
             // ---- 既存ファイルへの操作 ----
             let file_content = match tokio::fs::read_to_string(&file_path).await {
                 Ok(c) => c,
-                Err(_) => {
+                Err(e) => {
+                    warn!(
+                        "character_updater: failed to read character file {:?}: {}",
+                        file_path, e
+                    );
                     recorder.record_character_section(
                         update_id,
                         name,
@@ -531,6 +557,10 @@ async fn apply_updates(
                         {
                             Ok(Some(merged)) => merged,
                             Ok(None) => {
+                                debug!(
+                                    "character_updater: {}/{} no semantic change, skip",
+                                    name, attr_str
+                                );
                                 recorder.record_character_section(
                                     update_id,
                                     name,
@@ -559,6 +589,10 @@ async fn apply_updates(
                         match replace_section(&file_content, name, &attr, &merged) {
                             Some(c) => (Some(old), Some(c)),
                             None => {
+                                warn!(
+                                    "character_updater: replace_section failed for {}/{}",
+                                    name, attr_str
+                                );
                                 recorder.record_character_section(
                                     update_id,
                                     name,
@@ -581,6 +615,10 @@ async fn apply_updates(
                         ) {
                             Some(c) => (None, Some(c)),
                             None => {
+                                warn!(
+                                    "character_updater: append_attribute_section failed for {}/{}",
+                                    name, attr_str
+                                );
                                 recorder.record_character_section(
                                     update_id,
                                     name,
@@ -648,6 +686,10 @@ async fn apply_updates(
                     char_files.push(new_path);
                 }
                 None => {
+                    warn!(
+                        "character_updater: failed to create character file for {:?}",
+                        name
+                    );
                     recorder.record_character_section(
                         update_id,
                         name,
@@ -802,14 +844,14 @@ async fn create_character_file(
     let stem = sanitize_file_stem(name);
     if stem.trim_matches('_').is_empty() {
         error!(
-            "character_updater: キャラ名 {:?} をファイル名に変換できません",
+            "character_updater: cannot convert character name {:?} to a file name",
             name
         );
         return None;
     }
     if let Err(e) = tokio::fs::create_dir_all(chars_dir).await {
         error!(
-            "character_updater: characters ディレクトリの作成に失敗: {:?}: {}",
+            "character_updater: failed to create characters directory {:?}: {}",
             chars_dir, e
         );
         return None;
