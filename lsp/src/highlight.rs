@@ -1,11 +1,13 @@
 /// 会話ハイライト用のトークナイザ・ユーティリティ
 ///
 /// `lindera` を使って形態素解析を行い、会話テキストをハイライトします。
+use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::atomic::Ordering::Relaxed;
 
 use lindera::mode::Mode;
 use lindera::tokenizer::TokenizerBuilder;
+use parking_lot::RwLock;
 use strum_macros::EnumIter;
 
 use crate::types::{CachedLinderaToken, LineData, TokenStatus};
@@ -120,6 +122,9 @@ impl SemanticToken {
 pub struct Highlighter {
     tokenizer: lindera::tokenizer::Tokenizer,
     bracket_depth: std::sync::atomic::AtomicU32,
+    /// キャラクター一覧(名前+aliases、複合名分割済み)。人名ハイライトの絞り込みに使う。
+    /// character_cache 側の更新経路(初期化スキャン/保存/外部ファイル監視)から `set_allowed_names` 経由で差し替えられる。
+    allowed_names: RwLock<HashSet<String>>,
 }
 
 impl std::fmt::Debug for crate::highlight::Highlighter {
@@ -143,6 +148,7 @@ impl Highlighter {
         Self {
             tokenizer,
             bracket_depth: std::sync::atomic::AtomicU32::new(0),
+            allowed_names: RwLock::new(HashSet::new()),
         }
     }
 
@@ -155,6 +161,11 @@ impl Highlighter {
 
     pub fn initialize(&self) {
         self.bracket_depth.store(0, Relaxed);
+    }
+
+    /// 人名ハイライトの許可名集合(キャラ名+aliases)を差し替える。
+    pub fn set_allowed_names(&self, names: HashSet<String>) {
+        *self.allowed_names.write() = names;
     }
 
     pub fn text_to_lindera_token(&self, text: &str) -> Vec<CachedLinderaToken> {
@@ -198,8 +209,12 @@ impl Highlighter {
         trace!("{}", line.tokens.len());
 
         let mut result = Vec::new();
+        let allowed = self.allowed_names.read();
         line.tokens.iter_mut().for_each(|token| {
             let details = token.details.clone();
+            // 人名判定に使う表層文字列。byte_start/byte_endはトークン生成時点で確定しているため、
+            // classify呼び出し前に計算しておく。
+            let surface = &line.text[token.byte_start..token.byte_end];
 
             // 括弧開閉はモード dispatch の外で処理する（常に括弧外扱い）。
             // 括弧開: kind確定("comment") → depth加算（自身はまだ外側）
@@ -224,9 +239,9 @@ impl Highlighter {
                 }
                 _ if self.bracket_depth.load(Relaxed) > 0 => {
                     token.tag = TokenStatus::InBracket;
-                    Self::classify_bracket(&details)
+                    Self::classify_bracket(&details, surface, &allowed)
                 }
-                _ => Self::classify_normal(&details),
+                _ => Self::classify_normal(&details, surface, &allowed),
             };
 
             if let Some(k) = kind {
@@ -243,29 +258,48 @@ impl Highlighter {
         result
     }
 
-    /// 通常モードでの品詞→トークン種別マッピング
-    fn classify_normal(details: &[String]) -> Option<&'static str> {
-        let v = details[1..]
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+    /// 通常モードでの品詞→トークン種別マッピング。
+    ///
+    /// 人名(固有名詞・人名)は `allowed` (キャラ一覧の名前+aliases) に含まれる場合のみ
+    /// ハイライトする。組織名・地域名の判定は無効化(コメントアウト)しているが、
+    /// 将来再度有効化できるようロジックは残してある。
+    fn classify_normal(
+        details: &[String],
+        surface: &str,
+        allowed: &HashSet<String>,
+    ) -> Option<&'static str> {
+        if allowed.contains(surface) {
+            return Some("keyword");
+        }
+
+        // let v = details[1..]
+        //     .iter()
+        //     .map(|s| s.as_str())
+        //     .collect::<Vec<_>>()
+        //     .into_boxed_slice();
 
         match details[0].as_str() {
-            "名詞" => match v.as_ref() {
-                ["固有名詞", "人名", "一般"]
-                | ["固有名詞", "人名", "姓"]
-                | ["固有名詞", "人名", "名"] => Some("keyword"),
+            // "名詞" => match v.as_ref() {
+            //     ["固有名詞", "人名", "一般", ..]
+            //     | ["固有名詞", "人名", "姓", ..]
+            //     | ["固有名詞", "人名", "名", ..] => {
+            //         if allowed.contains(surface) {
+            //             Some("keyword")
+            //         } else {
+            //             None
+            //         }
+            //     }
 
-                ["固有名詞", "組織"] => Some("variable"),
+            //     ["固有名詞", "組織", ..] => Some("variable"),
 
-                ["固有名詞", "地域", "一般"] | ["固有名詞", "地域", "国"] => {
-                    Some("function")
-                }
-
-                ["接尾", "サ変接続"] => Some("variable"),
-                _ => None,
-            },
+            //     ["固有名詞", "地域", "一般", ..] | ["固有名詞", "地域", "国", ..] => {
+            //         Some("function")
+            //     }
+            //     ["接尾", "サ変接続", ..] => Some("variable"),
+            //     _ => {
+            //         None
+            //     }
+            // },
             // "動詞" => Some("variable"),
             // "形容詞" => Some("function"),
             "記号" => Some("comment"),
@@ -273,29 +307,38 @@ impl Highlighter {
         }
     }
 
-    /// 括弧内モードでの品詞→トークン種別マッピング
-    fn classify_bracket(details: &[String]) -> Option<&'static str> {
-        let v = details[1..]
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+    /// 括弧内モードでの品詞→トークン種別マッピング。
+    ///
+    /// 人名の絞り込みは `classify_normal` と同様。組織名・地域名の判定は無効化(コメントアウト)。
+    fn classify_bracket(
+        details: &[String],
+        surface: &str,
+        allowed: &HashSet<String>,
+    ) -> Option<&'static str> {
+        if allowed.contains(surface) {
+            return Some("keyword");
+        }
+
+        // let v = details[1..]
+        //     .iter()
+        //     .map(|s| s.as_str())
+        //     .collect::<Vec<_>>()
+        //     .into_boxed_slice();
 
         match details[0].as_str() {
-            "名詞" => match v.as_ref() {
-                ["固有名詞", "人名", "一般"]
-                | ["固有名詞", "人名", "姓"]
-                | ["固有名詞", "人名", "名"] => Some("keyword"),
+            // "名詞" => match v.as_ref() {
+            //     ["固有名詞", "人名", "一般"]
+            //     | ["固有名詞", "人名", "姓"]
+            //     | ["固有名詞", "人名", "名"] => Some("keyword"),
 
-                ["固有名詞", "組織"] => Some("variable"),
+            //     ["固有名詞", "組織"] => Some("variable"),
 
-                ["固有名詞", "地域", "一般"] | ["固有名詞", "地域", "国"] => {
-                    Some("function")
-                }
-                ["サ変接続"] | ["接尾", "サ変接続"] => Some("string"),
-                _ => Some("decorator"),
-            },
-
+            //     ["固有名詞", "地域", "一般"] | ["固有名詞", "地域", "国"] => {
+            //         Some("function")
+            //     }
+            //     ["サ変接続"] | ["接尾", "サ変接続"] => Some("string"),
+            //     _ => Some("decorator"),
+            // },
             // "動詞" => Some("variable"),
             // "形容詞" => Some("function"),
             "記号" => Some("comment"),
@@ -384,11 +427,11 @@ mod tests {
         ); // は
         assert_eq!(
             tokens[2].token_type,
-            SemanticTokenType::Decorator as u32,
-            "{} <> comment @{}",
+            SemanticTokenType::String as u32,
+            "{} <> string @{}",
             tokens[2].token_type,
             tokens[2].start
-        ); // テスト
+        ); // テスト (名詞,サ変接続 -> string)
     }
 
     #[test]
@@ -412,6 +455,55 @@ mod tests {
         let tokens = hilighter
             .tokenize(&mut LineData::from_str("吾輩は猫である。名前はまだない。").unwrap());
         assert!(!tokens.is_empty());
+    }
+
+    #[test]
+    fn test_registered_person_name_is_keyword() {
+        // "田中" は Lindera IPADIC で 固有名詞,人名,姓 の単一トークンになる(実測確認済み)。
+        let h = Highlighter::new();
+        h.set_allowed_names(HashSet::from(["田中".to_string()]));
+        let tokens = h.tokenize(&mut LineData::from_str("田中").unwrap());
+        assert_eq!(tokens.len(), 1, "{:?}", tokens);
+        assert_eq!(tokens[0].token_type, SemanticTokenType::Keyword as u32);
+    }
+
+    #[test]
+    fn test_unregistered_person_name_not_highlighted_normal() {
+        // 許可名集合が空の場合、通常モードでは固有名詞人名でも一切トークンを生成しない。
+        let h = Highlighter::new();
+        let tokens = h.tokenize(&mut LineData::from_str("田中").unwrap());
+        assert!(tokens.is_empty(), "{:?}", tokens);
+    }
+
+    #[test]
+    fn test_unregistered_person_name_in_bracket_is_decorator() {
+        // 括弧内モードでは、許可名集合に無い人名は一般名詞と同じ decorator にフォールバックする。
+        let h = Highlighter::in_bracket();
+        let tokens = h.tokenize(&mut LineData::from_str("田中").unwrap());
+        assert_eq!(tokens.len(), 1, "{:?}", tokens);
+        assert_eq!(tokens[0].token_type, SemanticTokenType::Decorator as u32);
+    }
+
+    #[test]
+    fn test_organization_and_region_not_highlighted() {
+        // 組織名("自民党": 固有名詞,組織)・地域名("東京": 固有名詞,地域,一般、"日本": 固有名詞,地域,国)は
+        // 判定ロジックをコメントアウトしているため、許可名集合に入れても Variable/Function にはならない
+        // (通常モードでは None -> トークン自体が生成されない)。
+        let h = Highlighter::new();
+        h.set_allowed_names(HashSet::from([
+            "自民党".to_string(),
+            "東京".to_string(),
+            "日本".to_string(),
+        ]));
+        for word in ["自民党", "東京", "日本"] {
+            let tokens = h.tokenize(&mut LineData::from_str(word).unwrap());
+            assert!(
+                tokens.is_empty(),
+                "{} が組織/地域としてハイライトされてしまっている: {:?}",
+                word,
+                tokens
+            );
+        }
     }
 
     #[test]
@@ -503,8 +595,8 @@ mod tests {
         );
         assert_eq!(
             tokens[1].token_type,
-            SemanticTokenType::Decorator as u32,
-            "テスト(名詞) inside bracket should be keyword"
+            SemanticTokenType::String as u32,
+            "テスト(名詞,サ変接続) inside bracket should be string"
         );
         assert_eq!(
             l.tokens[1].tag,

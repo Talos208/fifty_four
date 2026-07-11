@@ -301,6 +301,8 @@ pub enum CharacterAttribute {
     Role,
     Style,
     Weakness,
+    /// 呼称・別名（人名ハイライトの絞り込みに使う aliases の抽出元）
+    Alias,
 }
 
 impl TryFrom<&str> for CharacterAttribute {
@@ -326,6 +328,8 @@ impl TryFrom<&str> for CharacterAttribute {
             "weakness" | "弱点" | "急所" | "脆さ" | "欠点" | "短所" | "難点" | "問題点" => {
                 Ok(Self::Weakness)
             }
+            "alias" | "呼称" | "別名" | "通称" | "あだ名" | "渾名" | "二つ名" | "愛称"
+            | "呼び名" | "異名" => Ok(Self::Alias),
             _ => Err(format!("No such attribute {}", s)),
         }
     }
@@ -343,6 +347,7 @@ impl CharacterAttribute {
             Self::Role => "役割",
             Self::Style => "描写",
             Self::Weakness => "弱点",
+            Self::Alias => "呼称",
         }
     }
 }
@@ -360,6 +365,8 @@ pub(crate) struct TaggedContent {
 #[derive(Debug, Clone)]
 pub(crate) struct CharacterEntry {
     pub(crate) sections: Vec<TaggedContent>,
+    /// `Alias` タグ付きセクションから抽出済みの別名リスト（人名ハイライトの絞り込みに使う）
+    pub(crate) aliases: Vec<String>,
 }
 
 /// 1ファイル分のキャッシュ
@@ -506,13 +513,17 @@ pub fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry> {
                 (current_char.as_ref(), current_section.take())
             {
                 if !section.text.trim().is_empty() {
-                    characters
+                    let is_alias = section.tags.contains(&CharacterAttribute::Alias);
+                    let entry = characters
                         .entry(char_name.to_string())
                         .or_insert_with(|| CharacterEntry {
                             sections: Vec::new(),
-                        })
-                        .sections
-                        .push(section);
+                            aliases: Vec::new(),
+                        });
+                    if is_alias {
+                        entry.aliases.extend(split_aliases(&section.text));
+                    }
+                    entry.sections.push(section);
                 }
             }
         };
@@ -564,6 +575,63 @@ pub fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry> {
 
     flush_section!();
     characters
+}
+
+/// `Alias` タグ付きセクションのテキストを個々の別名に分割する。
+/// 箇条書きの各行をさらに区切り文字（「・」「、」「,」「/」半角スペース）で分割し、
+/// trim・空文字列除外して返す。
+fn split_aliases(text: &str) -> Vec<String> {
+    text.lines()
+        .flat_map(|line| line.split(['・', '、', ',', '/', ' ']))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// キャラクターの見出しキーから役職等の括弧書きを除いた表示名を返す。
+/// 例: "ジェフ・クライン（艦長）" -> "ジェフ・クライン"
+fn character_display_name(heading_key: &str) -> &str {
+    let end = heading_key
+        .find(['（', '('])
+        .unwrap_or(heading_key.len());
+    heading_key[..end].trim()
+}
+
+/// `character_cache` 全体から、人名ハイライトの絞り込みに使う許可名集合を構築する。
+/// 各キャラの表示名・aliasesに加え、「・」区切りの複合名は各部分も対象に含める
+/// （例: "ジェフ・クライン" -> "ジェフ・クライン","ジェフ","クライン"）。
+/// 1文字の断片は助詞等との誤マッチが起きやすいため除外する。
+pub(crate) fn collect_allowed_names(cache: &CharacterCache) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+
+    let mut add_name = |n: &str| {
+        let n = n.trim();
+        if n.chars().count() >= 2 {
+            names.insert(n.to_string());
+        }
+    };
+
+    let guard = cache.0.lock();
+    for file_entry in guard.values() {
+        for heading_key in file_entry.characters.keys() {
+            let display_name = character_display_name(heading_key);
+            add_name(display_name);
+            for part in display_name.split('・') {
+                add_name(part);
+            }
+        }
+        for entry in file_entry.characters.values() {
+            for alias in &entry.aliases {
+                add_name(alias);
+                for part in alias.split('・') {
+                    add_name(part);
+                }
+            }
+        }
+    }
+
+    names
 }
 
 /// 見出しノードの直接子から `Text` ノードを結合してキャラクター名や属性名を返す。
@@ -773,8 +841,15 @@ impl LanguageServer for Backend {
 
         let capabilities = ServerCapabilities {
             position_encoding: Some(PositionEncodingKind::UTF8),
-            text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                TextDocumentSyncKind::INCREMENTAL,
+            // save 通知(did_save)を有効化するため Kind ではなく Options 形式にする。
+            // キャラクター設定ファイル保存時に character_cache を再構築するために使う。
+            text_document_sync: Some(TextDocumentSyncCapability::Options(
+                TextDocumentSyncOptions {
+                    open_close: Some(true),
+                    change: Some(TextDocumentSyncKind::INCREMENTAL),
+                    save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                    ..Default::default()
+                },
             )),
             selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
             semantic_tokens_provider: Some(
@@ -863,6 +938,50 @@ impl LanguageServer for Backend {
         }];
         let res = self.client.configuration(req).await.unwrap();
         debug!("{:?}", res);
+
+        // (a) ワークスペース初期化時にキャラクターファイルを能動スキャンし character_cache を populate する。
+        // LLM補完のtool calling実行を待たずに、人名ハイライトの絞り込みをすぐ使えるようにするため。
+        let workspace_paths: Vec<PathBuf> = self
+            .workspace
+            .lock()
+            .await
+            .iter()
+            .filter_map(|w| w.uri.to_file_path().ok())
+            .collect();
+        for ws in &workspace_paths {
+            for path in Self::list_character_files(ws) {
+                self.reparse_character_file(&path).await;
+            }
+        }
+
+        // (c) 外部エディタ/gitなどによるキャラクターファイルの変更も検知できるよう、
+        // workspace/didChangeWatchedFiles を動的登録する。クライアントが対応していない場合は
+        // register_capability がエラーを返すが、致命的ではないのでログのみで継続する。
+        let registration = Registration {
+            id: "fifty-four-watch-characters".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                watchers: vec![
+                    FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/characters.md".to_string()),
+                        kind: None,
+                    },
+                    FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/characters/*.md".to_string()),
+                        kind: None,
+                    },
+                ],
+            })
+            .ok(),
+        };
+        if let Err(e) = self.client.register_capability(vec![registration]).await {
+            warn!(
+                "workspace/didChangeWatchedFiles の動的登録に失敗（クライアント未対応の可能性）: {:?}",
+                e
+            );
+        }
+
+        self.refresh_highlight_names().await;
     }
 
     /// サーバのシャットダウン要求を処理します。
@@ -887,6 +1006,45 @@ impl LanguageServer for Backend {
         self.update_all(params.text_document.uri.as_str(), 0, texts);
 
         let _ = self.client.semantic_tokens_refresh().await;
+    }
+
+    /// (b) キャラクター設定ファイル保存時に character_cache を再構築する。
+    /// 保存直後の内容をディスクから読み直し、人名ハイライトの許可名集合へ即座に反映する。
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let uri = params.text_document.uri.as_str();
+        if !self.is_character_file(uri) {
+            return;
+        }
+        debug!("did_save[{}]: character file, reparsing", uri);
+        let Ok(path) = params.text_document.uri.to_file_path() else {
+            warn!("did_save[{}]: failed to convert uri to file path", uri);
+            return;
+        };
+        self.reparse_character_file(&path).await;
+        self.refresh_highlight_names().await;
+    }
+
+    /// (c) workspace/didChangeWatchedFiles: エディタ外(他プログラム・git等)での
+    /// キャラクター設定ファイル変更を検知し character_cache を再構築する。
+    /// `initialized` で動的登録した watcher からの通知を受ける。
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        for change in params.changes {
+            let Ok(path) = change.uri.to_file_path() else {
+                warn!("did_change_watched_files: failed to convert uri to file path: {:?}", change.uri);
+                continue;
+            };
+            match change.typ {
+                FileChangeType::DELETED => {
+                    debug!("did_change_watched_files: removing {:?} from cache", path);
+                    self.character_cache.0.lock().remove(&path);
+                }
+                _ => {
+                    debug!("did_change_watched_files: reparsing {:?}", path);
+                    self.reparse_character_file(&path).await;
+                }
+            }
+        }
+        self.refresh_highlight_names().await;
     }
 
     // #[instrument]
@@ -1555,6 +1713,68 @@ impl Backend {
     /// characters/*.md または characters.md は更新タスクの対象外とする(自己ループ防止)。
     fn is_character_file(&self, uri: &str) -> bool {
         uri.contains("/characters/") || uri.ends_with("/characters.md")
+    }
+
+    /// workspace 配下の全キャラクターファイルパスを列挙する。
+    /// `characters.md`（単一ファイル）と `characters/*.md`（ディレクトリ）の両方に対応する
+    /// （`find_character_file_path` のファイル探索ロジックを「全件列挙」向けに一般化したもの）。
+    fn list_character_files(workspace: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+
+        let single = workspace.join("characters").with_extension("md");
+        if single.is_file() {
+            files.push(single);
+        }
+
+        let dir = workspace.join("characters");
+        if dir.is_dir()
+            && let Ok(entries) = dir.read_dir()
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    files.push(path);
+                }
+            }
+        }
+
+        files
+    }
+
+    /// 1ファイルを読み込み parse して character_cache に反映する。
+    /// 読み込みに失敗した場合はログのみで static に無視する(呼び出し元は複数ファイルを回すため)。
+    async fn reparse_character_file(&self, path: &Path) {
+        let modified = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+        let content = match tokio::fs::read_to_string(path).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("reparse_character_file: failed to read {:?}: {}", path, e);
+                return;
+            }
+        };
+
+        let characters = parse_all_content(&content);
+        self.character_cache.0.lock().insert(
+            path.to_path_buf(),
+            FileCacheEntry {
+                modified,
+                characters,
+            },
+        );
+    }
+
+    /// character_cache 全体から人名ハイライトの許可名集合を再構築し Highlighter に反映、
+    /// クライアントへ semanticTokens の再取得を要求する。
+    async fn refresh_highlight_names(&self) {
+        let names = collect_allowed_names(&self.character_cache);
+        debug!("refresh_highlight_names: {} 件の許可名", names.len());
+        self.highlighter.set_allowed_names(names);
+        if let Err(e) = self.client.semantic_tokens_refresh().await {
+            warn!("semantic_tokens_refresh failed: {:?}", e);
+        }
     }
 
     /// did_change イベントの情報を更新状態に記録し、発火判定を行う。
@@ -2264,5 +2484,107 @@ mod tests {
         let entry = make_entry(CHARACTERS_MD);
         let result = CharacterInfoTool::search_cache(&entry, "ユルゲン", &["性格".to_string()]);
         assert!(result.is_err(), "存在しないキャラクターでエラーにならない");
+    }
+
+    #[test]
+    fn test_alias_attribute_try_from() {
+        assert_eq!(
+            CharacterAttribute::try_from("呼称"),
+            Ok(CharacterAttribute::Alias)
+        );
+        assert_eq!(
+            CharacterAttribute::try_from("別名"),
+            Ok(CharacterAttribute::Alias)
+        );
+        assert_eq!(
+            CharacterAttribute::try_from("通称"),
+            Ok(CharacterAttribute::Alias)
+        );
+    }
+
+    #[test]
+    fn test_parse_aliases_from_heading() {
+        const MD: &str = indoc!(
+            "## ジェフ・クライン（艦長）
+            ### 呼称
+            - ジェフ
+            - クライン艦長・隊長
+            ### 背景・立場
+            - ムサイ艦の艦長。
+            "
+        );
+        let chars = parse_all_content(MD);
+        let entry = chars
+            .get("ジェフ・クライン（艦長）")
+            .expect("キャラが見つからない");
+        assert!(
+            entry.aliases.contains(&"ジェフ".to_string()),
+            "{:?}",
+            entry.aliases
+        );
+        assert!(
+            entry.aliases.contains(&"クライン艦長".to_string()),
+            "{:?}",
+            entry.aliases
+        );
+        assert!(
+            entry.aliases.contains(&"隊長".to_string()),
+            "{:?}",
+            entry.aliases
+        );
+        // sections には元テキストもそのまま残っていること(後方互換・検索用)
+        assert!(
+            entry
+                .sections
+                .iter()
+                .any(|s| s.tags.contains(&CharacterAttribute::Alias))
+        );
+    }
+
+    #[test]
+    fn test_character_display_name() {
+        assert_eq!(
+            character_display_name("ジェフ・クライン（艦長）"),
+            "ジェフ・クライン"
+        );
+        assert_eq!(character_display_name("シルビア（航海士）"), "シルビア");
+        assert_eq!(character_display_name("役職なしキャラ"), "役職なしキャラ");
+    }
+
+    #[test]
+    fn test_collect_allowed_names() {
+        let cache = CharacterCache::new();
+        cache
+            .0
+            .lock()
+            .insert(PathBuf::from("characters.md"), make_entry(CHARACTERS_MD));
+        let names = collect_allowed_names(&cache);
+
+        // フルネーム・「・」分割された部分名が含まれること
+        assert!(names.contains("ジェフ・クライン"), "{:?}", names);
+        assert!(names.contains("ジェフ"), "{:?}", names);
+        assert!(names.contains("クライン"), "{:?}", names);
+        assert!(names.contains("シルビア"), "{:?}", names);
+
+        // alias未登録の役職名は含まれないこと
+        assert!(!names.contains("艦長"), "{:?}", names);
+        assert!(!names.contains("航海士"), "{:?}", names);
+    }
+
+    #[test]
+    fn test_collect_allowed_names_includes_aliases() {
+        const MD: &str = indoc!(
+            "## ジェフ・クライン（艦長）
+            ### 呼称
+            - 隊長
+            "
+        );
+        let cache = CharacterCache::new();
+        cache
+            .0
+            .lock()
+            .insert(PathBuf::from("characters.md"), make_entry(MD));
+        let names = collect_allowed_names(&cache);
+        assert!(names.contains("隊長"), "{:?}", names);
     }
 }
