@@ -72,6 +72,28 @@ Zed 拡張またはクライアント設定から渡される JSON:
 }
 ```
 
+`provider` は `google` / `openai` / `anthropic` / `xai` / `lmstudio` / `cloudflare` のいずれか。任意で `url`（エンドポイント上書き）・`capabilities`（`["structured_output","tool_calling"]`、未指定時はプロバイダ＋モデルから自動導出）を指定できる。
+
+Cloudflare Workers AI を使う場合は `account_id`（Cloudflare アカウントID）が必須。エンドポイントは `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/` として自動組み立てされ、認証は環境変数 `CLOUDFLARE_API_TOKEN` から取得する:
+
+```json
+{
+  "llm": {
+    "ondemand": {
+      "provider": "cloudflare",
+      "account_id": "＜Cloudflare アカウントID＞",
+      "model": "@cf/meta/llama-3.1-8b-instruct"
+    },
+    "deferred": {
+      "provider": "cloudflare",
+      "account_id": "＜同上＞",
+      "model": "@cf/meta/llama-3.1-8b-instruct",
+      "capabilities": ["tool_calling"]
+    }
+  }
+}
+```
+
 ## 内部処理（LSP ハンドラ外）
 
 | 関数 | 呼び出し元 | 役割 |

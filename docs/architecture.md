@@ -23,7 +23,7 @@ flowchart TB
 
     subgraph External["外部"]
         Lindera["Lindera (IPADIC)"]
-        Providers["LLM プロバイダ\n(Google / OpenAI / Anthropic / xAI / LMStudio)"]
+        Providers["LLM プロバイダ\n(Google / OpenAI / Anthropic / xAI / LMStudio / Cloudflare Workers AI)"]
         WS["ワークスペース\n(.txt / .md / plot.md ファイル)"]
     end
 
@@ -112,7 +112,11 @@ classDiagram
 | `llm` | `llm.ondemand` | 文章補完（ユーザー操作に同期） |
 | `background_llm` | `llm.deferred`（未指定時は `ondemand` と同じ） | キャラ設定更新（バックグラウンド） |
 
-どちらも `LlmClientBuilder` → `GenericLlmClient` 経由で `genai` クレートを利用する。プロバイダは Google / OpenAI / Anthropic / xAI / LMStudio に対応。
+どちらも `LlmClientBuilder` → `GenericLlmClient` 経由で `genai` クレートを利用する。プロバイダは Google / OpenAI / Anthropic / xAI / LMStudio / Cloudflare Workers AI に対応。
+
+Cloudflare Workers AI は OpenAI 互換エンドポイント（`AdapterKind::OpenAI`）を利用し、認証には環境変数 `CLOUDFLARE_API_TOKEN` を使う。エンドポイントURLはアカウントIDから `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/` の形で組み立てるため、設定に `account_id` を指定する必要がある（設定例は [lsp-handlers.md](lsp-handlers.md) 参照）。
+
+各プロバイダの `capabilities`（`structured_output` / `tool_calling`）は、明示設定がなければプロバイダと実効モデル名から自動導出される（`Provider::default_capabilities`）。LMStudio はローカルLLM前提でモデル構成が多様なため常に未対応（空）として扱い、必要なら設定側で明示する。
 
 ## エージェント（AGENTS.md との対応）
 

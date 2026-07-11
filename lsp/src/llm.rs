@@ -33,6 +33,7 @@ pub enum Provider {
     Anthropic(String),
     XAi(String),
     LMStudio(String, Option<String>),
+    Cloudflare(String),
 
     Undefined,
 }
@@ -48,6 +49,9 @@ impl Provider {
             "lmstudio" => Ok(Provider::LMStudio(
                 "qwen3.5-2b".to_string(),
                 Some("http://localhost:1234/v1/".to_string()),
+            )),
+            "cloudflare" => Ok(Provider::Cloudflare(
+                "@cf/meta/llama-3.1-8b-instruct".to_string(),
             )),
             _ => Err(format!("Unsupported provider: {}", s)),
         }
@@ -88,17 +92,44 @@ impl Provider {
             "anthropic" => Ok(Provider::Anthropic(model.to_string())),
             "xai" => Ok(Provider::XAi(model.to_string())),
             "lmstudio" => Ok(Provider::LMStudio(model.to_string(), Some(url.to_string()))),
+            "cloudflare" => Ok(Provider::Cloudflare(model.to_string())),
             _ => Err(format!("Unsupported provider: {}", name)),
         }
     }
 
-    pub fn default_capabilities(&self) -> ModelCapability {
+    /// プロバイダと実際に使用するモデル名から capability を導出する。
+    ///
+    /// LMStudio はローカルLLM前提でモデルが多様なため常に空(未対応)とし、
+    /// 呼び出し側で明示的に `capabilities` を設定する運用とする。
+    /// それ以外のプロバイダは自社モデルのラインナップが既知のため、
+    /// プロバイダ単位で決め打ちできるものはそうしつつ、Cloudflare Workers AI
+    /// のようにモデルごとに tool calling 対応が分かれるプロバイダは
+    /// モデル名も加味して判定する。
+    pub fn default_capabilities(&self, model: &str) -> ModelCapability {
         match self {
-            Provider::Google(_) | Provider::OpenAI(_) => {
+            // Anthropic の構造化出力(output_config.format)は genai 0.6.5 の
+            // Anthropic adapter が ChatResponseFormat::JsonSpec を通じて対応済み。
+            Provider::Google(_) | Provider::OpenAI(_) | Provider::Anthropic(_) => {
                 ModelCapability::STRUCTURED_OUTPUT | ModelCapability::TOOL_CALLING
             }
-            Provider::Anthropic(_) | Provider::XAi(_) => ModelCapability::TOOL_CALLING,
+            Provider::XAi(_) => ModelCapability::TOOL_CALLING,
+            Provider::Cloudflare(_) => Self::cloudflare_capabilities(model),
             Provider::LMStudio(..) | Provider::Undefined => ModelCapability::empty(),
+        }
+    }
+
+    /// Cloudflare Workers AI のモデル一覧は function calling 対応がモデル依存のため、
+    /// モデル名に含まれるファミリー名から簡易判定する。
+    /// 対応が確実でないモデルは安全側(空)に倒す。
+    fn cloudflare_capabilities(model: &str) -> ModelCapability {
+        let m = model.to_lowercase();
+        let supports_tool_calling = ["instruct", "hermes", "qwen", "mistral"]
+            .iter()
+            .any(|kw| m.contains(kw));
+        if supports_tool_calling {
+            ModelCapability::TOOL_CALLING
+        } else {
+            ModelCapability::empty()
         }
     }
 
@@ -112,7 +143,7 @@ impl Provider {
             Provider::Anthropic(_) => &[Low, Medium, High, XHigh, Max],
             Provider::Google(_)    => &[Low, Medium, High],
             Provider::XAi(_)       => &[Low, High],
-            Provider::LMStudio(..) | Provider::Undefined => &[],
+            Provider::Cloudflare(_) | Provider::LMStudio(..) | Provider::Undefined => &[],
         };
         let n = norm.clamp(0.0, 1.0);
         if n <= 0.0 || ladder.is_empty() {
@@ -132,6 +163,7 @@ impl Provider {
             Provider::Anthropic(s) => write!(f, "Anthropic({})", s),
             Provider::XAi(s) => write!(f, "XAi({})", s),
             Provider::LMStudio(s, _) => write!(f, "LMStudio({})", s),
+            Provider::Cloudflare(s) => write!(f, "Cloudflare({})", s),
             Provider::Undefined => write!(f, "Undefined"),
         }
     }
@@ -143,6 +175,7 @@ impl Provider {
             Provider::Anthropic(s) => Provider::Anthropic(s.clone()),
             Provider::XAi(s) => Provider::XAi(s.clone()),
             Provider::LMStudio(s, _) => Provider::LMStudio(s.clone(), None),
+            Provider::Cloudflare(s) => Provider::Cloudflare(s.clone()),
             _ => Provider::Undefined,
         }
     }
@@ -271,6 +304,8 @@ pub struct LlmClientBuilder {
     sys_prompt: String,
     /// 明示的に指定された capability。None の場合は provider のデフォルトを使う。
     capabilities: Option<ModelCapability>,
+    /// Cloudflare Workers AI 用のアカウントID。エンドポイントURLの組み立てに使う。
+    account_id: Option<String>,
 }
 
 impl LlmClientBuilder {
@@ -284,6 +319,7 @@ impl LlmClientBuilder {
             tools: vec![],
             sys_prompt: String::new(),
             capabilities: None,
+            account_id: None,
         }
     }
 
@@ -296,6 +332,7 @@ impl LlmClientBuilder {
             tools: vec![],
             sys_prompt: String::new(),
             capabilities: None,
+            account_id: None,
         }
     }
 
@@ -321,6 +358,10 @@ impl LlmClientBuilder {
             tools: vec![],
             sys_prompt: String::new(),
             capabilities,
+            account_id: value
+                .get("account_id")
+                .and_then(|v| v.as_str())
+                .map(String::from),
         }
     }
 
@@ -383,6 +424,23 @@ impl LlmClientBuilder {
                     mdl,
                 )
             }
+            Provider::Cloudflare(mdl) => {
+                let account = self.account_id.as_deref().unwrap_or_else(|| {
+                    warn!(
+                        "Cloudflare provider requires account_id; endpoint will be invalid without it"
+                    );
+                    ""
+                });
+                u_from_prov = Some(format!(
+                    "https://api.cloudflare.com/client/v4/accounts/{}/ai/v1/",
+                    account
+                ));
+                (
+                    AuthData::FromEnv("CLOUDFLARE_API_TOKEN".to_string()),
+                    AdapterKind::OpenAI,
+                    mdl,
+                )
+            }
             _ => panic!("Unsupported provider"),
         };
 
@@ -424,7 +482,7 @@ impl LlmClientBuilder {
 
         let capabilities = self
             .capabilities
-            .unwrap_or_else(|| self.provider.default_capabilities());
+            .unwrap_or_else(|| self.provider.default_capabilities(mdl_name));
 
         Box::new(LlmClient {
             provider: self.provider.clone(),
@@ -790,5 +848,66 @@ mod tests_reasoning {
         for v in [0.0, 0.5, 1.0, 2.0] {
             assert!(matches!(lmstudio().map_reasoning(v), ReasoningEffort::None));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_capabilities {
+    use super::*;
+
+    #[test]
+    fn test_openai_google_anthropic_always_full() {
+        // OpenAI/Google/Anthropic はモデル名に依らず structured_output + tool_calling
+        // (Anthropic は genai の adapter が output_config.format 経由で対応済み)
+        let openai = Provider::OpenAI("gpt-5.3".to_string());
+        let google = Provider::Google("gemini-3.1-pro-preview".to_string());
+        let anthropic = Provider::Anthropic("claude-4.6-sonnet".to_string());
+        let expected = ModelCapability::STRUCTURED_OUTPUT | ModelCapability::TOOL_CALLING;
+        assert_eq!(openai.default_capabilities("gpt-5.3"), expected);
+        assert_eq!(google.default_capabilities("gemini-3.1-pro-preview"), expected);
+        assert_eq!(anthropic.default_capabilities("claude-4.6-sonnet"), expected);
+    }
+
+    #[test]
+    fn test_xai_tool_calling_only() {
+        let xai = Provider::XAi("grok-4.1".to_string());
+        assert_eq!(xai.default_capabilities("grok-4.1"), ModelCapability::TOOL_CALLING);
+    }
+
+    #[test]
+    fn test_lmstudio_always_empty_regardless_of_model() {
+        let lmstudio = Provider::LMStudio("model".to_string(), None);
+        assert_eq!(
+            lmstudio.default_capabilities("qwen3.5-2b-instruct"),
+            ModelCapability::empty()
+        );
+    }
+
+    #[test]
+    fn test_cloudflare_tool_calling_model_detected() {
+        let cf = Provider::Cloudflare("@cf/meta/llama-3.1-8b-instruct".to_string());
+        assert_eq!(
+            cf.default_capabilities("@cf/meta/llama-3.1-8b-instruct"),
+            ModelCapability::TOOL_CALLING
+        );
+    }
+
+    #[test]
+    fn test_cloudflare_unknown_model_defaults_empty() {
+        let cf = Provider::Cloudflare("@cf/some/unknown-model".to_string());
+        assert_eq!(
+            cf.default_capabilities("@cf/some/unknown-model"),
+            ModelCapability::empty()
+        );
+    }
+
+    #[test]
+    fn test_cloudflare_uses_effective_model_not_provider_default() {
+        // Provider が保持する既定モデルではなく、渡された実効モデル名で判定されること
+        let cf = Provider::Cloudflare("@cf/meta/llama-3.1-8b-instruct".to_string());
+        assert_eq!(
+            cf.default_capabilities("@cf/qwen/qwen1.5-14b-chat"),
+            ModelCapability::TOOL_CALLING // "qwen" キーワードにマッチ
+        );
     }
 }
