@@ -48,7 +48,7 @@ flowchart LR
 | Capability | 設定 |
 |---|---|
 | `textDocumentSync` | `INCREMENTAL` |
-| `positionEncoding` | `UTF8` |
+| `positionEncoding` | `UTF16`（LSP必須ベースライン。Position.character はUTF-16コード単位） |
 | `semanticTokensProvider` | full のみ（range 無効）、FiftyFour / file スキーム |
 | `completionProvider` | トリガ: `、` `「` `『` / コミット: `。` `」` `』` |
 | `selectionRangeProvider` | 有効 |

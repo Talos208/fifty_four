@@ -16,12 +16,12 @@ use log::{debug, trace};
 
 /// ハイライト用トークンを表す型。
 ///
-/// `start`/`length` はバイト単位のオフセットを想定しています（LSP の semantic tokens 生成時に変換して使います）。
+/// `start`/`length` は UTF-16 コード単位（LSP の positionEncoding=utf-16 に合わせた単位）。
 #[derive(Debug, Clone)]
 pub struct SemanticToken {
-    /// 先頭バイトオフセット
+    /// 行頭からの UTF-16 コード単位オフセット
     pub start: u32,
-    /// バイト長
+    /// UTF-16 コード単位での長さ
     pub length: u32,
     /// トークンの種類（例: "keyword", "string", "function" など）
     pub token_type: u32,
@@ -245,11 +245,9 @@ impl Highlighter {
             };
 
             if let Some(k) = kind {
-                let left = line.text[0..token.byte_start].to_string();
-                let right = line.text[token.byte_start..token.byte_end].to_string();
-
-                let start = left.chars().count();
-                let length = right.chars().count();
+                // positionEncoding=utf-16 に合わせ、UTF-16 コード単位で位置と長さを算出する
+                let start = crate::types::utf16_len(&line.text[..token.byte_start]);
+                let length = crate::types::utf16_len(&line.text[token.byte_start..token.byte_end]);
 
                 result.push(SemanticToken::from_kind(start as u32, length as u32, k));
             }

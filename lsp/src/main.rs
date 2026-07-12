@@ -904,7 +904,10 @@ impl LanguageServer for Backend {
         }
 
         let capabilities = ServerCapabilities {
-            position_encoding: Some(PositionEncodingKind::UTF8),
+            // UTF-16 は LSP の必須ベースラインで全クライアントがサポートするため、
+            // クライアントの general.positionEncodings を確認せず常に宣言してよい。
+            // (実クライアントの Zed も utf-16 のみをオファーする)
+            position_encoding: Some(PositionEncodingKind::UTF16),
             // キャラ名にカーソルを合わせた際、そのキャラの設定をMarkdownで表示する。
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             // save 通知(did_save)を有効化するため Kind ではなく Options 形式にする。
@@ -1212,7 +1215,7 @@ impl LanguageServer for Backend {
         let pos = params.text_document_position_params;
         let uri = pos.text_document.uri.as_str();
         let line_no = pos.position.line as usize;
-        let char_offset = pos.position.character as usize;
+        let utf16_offset = pos.position.character as usize;
 
         self.highlighter.initialize();
 
@@ -1228,7 +1231,7 @@ impl LanguageServer for Backend {
         let hit = cursor_context::token_at(
             tmp.as_mut_slice(),
             line_no,
-            char_offset,
+            utf16_offset,
             &mut |line| {
                 line.tokens = highlighter.text_to_lindera_token(line.text.as_str());
             },
@@ -1582,20 +1585,20 @@ fn apply_changes<T: AsRef<str>>(lines: &mut Vec<LineData>, text: T, range: Range
     let end_line = range.end.line as usize;
     let end_char = range.end.character as usize;
 
+    // range.character は UTF-16 コード単位(positionEncoding=utf-16)。
+    // utf16_to_byte_offset が行末クランプを内包する。
     let prefix = lines
         .get(start_line)
         .map(|l| {
-            let ix = start_char.min(l.text.len());
-            let n = l.text.chars().take(ix);
-            String::from_iter(n)
+            let ix = crate::types::utf16_to_byte_offset(&l.text, start_char);
+            l.text[..ix].to_string()
         })
         .unwrap_or("".to_string());
     let suffix = lines
         .get(end_line)
         .map(|l| {
-            let ix = end_char.min(l.text.len());
-            let n = l.text.chars().skip(ix);
-            String::from_iter(n)
+            let ix = crate::types::utf16_to_byte_offset(&l.text, end_char);
+            l.text[ix..].to_string()
         })
         .unwrap_or("".to_string());
 
@@ -2310,6 +2313,17 @@ mod tests {
                 娑羅双樹の花の色、盛者必衰の理をあらはす。"
             ))
         );
+    }
+
+    #[test]
+    fn test_apply_changes_utf16_supplementary() {
+        // "𠮷田" (𠮷=サロゲートペア,UTF-16で2単位/田=1単位)。
+        // character=2 は 𠮷 の直後(UTF-16基準)を指す。
+        // 旧char単位実装では chars().take(2) = "𠮷田" 全体が prefix になり
+        // "!" が末尾(田の後ろ)に入ってしまっていた誤りを検証する。
+        let mut ls = lines("𠮷田");
+        apply_changes(&mut ls, "!", range(0, 2, 0, 2));
+        assert_eq!(ls, lines("𠮷!田"));
     }
 
     // 2. 複数行の削除（text が空）

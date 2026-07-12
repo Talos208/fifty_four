@@ -54,6 +54,32 @@ impl LineData {
     }
 }
 
+/// UTF-16 コード単位オフセットをバイトオフセットに変換する。
+///
+/// LSP の `Position.character` (positionEncoding=utf-16) を Rust 文字列の
+/// バイトオフセットへ変換するために使う。
+/// オフセットが行末を超える場合は `text.len()` にクランプする。
+/// サロゲートペアの中間を指す場合はその文字の直後に丸める
+/// (LSP仕様上、正当な Position はペア中間を指さない)。
+pub fn utf16_to_byte_offset(text: &str, utf16_offset: usize) -> usize {
+    let mut u16_count = 0;
+    for (byte_ix, c) in text.char_indices() {
+        if u16_count >= utf16_offset {
+            return byte_ix;
+        }
+        u16_count += c.len_utf16();
+    }
+    text.len()
+}
+
+/// 文字列の UTF-16 コード単位数を返す。
+///
+/// バイトオフセットから LSP の character 値(positionEncoding=utf-16)を
+/// 算出する際、`&text[..byte_offset]` を渡して使う。
+pub fn utf16_len(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}
+
 /// カーソル位置によるcompletion プロンプト分類
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorContext {
@@ -69,4 +95,35 @@ pub enum CursorContext {
     InBracketOther,
     /// 上記以外のすべて
     Other,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // "a𠮷b": a=1byte/1u16, 𠮷(U+20BB7,サロゲートペア)=4byte/2u16, b=1byte/1u16
+
+    #[test]
+    fn test_utf16_to_byte_offset() {
+        let s = "a𠮷b";
+        assert_eq!(utf16_to_byte_offset(s, 0), 0);
+        assert_eq!(utf16_to_byte_offset(s, 1), 1); // aの直後
+        assert_eq!(utf16_to_byte_offset(s, 3), 5); // 𠮷の直後
+        assert_eq!(utf16_to_byte_offset(s, 4), 6); // bの直後(=末尾)
+        // 範囲外は末尾にクランプ
+        assert_eq!(utf16_to_byte_offset(s, 100), 6);
+        // サロゲートペア中間(u16オフセット2)は文字の直後に丸める
+        assert_eq!(utf16_to_byte_offset(s, 2), 5);
+        // 空文字列
+        assert_eq!(utf16_to_byte_offset("", 5), 0);
+    }
+
+    #[test]
+    fn test_utf16_len() {
+        assert_eq!(utf16_len(""), 0);
+        assert_eq!(utf16_len("abc"), 3);
+        assert_eq!(utf16_len("あいう"), 3); // BMP: 1文字=1u16
+        assert_eq!(utf16_len("𠮷"), 2); // サロゲートペア
+        assert_eq!(utf16_len("a𠮷b"), 4);
+    }
 }

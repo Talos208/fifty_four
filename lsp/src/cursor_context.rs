@@ -117,12 +117,12 @@ fn next_token(
 pub fn classify_complesion_mode(
     texts: &mut [LineData],
     line_no: usize,
-    char_offset: usize,
+    utf16_offset: usize,
     mut tokenize_line_no: impl FnMut(&mut LineData),
 ) -> CursorContext {
-    debug!("classify_complesion_mode({},{})", line_no, char_offset);
+    debug!("classify_complesion_mode({},{})", line_no, utf16_offset);
     let (line_no, cursor_ix, cursor_tkn) = {
-        let (l, i, c) = cursor_tkn(texts, line_no, char_offset, &mut tokenize_line_no);
+        let (l, i, c) = cursor_tkn(texts, line_no, utf16_offset, &mut tokenize_line_no);
         (l, i, c.clone())
     };
 
@@ -181,35 +181,28 @@ pub fn classify_complesion_mode(
     CursorContext::InBracketOther
 }
 
-/// カーソル位置(`line_no`, `char_offset`)が指すトークンを、フォールバック無しで返す。
+/// カーソル位置(`line_no`, `utf16_offset`)が指すトークンを、フォールバック無しで返す。
 ///
-/// `char_offset` は LSP の `Position.character` をそのまま受け取る想定。サーバーは
-/// `positionEncoding: UTF8` を宣言しているが、実クライアント(Zed)は常に UTF-16 コード単位で
-/// Position を送ってくる。日本語の常用文字は BMP 内で UTF-16 コード単位と Rust の `char` が
-/// 1:1 一致するため、`.chars().take(char_offset)` による char 基準の変換で実際には正しく動く
-/// (補助面文字が絡む場合はズレうるが、既知の別課題として扱う)。
+/// `utf16_offset` は LSP の `Position.character` をそのまま受け取る想定
+/// (`positionEncoding: UTF16` を宣言しているため UTF-16 コード単位)。
 ///
 /// 見つからなければ `None`。次のトークンへのフォールバックが必要な呼び出し元(補完)は
 /// `cursor_tkn` を使うこと。
 pub fn token_at(
     texts: &mut [LineData],
     line_no: usize,
-    char_offset: usize,
+    utf16_offset: usize,
     tokenize_line_no: &mut impl FnMut(&mut LineData),
 ) -> Option<(usize, CachedLinderaToken)> {
     // カーソル位置のトークンを取得
     if !texts[line_no].text.is_empty() && texts[line_no].tokens.is_empty() {
         tokenize_line_no(&mut texts[line_no]);
     }
-    let byte_offset: usize = texts[line_no]
-        .text
-        .chars()
-        .take(char_offset)
-        .fold(0, |a, c| a + c.len_utf8());
+    let byte_offset = crate::types::utf16_to_byte_offset(&texts[line_no].text, utf16_offset);
 
     trace!(
-        "line_no: {}, char_offset: {}, byte_offset: {}",
-        line_no, char_offset, byte_offset
+        "line_no: {}, utf16_offset: {}, byte_offset: {}",
+        line_no, utf16_offset, byte_offset
     );
     trace!("{}", texts[line_no].text.chars().take(45).collect::<String>());
 
@@ -224,12 +217,12 @@ pub fn token_at(
 fn cursor_tkn(
     texts: &mut [LineData],
     line_no: usize,
-    char_offset: usize,
+    utf16_offset: usize,
     tokenize_line_no: &mut impl FnMut(&mut LineData),
 ) -> (usize, usize, Option<CachedLinderaToken>) {
     debug!("cursor_tkn");
 
-    let find_result = token_at(texts, line_no, char_offset, tokenize_line_no)
+    let find_result = token_at(texts, line_no, utf16_offset, tokenize_line_no)
         .map(|(ix, tkn)| (ix, Some(tkn)));
 
     let ix_at_end = texts[line_no].tokens.len();
@@ -260,18 +253,18 @@ pub fn before_sentences_upto(
     texts: &DashMap<String, Vec<LineData>>,
     uri: &str,
     line_no: usize,
-    char_offset: usize,
+    utf16_offset: usize,
     len: usize,
     mut tokenize_line_no: impl FnMut(usize),
 ) -> Vec<String> {
     debug!(
-        "before_sentences_upto: line_no={}, char_offset={}, len={}",
-        line_no, char_offset, len
+        "before_sentences_upto: line_no={}, utf16_offset={}, len={}",
+        line_no, utf16_offset, len
     );
 
     let mut text = texts.get(uri).unwrap();
 
-    // char_offsetrからtoken_indexに変換
+    // utf16_offsetからtoken_indexに変換
     if text[line_no].tokens.is_empty() {
         drop(text);
         tokenize_line_no(line_no);
@@ -285,11 +278,7 @@ pub fn before_sentences_upto(
     }
     let mut line_buf = String::new();
 
-    let mut last_byte = text[line_no]
-        .text
-        .chars()
-        .take(char_offset)
-        .fold(0, |acc, c| acc + c.len_utf8());
+    let mut last_byte = crate::types::utf16_to_byte_offset(&text[line_no].text, utf16_offset);
 
     let mut tkn_ix: i64 = if let Some((token_index, tkn)) = text[line_no]
         .tokens
@@ -645,7 +634,7 @@ mod tests {
         let mut texts = lines("田中は歩いた。");
         let td = TestData::new();
         let mut tokenize = |line: &mut LineData| td.tokenize(line);
-        // char_offset=1 は "田中" トークンの内部(先頭文字の直後)
+        // utf16_offset=1 は "田中" トークンの内部(先頭文字の直後、田はBMPなので1u16)
         let hit = token_at(&mut texts, 0, 1, &mut tokenize);
         let (_ix, tkn) = hit.expect("token should be found");
         assert_eq!(&texts[0].text[tkn.byte_start..tkn.byte_end], "田中");
@@ -653,36 +642,66 @@ mod tests {
 
     #[test]
     fn test_token_at_miss_no_fallback() {
-        // 行末より後ろの char_offset では、cursor_tkn と違いフォールバックせず None を返す。
+        // 行末より後ろの utf16_offset では、cursor_tkn と違いフォールバックせず None を返す。
         let mut texts = lines("田中");
         let td = TestData::new();
         let mut tokenize = |line: &mut LineData| td.tokenize(line);
-        let len = texts[0].text.chars().count();
+        let len = crate::types::utf16_len(&texts[0].text);
         let hit = token_at(&mut texts, 0, len + 10, &mut tokenize);
         assert!(hit.is_none(), "{:?}", hit);
     }
 
     #[test]
     fn test_token_at_multibyte_boundary() {
-        // "田中" は2文字(6バイト)。char_offset=1(バイト3、"田中"内部)は "田中" に、
-        // char_offset=2(バイト6、"田中"の直後)は次のトークンにヒットすることを確認する
-        // (全角文字をバイト単位ではなく文字単位で正しく境界判定できていること)。
+        // "田中" は2文字(6バイト、BMPなのでUTF-16でも2単位)。utf16_offset=1(バイト3、
+        // "田中"内部)は "田中" に、utf16_offset=2(バイト6、"田中"の直後)は次のトークンに
+        // ヒットすることを確認する(全角文字をバイト単位ではなく文字単位で正しく境界判定
+        // できていること)。
         let mut texts = lines("田中は歩いた。");
         let td = TestData::new();
 
         let mut tokenize = |line: &mut LineData| td.tokenize(line);
         let inside = token_at(&mut texts, 0, 1, &mut tokenize)
-            .expect("char_offset=1 should hit a token");
+            .expect("utf16_offset=1 should hit a token");
         assert_eq!(&texts[0].text[inside.1.byte_start..inside.1.byte_end], "田中");
 
         let mut tokenize = |line: &mut LineData| td.tokenize(line);
         let after = token_at(&mut texts, 0, 2, &mut tokenize)
-            .expect("char_offset=2 should hit the next token");
+            .expect("utf16_offset=2 should hit the next token");
         assert_ne!(
             (after.1.byte_start, after.1.byte_end),
             (inside.1.byte_start, inside.1.byte_end),
             "「田中」の直後は別トークンにヒットするはず"
         );
         assert_eq!(after.1.byte_start, inside.1.byte_end, "境界が「田中」の直後(バイト6)であること");
+    }
+
+    #[test]
+    fn test_token_at_utf16_supplementary() {
+        use crate::types::{CachedLinderaToken, TokenStatus};
+        // サロゲートペア文字「𠮷」(U+20BB7, 4バイト/2 UTF-16単位)を含む行で、
+        // Position.character(UTF-16コード単位)が正しくバイト位置へ変換されること。
+        // Linderaの補助面文字の分割挙動に依存しないよう、トークンは手組みで与える。
+        let mut texts = lines("𠮷田中");
+        texts[0].tokens = vec![CachedLinderaToken {
+            details: vec!["名詞".to_string()],
+            byte_start: 4, // "田中" (𠮷=4バイトの直後)
+            byte_end: 10,
+            tag: TokenStatus::Normal,
+        }];
+        let mut noop = |_line: &mut LineData| {};
+
+        // UTF-16オフセット0 = 𠮷の手前 → トークン範囲外
+        assert!(token_at(&mut texts, 0, 0, &mut noop).is_none());
+
+        // UTF-16オフセット2 = 𠮷(2u16)の直後 → バイト4 → "田中"にヒット
+        let (_, tkn) = token_at(&mut texts, 0, 2, &mut noop).expect("offset=2 should hit");
+        assert_eq!(&texts[0].text[tkn.byte_start..tkn.byte_end], "田中");
+
+        // UTF-16オフセット3 = 𠮷(2)+田(1) → バイト7("田中"内部) → ヒット。
+        // 旧char単位解釈だと chars().take(3) = 𠮷+田+中 = バイト10 となり範囲外で
+        // ミスしていた、UTF-16化の差分を検証するケース。
+        let (_, tkn) = token_at(&mut texts, 0, 3, &mut noop).expect("offset=3 should hit");
+        assert_eq!(&texts[0].text[tkn.byte_start..tkn.byte_end], "田中");
     }
 }
