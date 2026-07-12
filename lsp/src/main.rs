@@ -634,6 +634,70 @@ pub(crate) fn collect_allowed_names(cache: &CharacterCache) -> std::collections:
     names
 }
 
+/// 1キャラクター分の全セクションを Markdown 文字列に整形する(ホバー表示用)。
+/// `search_cache`(tools.rs)と異なりタグによる絞り込みは行わず、全セクションを出力する。
+fn character_entry_to_markdown(heading_key: &str, entry: &CharacterEntry) -> String {
+    let mut out = format!("# {}", heading_key);
+
+    for section in &entry.sections {
+        let text = section.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if section.tags.is_empty() {
+            // 見出しが CharacterAttribute に認識されなかったセクション。
+            // 元の生見出し文字列は保持していないため、誤ったラベルを付けるより本文のみ出す。
+            out.push_str(&format!("\n\n{}", text));
+        } else {
+            let heading = section
+                .tags
+                .iter()
+                .map(|t| t.canonical_heading())
+                .collect::<Vec<_>>()
+                .join("・");
+            out.push_str(&format!("\n\n## {}\n{}", heading, text));
+        }
+    }
+
+    out
+}
+
+/// `character_cache` 全体を横断し、`surface`(表示名/「・」分割部分名/alias)に一致する
+/// キャラクターを探して Markdown 化した説明文を返す(ホバー表示用)。
+/// 一致判定は `collect_allowed_names` と同じルールを逆向きに適用する。
+/// 同名のキャラが複数ファイルに存在する場合は "---" 区切りで連結して返す。
+fn lookup_character_markdown(cache: &CharacterCache, surface: &str) -> Option<String> {
+    if surface.chars().count() < 2 {
+        return None;
+    }
+
+    let matches_surface = |heading_key: &str, entry: &CharacterEntry| -> bool {
+        let display_name = character_display_name(heading_key);
+        if display_name == surface || display_name.split('・').any(|p| p == surface) {
+            return true;
+        }
+        entry
+            .aliases
+            .iter()
+            .any(|a| a == surface || a.split('・').any(|p| p == surface))
+    };
+
+    let guard = cache.0.lock();
+    let hits: Vec<String> = guard
+        .values()
+        .flat_map(|file_entry| file_entry.characters.iter())
+        .filter(|(heading_key, entry)| matches_surface(heading_key, entry))
+        .map(|(heading_key, entry)| character_entry_to_markdown(heading_key, entry))
+        .collect();
+    drop(guard);
+
+    if hits.is_empty() {
+        None
+    } else {
+        Some(hits.join("\n\n---\n\n"))
+    }
+}
+
 /// 見出しノードの直接子から `Text` ノードを結合してキャラクター名や属性名を返す。
 fn heading_text<'a>(node: &'a AstNode<'a>) -> String {
     node.children()
@@ -841,6 +905,8 @@ impl LanguageServer for Backend {
 
         let capabilities = ServerCapabilities {
             position_encoding: Some(PositionEncodingKind::UTF8),
+            // キャラ名にカーソルを合わせた際、そのキャラの設定をMarkdownで表示する。
+            hover_provider: Some(HoverProviderCapability::Simple(true)),
             // save 通知(did_save)を有効化するため Kind ではなく Options 形式にする。
             // キャラクター設定ファイル保存時に character_cache を再構築するために使う。
             text_document_sync: Some(TextDocumentSyncCapability::Options(
@@ -1135,6 +1201,53 @@ impl LanguageServer for Backend {
             data: vec,
         };
         Ok(Some(SemanticTokensResult::Tokens(tokens)))
+    }
+
+    /// キャラ名にカーソルを合わせた際、そのキャラの設定(全セクション)をMarkdownで表示する。
+    /// 対象語が未登録のキャラ名でなければ `Ok(None)` を返し、何も表示しない。
+    async fn hover(
+        &self,
+        params: HoverParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Hover>> {
+        let pos = params.text_document_position_params;
+        let uri = pos.text_document.uri.as_str();
+        let line_no = pos.position.line as usize;
+        let char_offset = pos.position.character as usize;
+
+        self.highlighter.initialize();
+
+        let mut tmp: RefMut<_, _> = match self.text.try_get_mut(uri) {
+            TryResult::Locked | TryResult::Absent => return Ok(None),
+            TryResult::Present(t) => t,
+        };
+        if line_no >= tmp.len() {
+            return Ok(None);
+        }
+
+        let highlighter = &self.highlighter;
+        let hit = cursor_context::token_at(
+            tmp.as_mut_slice(),
+            line_no,
+            char_offset,
+            &mut |line| {
+                line.tokens = highlighter.text_to_lindera_token(line.text.as_str());
+            },
+        );
+        let Some((_ix, tkn)) = hit else {
+            return Ok(None);
+        };
+        let surface = tmp[line_no].surface(&tkn).to_string();
+        drop(tmp);
+
+        let markdown = lookup_character_markdown(&self.character_cache, &surface);
+
+        Ok(markdown.map(|value| Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            }),
+            range: None,
+        }))
     }
 
     // #[instrument(ret, err)]
@@ -2586,5 +2699,133 @@ mod tests {
             .insert(PathBuf::from("characters.md"), make_entry(MD));
         let names = collect_allowed_names(&cache);
         assert!(names.contains("隊長"), "{:?}", names);
+    }
+
+    #[test]
+    fn test_character_entry_to_markdown() {
+        let chars = parse_all_content(CHARACTERS_MD);
+        let entry = chars
+            .get("ジェフ・クライン（艦長）")
+            .expect("キャラが見つからない");
+        let md = character_entry_to_markdown("ジェフ・クライン（艦長）", entry);
+
+        assert!(md.starts_with("# ジェフ・クライン（艦長）"), "{}", md);
+        // 全セクション(抜粋しない)が含まれること。見出しは複数タグが「・」結合されることがあるため
+        // (例: "背景・立場"→タグ[Background,Role]→"背景・役割")、部分文字列で緩く検証する。
+        assert!(md.contains("背景"), "{}", md);
+        assert!(md.contains("予備役"), "{}", md);
+        assert!(md.contains("口調"), "{}", md);
+        assert!(md.contains("落ち着いていて"), "{}", md);
+        assert!(md.contains("## 描写"), "{}", md);
+        assert!(md.contains("## 容姿"), "{}", md);
+    }
+
+    #[test]
+    fn test_lookup_character_markdown_display_name() {
+        let cache = CharacterCache::new();
+        cache
+            .0
+            .lock()
+            .insert(PathBuf::from("characters.md"), make_entry(CHARACTERS_MD));
+        let md = lookup_character_markdown(&cache, "ジェフ・クライン")
+            .expect("表示名で見つかるはず");
+        assert!(md.contains("予備役"), "{}", md);
+    }
+
+    #[test]
+    fn test_lookup_character_markdown_split_part() {
+        let cache = CharacterCache::new();
+        cache
+            .0
+            .lock()
+            .insert(PathBuf::from("characters.md"), make_entry(CHARACTERS_MD));
+        let md = lookup_character_markdown(&cache, "クライン")
+            .expect("「・」分割部分名で見つかるはず");
+        assert!(md.contains("予備役"), "{}", md);
+    }
+
+    #[test]
+    fn test_lookup_character_markdown_alias() {
+        const MD: &str = indoc!(
+            "## ジェフ・クライン（艦長）
+            ### 呼称
+            - 隊長
+            ### 背景・立場
+            - ムサイ艦の艦長。
+            "
+        );
+        let cache = CharacterCache::new();
+        cache
+            .0
+            .lock()
+            .insert(PathBuf::from("characters.md"), make_entry(MD));
+        let md = lookup_character_markdown(&cache, "隊長").expect("aliasで見つかるはず");
+        assert!(md.contains("艦長"), "{}", md);
+    }
+
+    #[test]
+    fn test_lookup_character_markdown_miss() {
+        let cache = CharacterCache::new();
+        cache
+            .0
+            .lock()
+            .insert(PathBuf::from("characters.md"), make_entry(CHARACTERS_MD));
+        assert!(lookup_character_markdown(&cache, "存在しない人").is_none());
+        // 1文字はノイズ除外(collect_allowed_namesと同じ基準)で必ずNone
+        assert!(lookup_character_markdown(&cache, "ジ").is_none());
+    }
+
+    #[test]
+    fn test_lookup_character_markdown_cross_file() {
+        const MD_A: &str = indoc!(
+            "## アリス（技師）
+            ### 背景・立場
+            - 整備班所属。
+            "
+        );
+        const MD_B: &str = indoc!(
+            "## ボブ（通信士）
+            ### 背景・立場
+            - 通信班所属。
+            "
+        );
+        let cache = CharacterCache::new();
+        {
+            let mut guard = cache.0.lock();
+            guard.insert(PathBuf::from("a.md"), make_entry(MD_A));
+            guard.insert(PathBuf::from("b.md"), make_entry(MD_B));
+        }
+
+        let md_a = lookup_character_markdown(&cache, "アリス").expect("a.mdのキャラが見つかるはず");
+        assert!(md_a.contains("整備班"), "{}", md_a);
+        let md_b = lookup_character_markdown(&cache, "ボブ").expect("b.mdのキャラが見つかるはず");
+        assert!(md_b.contains("通信班"), "{}", md_b);
+    }
+
+    #[test]
+    fn test_lookup_character_markdown_same_name_multiple_files_joined() {
+        const MD_A: &str = indoc!(
+            "## タナカ（技師）
+            ### 背景・立場
+            - A船の整備士。
+            "
+        );
+        const MD_B: &str = indoc!(
+            "## タナカ（通信士）
+            ### 背景・立場
+            - B船の通信士。
+            "
+        );
+        let cache = CharacterCache::new();
+        {
+            let mut guard = cache.0.lock();
+            guard.insert(PathBuf::from("a.md"), make_entry(MD_A));
+            guard.insert(PathBuf::from("b.md"), make_entry(MD_B));
+        }
+
+        let md = lookup_character_markdown(&cache, "タナカ").expect("両ファイルのタナカが見つかるはず");
+        assert!(md.contains("A船の整備士"), "{}", md);
+        assert!(md.contains("B船の通信士"), "{}", md);
+        assert!(md.contains("---"), "{} に区切り線が含まれるはず", md);
     }
 }

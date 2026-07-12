@@ -404,17 +404,17 @@ mod tests {
             "tokenize_conversation should produce tokens"
         );
 
-        // 簡単な検証
-        // "これ" -> 名詞 -> keyword
-        // "は" -> 助詞 -> None
-        // "テスト" -> 名詞 -> keyword
-        // "です" -> 助動詞 -> None
+        // 簡単な検証(括弧内モードは許可名一致以外すべて string に丸められる)
+        // "これ" -> 名詞 -> string
+        // "は" -> 助詞 -> string
+        // "テスト" -> 名詞 -> string
+        // "です" -> 助動詞 -> string
         // "。" -> 記号 -> comment
         assert_eq!(tokens.len(), 5);
         assert_eq!(
             tokens[0].token_type,
-            SemanticTokenType::Decorator as u32,
-            "{} <> variable @{}",
+            SemanticTokenType::String as u32,
+            "{} <> string @{}",
             tokens[0].token_type,
             tokens[0].start
         ); // これ
@@ -476,25 +476,21 @@ mod tests {
     }
 
     #[test]
-    fn test_unregistered_person_name_in_bracket_is_decorator() {
-        // 括弧内モードでは、許可名集合に無い人名は一般名詞と同じ decorator にフォールバックする。
+    fn test_unregistered_person_name_in_bracket_is_string() {
+        // 括弧内モードでは、許可名集合に無い語は一般名詞と同じ string にフォールバックする。
         let h = Highlighter::in_bracket();
         let tokens = h.tokenize(&mut LineData::from_str("田中").unwrap());
         assert_eq!(tokens.len(), 1, "{:?}", tokens);
-        assert_eq!(tokens[0].token_type, SemanticTokenType::Decorator as u32);
+        assert_eq!(tokens[0].token_type, SemanticTokenType::String as u32);
     }
 
     #[test]
     fn test_organization_and_region_not_highlighted() {
         // 組織名("自民党": 固有名詞,組織)・地域名("東京": 固有名詞,地域,一般、"日本": 固有名詞,地域,国)は
-        // 判定ロジックをコメントアウトしているため、許可名集合に入れても Variable/Function にはならない
-        // (通常モードでは None -> トークン自体が生成されない)。
+        // 品詞ベースの判定ロジックをコメントアウトしているため、許可名集合に入っていなければ
+        // Variable/Function は生成されない(通常モードでは None -> トークン自体が生成されない)。
+        // 許可名一致は品詞を問わず keyword になる新仕様のため、ここでは許可名集合を空にして検証する。
         let h = Highlighter::new();
-        h.set_allowed_names(HashSet::from([
-            "自民党".to_string(),
-            "東京".to_string(),
-            "日本".to_string(),
-        ]));
         for word in ["自民党", "東京", "日本"] {
             let tokens = h.tokenize(&mut LineData::from_str(word).unwrap());
             assert!(
@@ -567,12 +563,11 @@ mod tests {
     /// "猫は" で形態素解析すると「猫(名詞)」「は(助詞)」に分かれることを利用する。
     #[test]
     fn test_particle_ha_is_skipped_outside_bracket() {
-        // 助詞は _ カテゴリ → None → スキップ
+        // 括弧内モードでは許可名一致以外すべて string に丸められる
         let h = Highlighter::in_bracket();
         let tokens = h.tokenize(&mut &mut LineData::from_str("猫は").unwrap());
-        // 猫 → keyword (名詞), は → スキップ
         assert_eq!(tokens.len(), 2, "猫は should produce 2 token");
-        assert_eq!(tokens[0].token_type, SemanticTokenType::Decorator as u32);
+        assert_eq!(tokens[0].token_type, SemanticTokenType::String as u32);
     }
 
     #[test]

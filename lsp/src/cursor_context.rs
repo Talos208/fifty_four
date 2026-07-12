@@ -181,13 +181,22 @@ pub fn classify_complesion_mode(
     CursorContext::InBracketOther
 }
 
-fn cursor_tkn(
+/// カーソル位置(`line_no`, `char_offset`)が指すトークンを、フォールバック無しで返す。
+///
+/// `char_offset` は LSP の `Position.character` をそのまま受け取る想定。サーバーは
+/// `positionEncoding: UTF8` を宣言しているが、実クライアント(Zed)は常に UTF-16 コード単位で
+/// Position を送ってくる。日本語の常用文字は BMP 内で UTF-16 コード単位と Rust の `char` が
+/// 1:1 一致するため、`.chars().take(char_offset)` による char 基準の変換で実際には正しく動く
+/// (補助面文字が絡む場合はズレうるが、既知の別課題として扱う)。
+///
+/// 見つからなければ `None`。次のトークンへのフォールバックが必要な呼び出し元(補完)は
+/// `cursor_tkn` を使うこと。
+pub fn token_at(
     texts: &mut [LineData],
     line_no: usize,
     char_offset: usize,
     tokenize_line_no: &mut impl FnMut(&mut LineData),
-) -> (usize, usize, Option<CachedLinderaToken>) {
-    debug!("cursor_tkn");
+) -> Option<(usize, CachedLinderaToken)> {
     // カーソル位置のトークンを取得
     if !texts[line_no].text.is_empty() && texts[line_no].tokens.is_empty() {
         tokenize_line_no(&mut texts[line_no]);
@@ -204,12 +213,24 @@ fn cursor_tkn(
     );
     trace!("{}", texts[line_no].text.chars().take(45).collect::<String>());
 
-    let find_result = texts[line_no]
+    texts[line_no]
         .tokens // Linderaは半角スペースをtokenにしない
         .iter()
         .enumerate()
         .find(|(_ix, tkn)| tkn.byte_start <= byte_offset && byte_offset < tkn.byte_end)
-        .map(|(ix, tkn)| (ix, Some(tkn.clone())));
+        .map(|(ix, tkn)| (ix, tkn.clone()))
+}
+
+fn cursor_tkn(
+    texts: &mut [LineData],
+    line_no: usize,
+    char_offset: usize,
+    tokenize_line_no: &mut impl FnMut(&mut LineData),
+) -> (usize, usize, Option<CachedLinderaToken>) {
+    debug!("cursor_tkn");
+
+    let find_result = token_at(texts, line_no, char_offset, tokenize_line_no)
+        .map(|(ix, tkn)| (ix, Some(tkn)));
 
     let ix_at_end = texts[line_no].tokens.len();
 
@@ -357,6 +378,7 @@ mod tests {
     use crate::LineData;
     use crate::cursor_context::before_sentences_upto;
     use crate::cursor_context::classify_complesion_mode;
+    use crate::cursor_context::token_at;
     // use indoc::indoc;
     use regex::Regex;
     use std::str::FromStr;
@@ -616,4 +638,51 @@ mod tests {
     //     let result = before_sentences_upto(&mut texts, 2, offset, 10, |_| {});
     //     assert_eq!(result.len(), 4);
     // }
+
+    #[test]
+    fn test_token_at_hit() {
+        // "田中" は Lindera IPADIC で単一トークン(固有名詞,人名,姓)になる(実測確認済み)。
+        let mut texts = lines("田中は歩いた。");
+        let td = TestData::new();
+        let mut tokenize = |line: &mut LineData| td.tokenize(line);
+        // char_offset=1 は "田中" トークンの内部(先頭文字の直後)
+        let hit = token_at(&mut texts, 0, 1, &mut tokenize);
+        let (_ix, tkn) = hit.expect("token should be found");
+        assert_eq!(&texts[0].text[tkn.byte_start..tkn.byte_end], "田中");
+    }
+
+    #[test]
+    fn test_token_at_miss_no_fallback() {
+        // 行末より後ろの char_offset では、cursor_tkn と違いフォールバックせず None を返す。
+        let mut texts = lines("田中");
+        let td = TestData::new();
+        let mut tokenize = |line: &mut LineData| td.tokenize(line);
+        let len = texts[0].text.chars().count();
+        let hit = token_at(&mut texts, 0, len + 10, &mut tokenize);
+        assert!(hit.is_none(), "{:?}", hit);
+    }
+
+    #[test]
+    fn test_token_at_multibyte_boundary() {
+        // "田中" は2文字(6バイト)。char_offset=1(バイト3、"田中"内部)は "田中" に、
+        // char_offset=2(バイト6、"田中"の直後)は次のトークンにヒットすることを確認する
+        // (全角文字をバイト単位ではなく文字単位で正しく境界判定できていること)。
+        let mut texts = lines("田中は歩いた。");
+        let td = TestData::new();
+
+        let mut tokenize = |line: &mut LineData| td.tokenize(line);
+        let inside = token_at(&mut texts, 0, 1, &mut tokenize)
+            .expect("char_offset=1 should hit a token");
+        assert_eq!(&texts[0].text[inside.1.byte_start..inside.1.byte_end], "田中");
+
+        let mut tokenize = |line: &mut LineData| td.tokenize(line);
+        let after = token_at(&mut texts, 0, 2, &mut tokenize)
+            .expect("char_offset=2 should hit the next token");
+        assert_ne!(
+            (after.1.byte_start, after.1.byte_end),
+            (inside.1.byte_start, inside.1.byte_end),
+            "「田中」の直後は別トークンにヒットするはず"
+        );
+        assert_eq!(after.1.byte_start, inside.1.byte_end, "境界が「田中」の直後(バイト6)であること");
+    }
 }
