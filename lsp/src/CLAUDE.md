@@ -7,7 +7,7 @@
 </claude-mem-context>
 
 ## Gotchas
-- `tower_lsp::jsonrpc::Result<T>` は1引数型エイリアス。`use` でインポートすると `std::result::Result` がシャドウされる。トレイト実装では `std::result::Result<T, E>` を完全修飾名で使うこと
+- `tower_lsp_server::jsonrpc::Result<T>` は1引数型エイリアス。`use` でインポートすると `std::result::Result` がシャドウされる。トレイト実装では `std::result::Result<T, E>` を完全修飾名で使うこと
 
 ## Tests
 - `cd lsp && cargo test test_parse_characters_md` — CharacterInfoTool のユニットテスト

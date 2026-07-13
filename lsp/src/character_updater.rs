@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as TokioMutex;
-use tower_lsp::lsp_types::WorkspaceFolder;
 
 use crate::types::LineData;
 
@@ -286,7 +285,7 @@ impl Drop for RunningGuard {
 /// (発火時に既にリセット済み・実行中に入った編集を保持するため)。
 pub async fn run(
     uri: String,
-    workspace_arc: Arc<TokioMutex<Vec<WorkspaceFolder>>>,
+    workspace_arc: Arc<TokioMutex<Vec<PathBuf>>>,
     full_text: String,
     llm: Arc<TokioMutex<Option<Box<dyn LlmInterface>>>>,
     recorder: Arc<FlightRecorder>,
@@ -308,9 +307,7 @@ pub async fn run(
 
     let workspace = {
         let ws = workspace_arc.lock().await;
-        ws.first()
-            .and_then(|w| w.uri.to_file_path().ok())
-            .unwrap_or_default()
+        ws.first().cloned().unwrap_or_default()
     };
     debug!("character_updater::run: workspace={:?}", workspace);
 

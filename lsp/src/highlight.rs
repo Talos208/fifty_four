@@ -28,6 +28,17 @@ pub struct SemanticToken {
     pub modifier: u32,
 }
 
+/// LSP の `SemanticToken`(デルタエンコード済み)をそのまま表す独自型。
+/// LSPクレートへの依存を main.rs 境界に閉じ込めるため、highlight.rs はこの型を返す。
+#[derive(Debug, Clone)]
+pub struct EncodedSemanticToken {
+    pub delta_line: u32,
+    pub delta_start: u32,
+    pub length: u32,
+    pub token_type: u32,
+    pub token_modifiers_bitset: u32,
+}
+
 #[derive(Debug, EnumIter)]
 #[repr(u32)]
 pub enum SemanticTokenType {
@@ -348,7 +359,7 @@ impl Highlighter {
     ///
     pub fn to_semantic_tokens(
         tokens: impl IntoIterator<Item = impl IntoIterator<Item = crate::highlight::SemanticToken>>,
-    ) -> Vec<tower_lsp::lsp_types::SemanticToken> {
+    ) -> Vec<EncodedSemanticToken> {
         let mut encoded = Vec::new();
         let mut prev_line: Option<u32> = None;
         let mut prev_start = 0_u32;
@@ -362,7 +373,7 @@ impl Highlighter {
                     Some(pl) => (line_no.saturating_sub(pl), tkn.start),
                 };
 
-                encoded.push(tower_lsp::lsp_types::SemanticToken {
+                encoded.push(EncodedSemanticToken {
                     delta_line,
                     delta_start,
                     length: tkn.length,

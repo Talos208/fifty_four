@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 tokio = { version = "1.49.0", features = ["full"] }
 async-trait = "0.1.89"
-tower-lsp = "0.20"
+tower-lsp-server = "0.22"
 lindera = { version = "2.3.2", features = ["embed-ipadic"] }
 log = "0.4.29"
 env_logger = "0.11.9"

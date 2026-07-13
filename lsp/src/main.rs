@@ -6,8 +6,8 @@ use comrak::{Arena, options};
 use dashmap::mapref::one::RefMut;
 use std::ffi::OsStr;
 use std::sync::Arc;
-use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer, async_trait};
+use tower_lsp_server::lsp_types::*;
+use tower_lsp_server::{Client, LanguageServer, UriExt};
 // use tracing::{debug, info, instrument, span, warn};
 mod highlight;
 use crate::highlight::Highlighter;
@@ -763,7 +763,7 @@ struct Backend {
     // 文章データ（uri、行ごとのテキスト）
     text: DashMap<String, Vec<LineData>>,
     //ワークスペース
-    workspace: Arc<tokio::sync::Mutex<Vec<WorkspaceFolder>>>,
+    workspace: Arc<tokio::sync::Mutex<Vec<PathBuf>>>,
     // 文章補完用 LLM(Arc化: 周期タスクに clone して渡せるようにする)
     llm: Arc<tokio::sync::Mutex<Option<Box<dyn LlmInterface>>>>,
     // バックグラウンド長考タスク用 LLM(補完をブロックしない。現状はキャラ設定収集が利用)
@@ -798,7 +798,6 @@ fn build_llm_client(cfg: &serde_json::Value) -> Box<dyn LlmInterface> {
 /// `LanguageServer` トレイトの実装。
 ///
 /// ここでは最小限のメソッドのみ実装しており、将来的にホバーや補完などを追加できます。
-#[async_trait]
 impl LanguageServer for Backend {
     /// LSP クライアントからの `initialize` リクエストに応答します。
     ///
@@ -807,7 +806,7 @@ impl LanguageServer for Backend {
     async fn initialize(
         &self,
         _param: InitializeParams,
-    ) -> tower_lsp::jsonrpc::Result<InitializeResult> {
+    ) -> tower_lsp_server::jsonrpc::Result<InitializeResult> {
         // サーバの機能（capabilities）を構成します。
         // ここでは最小限として semanticTokens の提供（空実装）を宣言します。
         debug!("initialize");
@@ -1010,13 +1009,7 @@ impl LanguageServer for Backend {
 
         // (a) ワークスペース初期化時にキャラクターファイルを能動スキャンし character_cache を populate する。
         // LLM補完のtool calling実行を待たずに、人名ハイライトの絞り込みをすぐ使えるようにするため。
-        let workspace_paths: Vec<PathBuf> = self
-            .workspace
-            .lock()
-            .await
-            .iter()
-            .filter_map(|w| w.uri.to_file_path().ok())
-            .collect();
+        let workspace_paths: Vec<PathBuf> = self.workspace.lock().await.clone();
         for ws in &workspace_paths {
             for path in Self::list_character_files(ws) {
                 self.reparse_character_file(&path).await;
@@ -1057,7 +1050,7 @@ impl LanguageServer for Backend {
     ///
     /// 現在は特別なクリーンアップを行わず、即座に成功を返します。
     // #[instrument(ret, err)]
-    async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
+    async fn shutdown(&self) -> tower_lsp_server::jsonrpc::Result<()> {
         Ok(())
     }
 
@@ -1085,7 +1078,7 @@ impl LanguageServer for Backend {
             return;
         }
         debug!("did_save[{}]: character file, reparsing", uri);
-        let Ok(path) = params.text_document.uri.to_file_path() else {
+        let Some(path) = params.text_document.uri.to_file_path() else {
             warn!("did_save[{}]: failed to convert uri to file path", uri);
             return;
         };
@@ -1098,7 +1091,7 @@ impl LanguageServer for Backend {
     /// `initialized` で動的登録した watcher からの通知を受ける。
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         for change in params.changes {
-            let Ok(path) = change.uri.to_file_path() else {
+            let Some(path) = change.uri.to_file_path().map(|p| p.into_owned()) else {
                 warn!("did_change_watched_files: failed to convert uri to file path: {:?}", change.uri);
                 continue;
             };
@@ -1183,10 +1176,10 @@ impl LanguageServer for Backend {
     async fn semantic_tokens_full(
         &self,
         params: SemanticTokensParams,
-    ) -> tower_lsp::jsonrpc::Result<Option<SemanticTokensResult>> {
+    ) -> tower_lsp_server::jsonrpc::Result<Option<SemanticTokensResult>> {
         debug!("semantic_token_full");
 
-        let uri = params.text_document.uri.as_ref();
+        let uri = params.text_document.uri.as_str();
 
         self.highlighter.initialize();
 
@@ -1197,6 +1190,15 @@ impl LanguageServer for Backend {
                 .map(|l| self.highlighter.tokenize(l))
                 .collect::<Vec<_>>();
             Highlighter::to_semantic_tokens(tokens)
+                .into_iter()
+                .map(|t| SemanticToken {
+                    delta_line: t.delta_line,
+                    delta_start: t.delta_start,
+                    length: t.length,
+                    token_type: t.token_type,
+                    token_modifiers_bitset: t.token_modifiers_bitset,
+                })
+                .collect::<Vec<_>>()
         };
 
         let tokens = SemanticTokens {
@@ -1211,7 +1213,7 @@ impl LanguageServer for Backend {
     async fn hover(
         &self,
         params: HoverParams,
-    ) -> tower_lsp::jsonrpc::Result<Option<Hover>> {
+    ) -> tower_lsp_server::jsonrpc::Result<Option<Hover>> {
         let pos = params.text_document_position_params;
         let uri = pos.text_document.uri.as_str();
         let line_no = pos.position.line as usize;
@@ -1257,7 +1259,7 @@ impl LanguageServer for Backend {
     async fn completion(
         &self,
         params: CompletionParams,
-    ) -> tower_lsp::jsonrpc::Result<Option<CompletionResponse>> {
+    ) -> tower_lsp_server::jsonrpc::Result<Option<CompletionResponse>> {
         debug!(
             "completion: partial({:?}), progress({:?})",
             params.partial_result_params.partial_result_token,
@@ -1324,7 +1326,7 @@ impl LanguageServer for Backend {
             );
 
             if offset > 0 && before.is_empty() {
-                return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                return Err(tower_lsp_server::jsonrpc::Error::invalid_params(
                     "offset > 0 && before.is_empty()",
                 ));
             }
@@ -1332,12 +1334,12 @@ impl LanguageServer for Backend {
             // カーソルコンテキスト分類
             let mut tmp: RefMut<_, _> = match self.text.try_get_mut(uri) {
                 TryResult::Locked => {
-                    return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                    return Err(tower_lsp_server::jsonrpc::Error::invalid_params(
                         "text for uri is locked",
                     ));
                 }
                 TryResult::Absent => {
-                    return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                    return Err(tower_lsp_server::jsonrpc::Error::invalid_params(
                         "No text found for uri",
                     ));
                 }
@@ -1368,7 +1370,7 @@ impl LanguageServer for Backend {
             .unwrap_or(None)
             .unwrap_or(vec![])
             .first()
-            .map(|v| v.uri.to_file_path().unwrap())
+            .map(|v| v.uri.to_file_path().unwrap().into_owned())
             .unwrap_or_default();
 
         let chapter = params
@@ -1492,7 +1494,7 @@ impl LanguageServer for Backend {
                         .await;
                 }
 
-                Err(tower_lsp::jsonrpc::Error::invalid_params(err.to_string()))
+                Err(tower_lsp_server::jsonrpc::Error::invalid_params(err.to_string()))
             }
         }
     }
@@ -1567,13 +1569,27 @@ impl LanguageServer for Backend {
         debug!("did_change_workspace_folders");
         debug!("\t before {:?}", self.workspace.lock().await);
         for ws in params.event.removed {
+            let Some(path) = ws.uri.to_file_path().map(|p| p.into_owned()) else {
+                warn!(
+                    "did_change_workspace_folders: failed to convert uri to file path: {:?}",
+                    ws.uri
+                );
+                continue;
+            };
             let mut w = self.workspace.lock().await;
-            if let Some(ix) = w.iter().position(|v| v.uri == ws.uri) {
+            if let Some(ix) = w.iter().position(|v| *v == path) {
                 w.deref_mut().remove(ix);
             }
         }
         for ws in params.event.added {
-            self.workspace.lock().await.deref_mut().push(ws);
+            let Some(path) = ws.uri.to_file_path() else {
+                warn!(
+                    "did_change_workspace_folders: failed to convert uri to file path: {:?}",
+                    ws.uri
+                );
+                continue;
+            };
+            self.workspace.lock().await.deref_mut().push(path.into_owned());
         }
         debug!("\t after {:?}", self.workspace.lock().await);
     }
@@ -1820,9 +1836,19 @@ impl Backend {
            self.highlighter.tokenize(line);
        }
     */
-    async fn init_workspace(&self, mut workspaces: Vec<WorkspaceFolder>) {
+    async fn init_workspace(&self, workspaces: Vec<WorkspaceFolder>) {
         debug!("init_workspace: {:?}", workspaces);
-        self.workspace.lock().await.append(&mut workspaces);
+        let mut paths: Vec<PathBuf> = Vec::with_capacity(workspaces.len());
+        for ws in &workspaces {
+            match ws.uri.to_file_path() {
+                Some(p) => paths.push(p.into_owned()),
+                None => warn!(
+                    "init_workspace: failed to convert uri to file path: {:?}",
+                    ws.uri
+                ),
+            }
+        }
+        self.workspace.lock().await.append(&mut paths);
     }
 
     /// URI がキャラクター設定ファイルかどうかを判定する。
@@ -2153,7 +2179,7 @@ async fn main() {
         return;
     }
     let db_path = db_dir.join("fifty_four.db");
-    let (service, socket) = tower_lsp::LspService::build(|client| Backend {
+    let (service, socket) = tower_lsp_server::LspService::build(|client| Backend {
         client,
         text: DashMap::new(),
         workspace: Arc::new(tokio::sync::Mutex::new(vec![])),
@@ -2179,7 +2205,7 @@ async fn main() {
     // サーバを起動してクライアントとのメッセージループを開始する
     info!("start server");
 
-    tower_lsp::Server::new(stdin, stdout, socket)
+    tower_lsp_server::Server::new(stdin, stdout, socket)
         .serve(service)
         .await;
 
@@ -2191,7 +2217,7 @@ mod tests {
     use super::*;
     use crate::tools::CharacterInfoTool;
     use indoc::indoc;
-    use tower_lsp::lsp_types::{Position, Range};
+    use tower_lsp_server::lsp_types::{Position, Range};
 
     fn range(sl: u32, sc: u32, el: u32, ec: u32) -> Range {
         Range {
