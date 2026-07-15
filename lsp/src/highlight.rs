@@ -12,7 +12,7 @@ use strum_macros::EnumIter;
 
 use crate::types::{CachedLinderaToken, LineData, TokenStatus};
 #[allow(unused_imports)]
-use log::{debug, trace};
+use log::{debug, trace, warn};
 
 /// ハイライト用トークンを表す型。
 ///
@@ -131,7 +131,9 @@ impl SemanticToken {
 }
 
 pub struct Highlighter {
-    tokenizer: lindera::tokenizer::Tokenizer,
+    /// Lindera トークナイザ。キャラ名のユーザー辞書差し替え(`rebuild_user_dictionary`)が
+    /// あるため RwLock で内部可変にしている。
+    tokenizer: RwLock<lindera::tokenizer::Tokenizer>,
     bracket_depth: std::sync::atomic::AtomicU32,
     /// キャラクター一覧(名前+aliases、複合名分割済み)。人名ハイライトの絞り込みに使う。
     /// character_cache 側の更新経路(初期化スキャン/保存/外部ファイル監視)から `set_allowed_names` 経由で差し替えられる。
@@ -157,7 +159,7 @@ impl Highlighter {
             .expect("failed to create lindera tokenizer");
 
         Self {
-            tokenizer,
+            tokenizer: RwLock::new(tokenizer),
             bracket_depth: std::sync::atomic::AtomicU32::new(0),
             allowed_names: RwLock::new(HashSet::new()),
         }
@@ -175,12 +177,96 @@ impl Highlighter {
     }
 
     /// 人名ハイライトの許可名集合(キャラ名+aliases)を差し替える。
-    pub fn set_allowed_names(&self, names: HashSet<String>) {
-        *self.allowed_names.write() = names;
+    /// 集合が実際に変化した場合 true を返す(ユーザー辞書再構築の要否判定に使う)。
+    pub fn set_allowed_names(&self, names: HashSet<String>) -> bool {
+        let mut guard = self.allowed_names.write();
+        if *guard == names {
+            return false;
+        }
+        *guard = names;
+        true
+    }
+
+    /// allowed_names の全エントリを固有名詞(名詞,固有名詞,人名,一般)としてユーザー辞書に
+    /// 登録し直す。空集合なら辞書を外す。
+    ///
+    /// lindera 2.3.2 はCSVファイル経由でしかユーザー辞書を構築できないため、一時ファイルに
+    /// 書き出してロード後に削除する。`Tokenizer.segmenter.user_dictionary` が pub なので、
+    /// 埋め込みIPADIC の再ロードなしに辞書だけを差し替えられる。
+    pub fn rebuild_user_dictionary(&self) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+
+        let rows: Vec<String> = {
+            let names = self.allowed_names.read();
+            names
+                .iter()
+                .filter(|n| {
+                    // CSVを壊す文字を含む名前は登録スキップ(表層一致ハイライトは引き続き機能する)
+                    let unsafe_csv =
+                        n.contains(',') || n.contains('"') || n.contains('\n') || n.contains('\r');
+                    if unsafe_csv {
+                        warn!("ユーザー辞書登録をスキップ(CSV非対応文字を含む): {:?}", n);
+                    }
+                    !unsafe_csv
+                })
+                .map(|n| Self::user_dict_csv_row(n, "人名", "一般"))
+                .collect()
+        };
+
+        if rows.is_empty() {
+            self.tokenizer.write().segmenter.user_dictionary = None;
+            debug!("rebuild_user_dictionary: 登録名なし、ユーザー辞書を解除");
+            return Ok(());
+        }
+
+        // 一時CSVファイル。並列テスト・複数LSPプロセスの衝突を避けるため PID+連番 を含める。
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "fifty_four_userdic_{}_{}.csv",
+            std::process::id(),
+            COUNTER.fetch_add(1, Relaxed),
+        ));
+        std::fs::write(&path, rows.join("\n"))?;
+
+        let result = {
+            let mut tok = self.tokenizer.write();
+            match lindera::dictionary::load_user_dictionary_from_csv(
+                &tok.segmenter.dictionary.metadata,
+                &path,
+            ) {
+                Ok(ud) => {
+                    tok.segmenter.user_dictionary = Some(ud);
+                    debug!("rebuild_user_dictionary: {} 件を登録", rows.len());
+                    Ok(())
+                }
+                Err(e) => Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("failed to build user dictionary: {}", e),
+                )),
+            }
+        };
+
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    /// ユーザー辞書CSVの1行(IPADIC 詳細13カラム形式)を組み立てる。
+    /// 文脈ID 0/コスト -10000 は lindera が簡易形式に自動付与する実績値
+    /// (0=未定義文脈、-10000でViterbi上1トークン化を強く優先)。
+    /// 原形=表層形とし(`text_to_lindera_token` の d[6]=="*" 除外フィルタを回避)、読み/発音は "*"。
+    /// 組織(固有名詞,組織,*)・地域(固有名詞,地域,一般)のサポート追加時は subcategory を変えて呼ぶ。
+    fn user_dict_csv_row(surface: &str, subcategory2: &str, subcategory3: &str) -> String {
+        format!(
+            "{s},0,0,-10000,名詞,固有名詞,{c2},{c3},*,*,{s},*,*",
+            s = surface,
+            c2 = subcategory2,
+            c3 = subcategory3,
+        )
     }
 
     pub fn text_to_lindera_token(&self, text: &str) -> Vec<CachedLinderaToken> {
-        self.tokenizer
+        let tokenizer = self.tokenizer.read();
+        tokenizer
             .tokenize(text)
             .expect("failed to tokenize text")
             .into_iter()
@@ -277,40 +363,30 @@ impl Highlighter {
         surface: &str,
         allowed: &HashSet<String>,
     ) -> Option<&'static str> {
-        if allowed.contains(surface) {
-            return Some("keyword");
-        }
-
-        // let v = details[1..]
-        //     .iter()
-        //     .map(|s| s.as_str())
-        //     .collect::<Vec<_>>()
-        //     .into_boxed_slice();
+        let v = details[1..]
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
 
         match details[0].as_str() {
-            // "名詞" => match v.as_ref() {
-            //     ["固有名詞", "人名", "一般", ..]
-            //     | ["固有名詞", "人名", "姓", ..]
-            //     | ["固有名詞", "人名", "名", ..] => {
-            //         if allowed.contains(surface) {
-            //             Some("keyword")
-            //         } else {
-            //             None
-            //         }
-            //     }
+            "名詞" => match v.as_ref() {
+                ["固有名詞", "人名", ..] => {
+                    if allowed.contains(surface) {
+                        Some("keyword")
+                    } else {
+                        None
+                    }
+                }
 
-            //     ["固有名詞", "組織", ..] => Some("variable"),
+                // ["固有名詞", "組織", ..] => Some("variable"),
 
-            //     ["固有名詞", "地域", "一般", ..] | ["固有名詞", "地域", "国", ..] => {
-            //         Some("function")
-            //     }
-            //     ["接尾", "サ変接続", ..] => Some("variable"),
-            //     _ => {
-            //         None
-            //     }
-            // },
-            // "動詞" => Some("variable"),
-            // "形容詞" => Some("function"),
+                // ["固有名詞", "地域", "一般", ..] | ["固有名詞", "地域", "国", ..] => {
+                //     Some("function")
+                // }
+                // ["接尾", "サ変接続", ..] => Some("variable"),
+                _ => None,
+            },
             "記号" => Some("comment"),
             _ => None,
         }
@@ -324,32 +400,30 @@ impl Highlighter {
         surface: &str,
         allowed: &HashSet<String>,
     ) -> Option<&'static str> {
-        if allowed.contains(surface) {
-            return Some("keyword");
-        }
-
-        // let v = details[1..]
-        //     .iter()
-        //     .map(|s| s.as_str())
-        //     .collect::<Vec<_>>()
-        //     .into_boxed_slice();
+        let v = details[1..]
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
 
         match details[0].as_str() {
-            // "名詞" => match v.as_ref() {
-            //     ["固有名詞", "人名", "一般"]
-            //     | ["固有名詞", "人名", "姓"]
-            //     | ["固有名詞", "人名", "名"] => Some("keyword"),
+            "名詞" => match v.as_ref() {
+                ["固有名詞", "人名", ..] => {
+                    if allowed.contains(surface) {
+                        Some("keyword")
+                    } else {
+                        Some("string")
+                    }
+                }
 
-            //     ["固有名詞", "組織"] => Some("variable"),
+                // ["固有名詞", "組織"] => Some("variable"),
 
-            //     ["固有名詞", "地域", "一般"] | ["固有名詞", "地域", "国"] => {
-            //         Some("function")
-            //     }
-            //     ["サ変接続"] | ["接尾", "サ変接続"] => Some("string"),
-            //     _ => Some("decorator"),
-            // },
-            // "動詞" => Some("variable"),
-            // "形容詞" => Some("function"),
+                // ["固有名詞", "地域", "一般"] | ["固有名詞", "地域", "国"] => {
+                //     Some("function")
+                // }
+                ["サ変接続"] | ["接尾", "サ変接続"] => Some("string"),
+                _ => Some("string"),
+            },
             "記号" => Some("comment"),
             _ => Some("string"),
         }

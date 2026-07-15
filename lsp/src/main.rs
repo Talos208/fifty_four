@@ -328,8 +328,8 @@ impl TryFrom<&str> for CharacterAttribute {
             "weakness" | "弱点" | "急所" | "脆さ" | "欠点" | "短所" | "難点" | "問題点" => {
                 Ok(Self::Weakness)
             }
-            "alias" | "呼称" | "別名" | "通称" | "あだ名" | "渾名" | "二つ名" | "愛称"
-            | "呼び名" | "異名" => Ok(Self::Alias),
+            "alias" | "aliases" | "呼称" | "別名" | "通称" | "あだ名" | "渾名" | "二つ名"
+            | "愛称" | "呼び名" | "異名" => Ok(Self::Alias),
             _ => Err(format!("No such attribute {}", s)),
         }
     }
@@ -455,7 +455,7 @@ fn detect_char_level<'a>(root: &'a AstNode<'a>) -> u8 {
 }
 
 /// このプロジェクト共通の comrak パースオプションを返す。
-fn comrak_options() -> comrak::Options<'static> {
+pub(crate) fn comrak_options() -> comrak::Options<'static> {
     let mut options = comrak::Options::default();
     options.extension = comrak::options::Extension::builder()
         .cjk_friendly_emphasis(true)
@@ -514,12 +514,13 @@ pub fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry> {
             {
                 if !section.text.trim().is_empty() {
                     let is_alias = section.tags.contains(&CharacterAttribute::Alias);
-                    let entry = characters
-                        .entry(char_name.to_string())
-                        .or_insert_with(|| CharacterEntry {
-                            sections: Vec::new(),
-                            aliases: Vec::new(),
-                        });
+                    let entry =
+                        characters
+                            .entry(char_name.to_string())
+                            .or_insert_with(|| CharacterEntry {
+                                sections: Vec::new(),
+                                aliases: Vec::new(),
+                            });
                     if is_alias {
                         entry.aliases.extend(split_aliases(&section.text));
                     }
@@ -580,7 +581,7 @@ pub fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry> {
 /// `Alias` タグ付きセクションのテキストを個々の別名に分割する。
 /// 箇条書きの各行をさらに区切り文字（「・」「、」「,」「/」半角スペース）で分割し、
 /// trim・空文字列除外して返す。
-fn split_aliases(text: &str) -> Vec<String> {
+pub(crate) fn split_aliases(text: &str) -> Vec<String> {
     text.lines()
         .flat_map(|line| line.split(['・', '、', ',', '/', ' ']))
         .map(|s| s.trim())
@@ -592,9 +593,7 @@ fn split_aliases(text: &str) -> Vec<String> {
 /// キャラクターの見出しキーから役職等の括弧書きを除いた表示名を返す。
 /// 例: "ジェフ・クライン（艦長）" -> "ジェフ・クライン"
 fn character_display_name(heading_key: &str) -> &str {
-    let end = heading_key
-        .find(['（', '('])
-        .unwrap_or(heading_key.len());
+    let end = heading_key.find(['（', '(']).unwrap_or(heading_key.len());
     heading_key[..end].trim()
 }
 
@@ -792,7 +791,9 @@ fn build_llm_client(cfg: &serde_json::Value) -> Box<dyn LlmInterface> {
     if sys_prompt.is_none() {
         warn!("system.md not found on disk nor in embedded assets; LLM runs without system prompt");
     }
-    LlmClientBuilder::from_value(cfg).sys_prompt(sys_prompt).build()
+    LlmClientBuilder::from_value(cfg)
+        .sys_prompt(sys_prompt)
+        .build()
 }
 
 /// `LanguageServer` トレイトの実装。
@@ -880,8 +881,15 @@ impl LanguageServer for Backend {
                         "llm config has neither ondemand nor provider key; completion LLM remains uninitialized"
                     );
                 }
-                if let Some(cfg) = llm_root
-                    .get("deferred")
+                let deferred_cfg = llm_root.get("deferred");
+                if deferred_cfg.is_none() {
+                    // フォールバック自体は許容するが、バックグラウンド処理が
+                    // ondemand の LLM で動くことに気づけるよう warn を出す。
+                    warn!(
+                        "llm.deferred is not configured; background LLM (character_updater) falls back to the ondemand config"
+                    );
+                }
+                if let Some(cfg) = deferred_cfg
                     .or_else(|| llm_root.get("ondemand"))
                     .or_else(|| {
                         if llm_root.get("provider").is_some() {
@@ -1092,7 +1100,10 @@ impl LanguageServer for Backend {
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         for change in params.changes {
             let Some(path) = change.uri.to_file_path().map(|p| p.into_owned()) else {
-                warn!("did_change_watched_files: failed to convert uri to file path: {:?}", change.uri);
+                warn!(
+                    "did_change_watched_files: failed to convert uri to file path: {:?}",
+                    change.uri
+                );
                 continue;
             };
             match change.typ {
@@ -1210,10 +1221,7 @@ impl LanguageServer for Backend {
 
     /// キャラ名にカーソルを合わせた際、そのキャラの設定(全セクション)をMarkdownで表示する。
     /// 対象語が未登録のキャラ名でなければ `Ok(None)` を返し、何も表示しない。
-    async fn hover(
-        &self,
-        params: HoverParams,
-    ) -> tower_lsp_server::jsonrpc::Result<Option<Hover>> {
+    async fn hover(&self, params: HoverParams) -> tower_lsp_server::jsonrpc::Result<Option<Hover>> {
         let pos = params.text_document_position_params;
         let uri = pos.text_document.uri.as_str();
         let line_no = pos.position.line as usize;
@@ -1230,14 +1238,10 @@ impl LanguageServer for Backend {
         }
 
         let highlighter = &self.highlighter;
-        let hit = cursor_context::token_at(
-            tmp.as_mut_slice(),
-            line_no,
-            utf16_offset,
-            &mut |line| {
+        let hit =
+            cursor_context::token_at(tmp.as_mut_slice(), line_no, utf16_offset, &mut |line| {
                 line.tokens = highlighter.text_to_lindera_token(line.text.as_str());
-            },
-        );
+            });
         let Some((_ix, tkn)) = hit else {
             return Ok(None);
         };
@@ -1494,7 +1498,9 @@ impl LanguageServer for Backend {
                         .await;
                 }
 
-                Err(tower_lsp_server::jsonrpc::Error::invalid_params(err.to_string()))
+                Err(tower_lsp_server::jsonrpc::Error::invalid_params(
+                    err.to_string(),
+                ))
             }
         }
     }
@@ -1589,7 +1595,11 @@ impl LanguageServer for Backend {
                 );
                 continue;
             };
-            self.workspace.lock().await.deref_mut().push(path.into_owned());
+            self.workspace
+                .lock()
+                .await
+                .deref_mut()
+                .push(path.into_owned());
         }
         debug!("\t after {:?}", self.workspace.lock().await);
     }
@@ -1910,12 +1920,30 @@ impl Backend {
 
     /// character_cache 全体から人名ハイライトの許可名集合を再構築し Highlighter に反映、
     /// クライアントへ semanticTokens の再取得を要求する。
+    /// 名前集合が変化した場合は、キャラ名を Lindera ユーザー辞書に固有名詞として登録し直し、
+    /// 旧辞書でトークナイズ済みのキャッシュを破棄する(誤分割されていた名前の再解析のため)。
     async fn refresh_highlight_names(&self) {
         let names = collect_allowed_names(&self.character_cache);
         debug!("refresh_highlight_names: {} 件の許可名", names.len());
-        self.highlighter.set_allowed_names(names);
+        let changed = self.highlighter.set_allowed_names(names);
+        if changed {
+            if let Err(e) = self.highlighter.rebuild_user_dictionary() {
+                warn!("ユーザー辞書の再構築に失敗: {}", e);
+            }
+            self.invalidate_token_caches();
+        }
         if let Err(e) = self.client.semantic_tokens_refresh().await {
             warn!("semantic_tokens_refresh failed: {:?}", e);
+        }
+    }
+
+    /// 全バッファの Lindera トークンキャッシュを破棄する(次回アクセス時に遅延再トークナイズされる)。
+    /// ユーザー辞書の差し替え後、旧辞書による分割結果を捨てるために使う。
+    fn invalidate_token_caches(&self) {
+        for mut entry in self.text.iter_mut() {
+            for line in entry.value_mut().iter_mut() {
+                line.tokens.clear();
+            }
         }
     }
 
@@ -2645,6 +2673,11 @@ mod tests {
             CharacterAttribute::try_from("呼称"),
             Ok(CharacterAttribute::Alias)
         );
+        // LLM 抽出スキーマの enum 値("aliases")も受理されること
+        assert_eq!(
+            CharacterAttribute::try_from("aliases"),
+            Ok(CharacterAttribute::Alias)
+        );
         assert_eq!(
             CharacterAttribute::try_from("別名"),
             Ok(CharacterAttribute::Alias)
@@ -2767,8 +2800,8 @@ mod tests {
             .0
             .lock()
             .insert(PathBuf::from("characters.md"), make_entry(CHARACTERS_MD));
-        let md = lookup_character_markdown(&cache, "ジェフ・クライン")
-            .expect("表示名で見つかるはず");
+        let md =
+            lookup_character_markdown(&cache, "ジェフ・クライン").expect("表示名で見つかるはず");
         assert!(md.contains("予備役"), "{}", md);
     }
 
@@ -2779,8 +2812,8 @@ mod tests {
             .0
             .lock()
             .insert(PathBuf::from("characters.md"), make_entry(CHARACTERS_MD));
-        let md = lookup_character_markdown(&cache, "クライン")
-            .expect("「・」分割部分名で見つかるはず");
+        let md =
+            lookup_character_markdown(&cache, "クライン").expect("「・」分割部分名で見つかるはず");
         assert!(md.contains("予備役"), "{}", md);
     }
 
@@ -2863,7 +2896,8 @@ mod tests {
             guard.insert(PathBuf::from("b.md"), make_entry(MD_B));
         }
 
-        let md = lookup_character_markdown(&cache, "タナカ").expect("両ファイルのタナカが見つかるはず");
+        let md =
+            lookup_character_markdown(&cache, "タナカ").expect("両ファイルのタナカが見つかるはず");
         assert!(md.contains("A船の整備士"), "{}", md);
         assert!(md.contains("B船の通信士"), "{}", md);
         assert!(md.contains("---"), "{} に区切り線が含まれるはず", md);
