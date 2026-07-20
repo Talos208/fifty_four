@@ -49,6 +49,41 @@ fifty_four/
 | Zed 拡張 | `extension/` | `zed_extension_api` で LSP を起動 |
 | `prepare` | `prepare/` | 開発用タスクランナー。`cargo prepare package` で他PC配布用の `dist/` を生成 |
 
+## クロスビルド (aarch64-pc-windows-msvc)
+
+Windows on ARM 向けにネイティブ ARM64 バイナリを作る場合、x64 Windows 開発機から以下の手順でクロスコンパイルできる。
+
+### 前提条件
+
+1. `rustup target add aarch64-pc-windows-msvc`
+2. Visual Studio の「MSVC v143 (または v142) - C++ ARM64/ARM64EC ビルドツール」コンポーネント(link.exe の ARM64 対応、Windows SDK の ARM64 lib)
+3. **clang**(aws-lc-sys のビルドに必要。`winget install LLVM.LLVM` 等で導入)
+4. **CMake** と **Ninja**(aws-lc-sys のビルドに必要。Visual Studio Installer に同梱されていれば追加コンポーネント不要。同梱の場所の例:
+   `<VSインストール先>\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin` と
+   `<VSインストール先>\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja`)
+
+上記の clang / cmake / ninja はインストールしただけでは `PATH` に自動追加されない(特に winget の LLVM や VS 同梱の CMake/Ninja)。ユーザー環境変数 `Path` に以下を恒久的に追加しておく(追加後は新しいターミナルから有効):
+
+```
+C:\Program Files\LLVM\bin
+<VSインストール先>\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin
+<VSインストール先>\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja
+```
+
+### ビルド
+
+```bash
+cargo prepare package --release --target aarch64-pc-windows-msvc
+```
+
+`dist/fifty-four-aarch64/` に ARM64 ネイティブの `fifty_four_lsp.exe` を含む配布一式が生成される(拡張の wasm・`data/` は arch 非依存でホストビルドと共通)。引数なしの `cargo prepare package` は従来どおり host(x64)向けに `dist/fifty-four/` を生成し、動作は変わらない。
+
+### 既知の注意点
+
+- `aws-lc-sys`(rustls の暗号バックエンド、genai/opentelemetry-otlp が推移的に依存)が clang・CMake・Ninja を要求する。これが無いと `cc-rs: failed to find tool "clang"` のようなエラーで `cargo build`/`cargo check` が失敗する。
+- `onig_sys`(comrak → syntect)・`libsqlite3-sys`(rusqlite, bundled)・`zstd-sys`(rust-embed) は C ソース同梱ビルドだが、VS の ARM64 ツールセットがあれば追加設定なしで通る。
+- `lindera`(embed-ipadic)の辞書はビルド時に生成される arch 非依存データなので、クロスビルドでの追加対応は不要。
+
 ## 言語定義
 
 `extension/languages/fiftyfour/config.toml` で FiftyFour 言語を定義。

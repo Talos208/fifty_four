@@ -280,18 +280,18 @@ pub fn before_sentences_upto(
 
     let mut last_byte = crate::types::utf16_to_byte_offset(&text[line_no].text, utf16_offset);
 
-    let mut tkn_ix: i64 = if let Some((token_index, tkn)) = text[line_no]
+    // カーソルがトークン上(境界含む)にある場合でも、ここではそのトークンを consume しない。
+    // last_byte をカーソル位置のままにしておけば、直後の 'outer ループが
+    // [直前トークンの byte_start .. カーソル位置) をまとめて取り込むため、
+    // カーソルより後方の文字の混入やトークンの二重計上なしに「カーソル直前まで」が集まる。
+    // (以前はカーソルトークン全体を push + last_byte を byte_end へ進めていたため、
+    //  閉じ括弧直前などトークン境界にカーソルがあると後方文字の混入・重複が起きていた)
+    let mut tkn_ix: i64 = text[line_no]
         .tokens
         .iter()
-        .enumerate()
-        .find(|(_, tkn)| tkn.byte_start <= last_byte && last_byte < tkn.byte_end)
-    {
-        line_buf.push_str(&text[line_no].text[tkn.byte_start..tkn.byte_end]);
-        last_byte = tkn.byte_end;
-        token_index as i64
-    } else {
-        text[line_no].tokens.len() as i64
-    };
+        .position(|tkn| tkn.byte_start <= last_byte && last_byte < tkn.byte_end)
+        .map(|ix| ix as i64)
+        .unwrap_or(text[line_no].tokens.len() as i64);
 
     let mut ln = line_no as i64;
     let mut result = vec![];
@@ -368,6 +368,7 @@ mod tests {
     use crate::cursor_context::before_sentences_upto;
     use crate::cursor_context::classify_complesion_mode;
     use crate::cursor_context::token_at;
+    use dashmap::DashMap;
     // use indoc::indoc;
     use regex::Regex;
     use std::str::FromStr;
@@ -392,6 +393,18 @@ mod tests {
 
         fn tokenize(&self, line: &mut LineData) {
             self.hl.tokenize(line);
+        }
+
+        /// 本番(completion)と同じ手順で分類する:
+        /// カーソル行まで括弧深さを畳み込んでから classify_complesion_mode を呼ぶ。
+        fn classify(
+            &self,
+            texts: &mut Vec<LineData>,
+            line_no: usize,
+            offset: usize,
+        ) -> CursorContext {
+            self.hl.ensure_bracket_depth(texts.as_mut_slice(), line_no);
+            classify_complesion_mode(texts, line_no, offset, |line| self.tokenize(line))
         }
     }
 
@@ -418,7 +431,7 @@ mod tests {
         let td = TestData::new();
         let offset = texts[0].text.chars().count(); // カーソルは末尾
         assert_eq!(
-            classify_complesion_mode(&mut texts, 0, offset, |line| td.tokenize(line)),
+            td.classify(&mut texts, 0, offset),
             CursorContext::AfterClosingBracket
         );
     }
@@ -428,7 +441,7 @@ mod tests {
         let mut text = lines("思い出した。\n「」\n　故郷たる");
         let td = TestData::new();
         assert_eq!(
-            classify_complesion_mode(&mut text, 2, 1, |line| td.tokenize(line)),
+            td.classify(&mut text, 2, 1),
             CursorContext::AfterClosingBracket
         );
     }
@@ -449,7 +462,7 @@ mod tests {
         let td = TestData::new();
         let offset = text[0].text.chars().count();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
+            td.classify(&mut text, 0, offset),
             CursorContext::AfterSentenceEnd
         );
     }
@@ -459,7 +472,7 @@ mod tests {
         let mut text = lines("これは文章。\n");
         let td = TestData::new();
         assert_eq!(
-            classify_complesion_mode(&mut text, 1, 0, |line| td.tokenize(line)),
+            td.classify(&mut text, 1, 0),
             CursorContext::AfterSentenceEnd
         );
     }
@@ -469,7 +482,7 @@ mod tests {
         let mut text = lines("「」");
         let td = TestData::new();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, 1, |line| td.tokenize(line)),
+            td.classify(&mut text, 0, 1),
             CursorContext::EmptyBracket
         );
     }
@@ -492,8 +505,33 @@ mod tests {
         let td = TestData::new();
         let offset = "「こんにちは".chars().count();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
+            td.classify(&mut text, 0, offset),
             CursorContext::BeforeClosingBracket
+        );
+    }
+
+    #[test]
+    fn before_closing_bracket_consecutive_dialogue_lines() {
+        // 連続する台詞行の1行目、」の直前 → BeforeClosingBracket
+        // (修正前: completion 経路では tag が常に Normal だったため Other に誤判定されていた)
+        let mut text = lines("「セリフ１」\n「セリフ２」");
+        let td = TestData::new();
+        let offset = "「セリフ１".chars().count();
+        assert_eq!(
+            td.classify(&mut text, 0, offset),
+            CursorContext::BeforeClosingBracket
+        );
+    }
+
+    #[test]
+    fn in_bracket_other_second_dialogue_line() {
+        // 連続台詞の2行目、読点の直後(台詞の途中) → InBracketOther
+        let mut text = lines("「セリフ１」\n「セリフ２、");
+        let td = TestData::new();
+        let offset = "「セリフ２、".chars().count();
+        assert_eq!(
+            td.classify(&mut text, 1, offset),
+            CursorContext::InBracketOther
         );
     }
 
@@ -504,7 +542,7 @@ mod tests {
         // カーソルは1行目の末尾
         let offset = "「こんにちは".chars().count();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
+            td.classify(&mut text, 0, offset),
             CursorContext::BeforeClosingBracket
         );
     }
@@ -515,7 +553,7 @@ mod tests {
         let td = TestData::new();
         let offset = text[0].text.chars().count();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
+            td.classify(&mut text, 0, offset),
             CursorContext::InBracketOther
         );
     }
@@ -526,7 +564,7 @@ mod tests {
         let td = TestData::new();
         let offset = text[0].text.chars().count();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
+            td.classify(&mut text, 0, offset),
             CursorContext::Other
         );
     }
@@ -537,7 +575,7 @@ mod tests {
         let td = TestData::new();
         let offset = 0;
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
+            td.classify(&mut text, 0, offset),
             CursorContext::Other
         );
     }
@@ -547,7 +585,7 @@ mod tests {
         let mut text = lines("");
         let td = TestData::new();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, 0, |line| td.tokenize(line)),
+            td.classify(&mut text, 0, 0),
             CursorContext::Other
         );
     }
@@ -559,7 +597,7 @@ mod tests {
         let td = TestData::new();
         let offset = "「『内側』外側".chars().count();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
+            td.classify(&mut text, 0, offset),
             CursorContext::BeforeClosingBracket
         );
     }
@@ -571,62 +609,94 @@ mod tests {
         let mut text = lines("「『内側』」");
         let td = TestData::new();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, 0, |line| td.tokenize(line)),
+            td.classify(&mut text, 0, 0),
             CursorContext::Other
         );
 
         let offset = "「『内側』".chars().count();
         assert_eq!(
-            classify_complesion_mode(&mut text, 0, offset, |line| td.tokenize(line)),
+            td.classify(&mut text, 0, offset),
             CursorContext::BeforeClosingBracket
         );
     }
-    /*
-        #[test]
-        fn sentences_upto_single() {
-            let (mut texts, _) = tokenize("一文目です。");
-            let offset = texts[0].text.chars().count();
-            let result = before_sentences_upto(&mut texts, 0, offset, 10, |_| {});
-            assert_eq!(result.len(), 1);
-            assert!(result.iter().any(|s| s.contains("。")));
-        }
+    // ─── before_sentences_upto ───────────────────────────────────────────
 
-        #[test]
-        fn sentences_upto_multiple() {
-            let (mut texts, _) = tokenize("一文目です。二文目です。");
-            let offset = texts[0].text.chars().count();
-            let result = before_sentences_upto(&mut texts, 0, offset, 10, |_| {});
-            assert_eq!(result.len(), 2);
-        }
+    /// テスト用: uri "uri" 1本の DashMap を組み立てる。
+    fn dash(text: &str) -> DashMap<String, Vec<LineData>> {
+        let m = DashMap::new();
+        m.insert("uri".to_string(), lines(text));
+        m
+    }
 
-        #[test]
-        fn sentences_upto_len_limit() {
-            let (mut texts, _) = tokenize("一文目。二文目。三文目。");
-            let offset = texts[0].text.chars().count();
-            let result = before_sentences_upto(&mut texts, 0, offset, 2, |_| {});
-            assert_eq!(result.len(), 2);
-        }
+    /// テスト用: 本番(main.rs completion)と同じ遅延トークン化クロージャで呼び出す。
+    fn sentences(
+        td: &TestData,
+        texts: &DashMap<String, Vec<LineData>>,
+        line_no: usize,
+        utf16_offset: usize,
+        len: usize,
+    ) -> Vec<String> {
+        before_sentences_upto(texts, "uri", line_no, utf16_offset, len, |ln| {
+            let mut t = texts.get_mut("uri").unwrap();
+            if let Some(l) = t.get_mut(ln) {
+                td.tokenize(l);
+            }
+        })
+    }
 
-        #[test]
-        fn sentences_upto_multiline() {
-            let (mut texts, _) = tokenize("一文目。\n\n二文目。");
-            let offset = texts[2].text.chars().count();
-            // 0行目末尾のカーソル → 0行目の文のみ
-            let result = before_sentences_upto(&mut texts, 2, offset, 10, |_| {});
-            assert_eq!(result.len(), 3);
-        }
-    */
-    // #[test]
-    // fn sentences_upto_multiline2() {
-    //     let (mut texts, _) = tokenize(indoc!(
-    //         "通信回線を開いた。やがてスピーカーから微かな通信音が響き渡った。
-    //         「応答せよ、グラナダ管制、これより進入を開始する」
-    //         「こちらサイド・スリー防衛艦隊所属、認識番号を確認されたし」"
-    //     ));
-    //     let offset = texts[2].text.chars().count() - 1;
-    //     let result = before_sentences_upto(&mut texts, 2, offset, 10, |_| {});
-    //     assert_eq!(result.len(), 4);
-    // }
+    #[test]
+    fn sentences_upto_cursor_before_closing_bracket() {
+        // 連続台詞の1行目、閉じ括弧」の直前にカーソルがあるとき、
+        // カーソルより後方の」が混入したり、文字が重複したりしないこと。
+        // (カーソルのバイト位置が次トークンの byte_start と一致する境界ケース)
+        let td = TestData::new();
+        let texts = dash("「セリフ１」\n「セリフ２」");
+        let offset = "「セリフ１".chars().count();
+        let result = sentences(&td, &texts, 0, offset, 10);
+        assert_eq!(result.concat(), "「セリフ１", "{:?}", result);
+    }
+
+    #[test]
+    fn sentences_upto_cursor_mid_token() {
+        // トークン内部(部分入力済みの語の途中)にカーソルがある場合も、
+        // カーソルより後方の文字が混入しないこと。
+        let td = TestData::new();
+        let texts = dash("これは途中");
+        let offset = "これは途".chars().count(); // "途中" トークンの内部
+        let result = sentences(&td, &texts, 0, offset, 10);
+        assert_eq!(result.concat(), "これは途", "{:?}", result);
+    }
+
+    #[test]
+    fn sentences_upto_multiple_sentences() {
+        let td = TestData::new();
+        let texts = dash("一文目です。二文目です。");
+        let offset = "一文目です。二文目です。".chars().count();
+        let result = sentences(&td, &texts, 0, offset, 10);
+        assert_eq!(result.len(), 2, "{:?}", result);
+        assert_eq!(result.concat(), "一文目です。二文目です。");
+    }
+
+    #[test]
+    fn sentences_upto_len_limit() {
+        let td = TestData::new();
+        let texts = dash("一文目。二文目。三文目。");
+        let offset = "一文目。二文目。三文目。".chars().count();
+        let result = sentences(&td, &texts, 0, offset, 2);
+        assert_eq!(result.len(), 2, "{:?}", result);
+        // 直近の2文だけが返る
+        assert_eq!(result.concat(), "二文目。三文目。");
+    }
+
+    #[test]
+    fn sentences_upto_consecutive_dialogue_lines() {
+        // 連続台詞2行、カーソルは2行目末尾 → 両方の台詞が行単位で返る
+        let td = TestData::new();
+        let texts = dash("「セリフ１」\n「セリフ２」");
+        let offset = "「セリフ２」".chars().count();
+        let result = sentences(&td, &texts, 1, offset, 10);
+        assert_eq!(result.concat(), "「セリフ１」「セリフ２」", "{:?}", result);
+    }
 
     #[test]
     fn test_token_at_hit() {

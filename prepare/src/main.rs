@@ -21,35 +21,75 @@ const EXTENSION_ID: &str = "fifty-four";
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let release = args.iter().any(|a| a == "--release");
+    let target = parse_target(&args);
     match args.first().map(|s| s.as_str()) {
-        Some("package") => package(release),
+        Some("package") => package(release, target.as_deref()),
         // extension.wasm の生成(ビルド + strip + 検証)だけを行う。
         // cargo に post-build フックが無いため `cargo build` へは統合できず、
         // このサブコマンドが「wasm のビルド」に相当する。
+        // 拡張は wasm32-wasip2 固定(arch 非依存)なので --target の影響を受けない。
         Some("wasm") => {
             build_extension_wasm(&repo_root().join("extension"), release);
         }
         _ => {
-            eprintln!("Usage: cargo prepare <package|wasm> [--release]");
+            eprintln!("Usage: cargo prepare <package|wasm> [--release] [--target <triple>]");
             std::process::exit(1);
         }
     }
 }
 
-fn package(release: bool) {
+/// `--target <triple>` / `--target=<triple>` の両形式を受け付ける。
+/// 未指定なら `None`(= host ターゲット、従来動作)。
+fn parse_target(args: &[String]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        if a == "--target" {
+            match iter.next() {
+                Some(t) => return Some(t.clone()),
+                None => {
+                    eprintln!("--target には <triple> の指定が必要です");
+                    std::process::exit(1);
+                }
+            }
+        }
+        if let Some(t) = a.strip_prefix("--target=") {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
+fn package(release: bool, target: Option<&str>) {
     let repo_root = repo_root();
     let profile_dir = if release { "release" } else { "debug" };
     let profile_label = if release { "release" } else { "debug" };
 
-    println!("Building fifty_four_lsp ({})...", profile_label);
-    run_cargo_build(&repo_root, &["-p", "fifty_four_lsp"], release);
+    match target {
+        Some(t) => println!("Building fifty_four_lsp ({}, target={})...", profile_label, t),
+        None => println!("Building fifty_four_lsp ({})...", profile_label),
+    }
+    let mut build_args = vec!["-p", "fifty_four_lsp"];
+    if let Some(t) = target {
+        build_args.extend_from_slice(&["--target", t]);
+    }
+    run_cargo_build(&repo_root, &build_args, release);
 
     // ---- extension.wasm: Zed の Install Dev Extension と同じ処理で生成する ----
+    // (wasm32-wasip2 固定・arch 非依存なので --target の影響を受けない)
     let ext_dir = repo_root.join("extension");
     let src_wasm = build_extension_wasm(&ext_dir, release);
 
-    // ---- dist/fifty-four/: 配布用ディレクトリを組み立てる ----
-    let dist_dir = repo_root.join("dist").join(EXTENSION_ID);
+    // ---- dist/fifty-four[-<arch>]/: 配布用ディレクトリを組み立てる ----
+    // ターゲット指定時は arch(triple の先頭要素)サフィックスを付けて
+    // host 用の dist/fifty-four/ と共存させる(例: dist/fifty-four-aarch64/)。
+    let dist_name = match target {
+        Some(t) => {
+            let arch = t.split('-').next().unwrap_or(t);
+            format!("{}-{}", EXTENSION_ID, arch)
+        }
+        None => EXTENSION_ID.to_string(),
+    };
+    let dist_dir = repo_root.join("dist").join(&dist_name);
     if dist_dir.exists() {
         fs::remove_dir_all(&dist_dir)
             .unwrap_or_else(|e| panic!("削除に失敗 {:?}: {}", dist_dir, e));
@@ -63,12 +103,23 @@ fn package(release: bool) {
     );
     copy_dir_recursive(&ext_dir.join("languages"), &dist_dir.join("languages"));
 
-    let exe_name = if cfg!(windows) {
+    // exe 名はターゲット指定時は triple 基準で判定する(クロスコンパイル対応)。
+    // 未指定時は従来どおり host 基準(cfg!(windows))。
+    let for_windows = match target {
+        Some(t) => t.contains("windows"),
+        None => cfg!(windows),
+    };
+    let exe_name = if for_windows {
         "fifty_four_lsp.exe"
     } else {
         "fifty_four_lsp"
     };
-    let src_exe = repo_root.join("target").join(profile_dir).join(exe_name);
+    // ターゲット指定時の cargo 出力先は target/<triple>/<profile>/。
+    let mut src_exe = repo_root.join("target");
+    if let Some(t) = target {
+        src_exe = src_exe.join(t);
+    }
+    let src_exe = src_exe.join(profile_dir).join(exe_name);
     copy_file(&src_exe, &dist_dir.join(exe_name));
 
     copy_dir_recursive(&repo_root.join("data"), &dist_dir.join("data"));
@@ -102,7 +153,11 @@ fn build_extension_wasm(ext_dir: &Path, release: bool) -> PathBuf {
     );
     run_cargo_build(ext_dir, &["--target", "wasm32-wasip2"], release);
 
-    let cargo_wasm = ext_dir
+    // extension は workspace メンバーなので、cwd=ext_dir でビルドしても
+    // 出力は ext_dir/target/ ではなく workspace ルートの target/ に置かれる
+    // (Cargo の仕様: workspace メンバーは常にルート共有の target/ を使う)。
+    let workspace_root = ext_dir.parent().unwrap_or(ext_dir);
+    let cargo_wasm = workspace_root
         .join("target")
         .join("wasm32-wasip2")
         .join(profile_dir)

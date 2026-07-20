@@ -33,6 +33,10 @@ pub struct CachedLinderaToken {
 pub struct LineData {
     pub text: String,
     pub tokens: Vec<CachedLinderaToken>,
+    /// この行の処理を終えた時点での括弧ネスト深さ。None = 未計算/無効化済み。
+    /// 前方の全行に依存する累積量のため、編集時は編集行以降を一括で None にすること
+    /// (`apply_changes` 参照)。
+    pub bracket_depth_after: Option<u32>,
 }
 
 impl FromStr for LineData {
@@ -43,6 +47,7 @@ impl FromStr for LineData {
         Ok(Self {
             text: text.to_string(),
             tokens: Vec::new(),
+            bracket_depth_after: None,
         })
     }
 }

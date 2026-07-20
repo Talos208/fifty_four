@@ -553,6 +553,8 @@ impl LlmInterface for LlmClient {
 
     async fn with_model(&mut self, model: &str) -> Result<String, LlmError> {
         // TODO AGENTS.mdをfrom_system()で投入
+        // chat_req はツール呼び出しの往復をまたいで会話履歴として保持・追記する。
+        // (LLM API はステートレスなので、毎リクエストに全履歴を送る必要がある)
         let mut chat_req = ChatRequest::from_system(&self.sys_prompt)
             .append_messages(self.fetch_all().iter().filter_map(|c| {
                 Some(ChatMessage::system(match c {
@@ -576,7 +578,7 @@ impl LlmInterface for LlmClient {
         let content = loop {
             let res = self
                 .inner_client
-                .exec_chat(model, chat_req, Some(&self.options))
+                .exec_chat(model, chat_req.clone(), Some(&self.options))
                 .await;
 
             let Ok(response) = res else {
@@ -621,21 +623,27 @@ impl LlmInterface for LlmClient {
                 });
             };
 
-            self.prompts.clear(); // promptはクリア、キャッシュは保存
-            self.options = ChatOptions::default();
+            self.prompts.clear(); // promptはクリア(chat_req に焼き込み済み)、キャッシュは保存
 
             if let Some(reason) = response.reasoning_content.as_ref() {
                 debug!("reasoning: {}", reason)
             }
 
             if response.tool_calls().is_empty() {
+                // オプションのリセットは最終応答の確定時のみ。ツール往復の途中で
+                // リセットすると response_format / temperature 等が2周目以降で消える。
+                self.options = ChatOptions::default();
                 break response.content.texts().join("");
             }
 
-            // Toolcallが無くなるまでループ
+            // Toolcallが無くなるまでループ。
+            // 置き換えではなく履歴へ追記する: system・元の user プロンプト・tools 宣言を
+            // 保ったまま Assistant(functionCall) → User(functionResponse) を末尾に足す。
+            // (まっさらなリクエストで functionCall から始めると Gemini が
+            //  "function call turn must come after a user turn" の 400 を返す)
             let tc = response.into_tool_calls();
             match self.respond_tool(tc.as_slice()).await {
-                Ok(ret) => chat_req = ret,
+                Ok(follow) => chat_req.messages.extend(follow.messages),
                 Err(e) => {
                     return Result::Err(e);
                 }
@@ -650,7 +658,17 @@ impl LlmInterface for LlmClient {
         let mut result_tr = vec![];
 
         for tc in tool_calls {
+            // モデルが実際に発話した functionCall は未知ツールでも履歴に残す。
+            // 黙って除外するとモデルの発話と履歴が食い違い、functionCall と
+            // functionResponse の件数不一致や同じ未知ツールの再呼び出しを招く。
+            result_tc.push(tc.clone());
+
             let Some(t) = self.tools.get(&tc.fn_name) else {
+                warn!("unknown tool called: {}", tc.fn_name);
+                result_tr.push(ToolResponse::new(
+                    tc.call_id.clone(),
+                    format!("Error: unknown tool {}", tc.fn_name),
+                ));
                 continue;
             };
 
@@ -674,25 +692,20 @@ impl LlmInterface for LlmClient {
                     ));
                 }
             }
-            result_tc.push(tc.clone());
         }
 
+        // genai の From 実装で組む(ToolCall の doc が示す慣用パターン
+        //  append_message(tool_calls).append_message(tool_response))。
+        // From<Vec<ToolCall>> は先頭 ToolCall の thought_signatures を先頭の
+        // ThoughtSignature パートへ hoist する。Gemini 3 の送信シリアライザは
+        // functionCall の直前にある ThoughtSignature パートからしか署名を読まないため、
+        // これを通さないとモデルが返した署名が欠落し
+        //  "Function call is missing a thought_signature" の 400 になる。
+        // From<Vec<ToolResponse>> は Tool ロールになるが、Gemini adapter は User/Tool
+        // どちらも {"role":"user", functionResponse} に出力するため出力は不変。
         let chat_req = ChatRequest::from_messages(vec![])
-            .append_message(ChatMessage {
-                role: genai::chat::ChatRole::Assistant,
-                content: genai::chat::MessageContent::from_tool_calls(result_tc),
-                options: None,
-            })
-            .append_message(ChatMessage {
-                role: genai::chat::ChatRole::User,
-                content: genai::chat::MessageContent::from_parts(
-                    result_tr
-                        .into_iter()
-                        .map(genai::chat::ContentPart::ToolResponse)
-                        .collect::<Vec<_>>(),
-                ),
-                options: None,
-            });
+            .append_message(ChatMessage::from(result_tc))
+            .append_message(ChatMessage::from(result_tr));
         Ok(chat_req)
     }
 
@@ -909,5 +922,150 @@ mod tests_capabilities {
             cf.default_capabilities("@cf/qwen/qwen1.5-14b-chat"),
             ModelCapability::TOOL_CALLING // "qwen" キーワードにマッチ
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_tool_round {
+    use super::*;
+    use genai::chat::ChatRole;
+
+    /// テスト用の最小 LlmTool。args の "msg" をそのまま返す。
+    #[derive(Debug)]
+    struct EchoTool;
+
+    #[async_trait]
+    impl LlmTool for EchoTool {
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "echo tool for tests"
+        }
+        async fn invoke(&self, args: &Map<String, Value>) -> Result<String, LlmError> {
+            Ok(format!(
+                "echo:{}",
+                args.get("msg").and_then(|v| v.as_str()).unwrap_or("")
+            ))
+        }
+    }
+
+    fn client_with_echo_tool() -> Box<dyn LlmInterface> {
+        let mut cl =
+            LlmClientBuilder::from_value(&serde_json::json!({"provider": "lmstudio"})).build();
+        cl.add_tool(Box::new(EchoTool));
+        cl
+    }
+
+    fn tool_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            call_id: id.to_string(),
+            fn_name: name.to_string(),
+            fn_arguments: serde_json::json!({"msg": "hello"}),
+            thought_signatures: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_respond_tool_returns_assistant_then_tool() {
+        let cl = client_with_echo_tool();
+        let follow = cl.respond_tool(&[tool_call("c1", "echo")]).await.unwrap();
+
+        // Assistant(functionCall) → Tool(functionResponse) の順で2メッセージ。
+        // From<Vec<ToolResponse>> は Tool ロールになる(Gemini 出力は User と同一)。
+        assert_eq!(follow.messages.len(), 2);
+        assert!(matches!(follow.messages[0].role, ChatRole::Assistant));
+        assert!(matches!(follow.messages[1].role, ChatRole::Tool));
+        assert_eq!(follow.messages[0].content.tool_calls().len(), 1);
+        // ツールの実行結果が functionResponse に入っていること
+        let serialized = serde_json::to_string(&follow.messages[1]).unwrap();
+        assert!(serialized.contains("echo:hello"), "{serialized}");
+    }
+
+    #[tokio::test]
+    async fn test_respond_tool_preserves_thought_signature() {
+        // モデルが functionCall に付けて返した thought_signature を、送信用の
+        // Assistant メッセージの先頭 ThoughtSignature パートへ hoist すること
+        // (Gemini 3 はこの署名を verbatim で戻さないと 400 を返す)。
+        let cl = client_with_echo_tool();
+        let mut tc = tool_call("c1", "echo");
+        tc.thought_signatures = Some(vec!["sig-abc".to_string()]);
+
+        let follow = cl.respond_tool(&[tc]).await.unwrap();
+
+        let assistant = &follow.messages[0].content;
+        assert!(
+            assistant.contains_thought_signature(),
+            "Assistant メッセージに ThoughtSignature パートが含まれること"
+        );
+        assert_eq!(
+            assistant.first_thought_signature(),
+            Some("sig-abc"),
+            "モデルの署名が保持されること"
+        );
+        // 署名を hoist しても functionCall 自体は保持される
+        assert_eq!(assistant.tool_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_respond_tool_unknown_tool_gets_error_response() {
+        let cl = client_with_echo_tool();
+        let follow = cl
+            .respond_tool(&[tool_call("c1", "echo"), tool_call("c2", "nonexistent")])
+            .await
+            .unwrap();
+
+        // 未知ツールも functionCall 履歴から除外せず、エラー応答を返す
+        // (除外すると functionCall と functionResponse の件数が食い違う)
+        assert_eq!(follow.messages[0].content.tool_calls().len(), 2);
+        let serialized = serde_json::to_string(&follow.messages[1]).unwrap();
+        assert!(
+            serialized.contains("Error: unknown tool nonexistent"),
+            "{serialized}"
+        );
+        assert!(serialized.contains("echo:hello"), "{serialized}");
+    }
+
+    #[test]
+    fn test_tool_round_appends_to_history() {
+        // with_model のツールラウンド処理と同じマージ: 既存履歴へ追記し、
+        // system / user プロンプト / tools 宣言が保持されること
+        // (Gemini は functionCall ターンが user ターンの直後に無いと 400 を返す)
+        let mut chat_req = ChatRequest::from_system("sys")
+            .append_message(ChatMessage::user("prompt"))
+            .with_tools(vec![Tool::new("echo")]);
+
+        let follow = ChatRequest::from_messages(vec![
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: genai::chat::MessageContent::from_tool_calls(vec![tool_call(
+                    "c1", "echo",
+                )]),
+                options: None,
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: genai::chat::MessageContent::from_parts(vec![
+                    genai::chat::ContentPart::ToolResponse(ToolResponse::new(
+                        "c1".to_string(),
+                        "echo:hello".to_string(),
+                    )),
+                ]),
+                options: None,
+            },
+        ]);
+
+        chat_req.messages.extend(follow.messages);
+
+        assert_eq!(chat_req.system.as_deref(), Some("sys"));
+        assert!(chat_req.tools.is_some(), "tools 宣言が保持されること");
+        assert_eq!(chat_req.messages.len(), 3);
+        assert!(matches!(chat_req.messages[0].role, ChatRole::User));
+        assert!(matches!(chat_req.messages[1].role, ChatRole::Assistant));
+        assert!(matches!(chat_req.messages[2].role, ChatRole::User));
+        assert_eq!(chat_req.messages[1].content.tool_calls().len(), 1);
     }
 }

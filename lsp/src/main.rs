@@ -17,6 +17,7 @@ use crate::types::{CursorContext, LineData};
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::str::FromStr;
+mod assets;
 mod character_updater;
 use crate::character_updater::UpdateState;
 mod cursor_context;
@@ -36,7 +37,6 @@ use genai::chat::{ReasoningEffort, ServiceTier, Verbosity};
 use indoc::indoc;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
-use rust_embed::Embed;
 use serde_json::{Value, json};
 use std::ops::DerefMut;
 
@@ -780,14 +780,12 @@ struct Backend {
     character_cache: CharacterCache,
     // URI ごとのキャラクター更新トリガー状態
     update_states: DashMap<String, Arc<parking_lot::Mutex<UpdateState>>>,
+    // クライアントが window/workDoneProgress をサポートするか(initialize で判定)
+    work_done_progress_supported: std::sync::atomic::AtomicBool,
 }
 
 fn build_llm_client(cfg: &serde_json::Value) -> Box<dyn LlmInterface> {
-    // prompt 群と同じく exe 隣の data/ を優先し、無ければ埋め込みアセットへフォールバック
-    // (デバッグビルドの埋め込みはビルドマシンの絶対パスを実行時に読むため、転送先では失敗する)。
-    let sys_prompt = load_prompt_from_disk("system.md").or_else(|| {
-        Asset::get("system.md").map(|d| String::from_utf8_lossy(d.data.as_ref()).to_string())
-    });
+    let sys_prompt = assets::load("system.md");
     if sys_prompt.is_none() {
         warn!("system.md not found on disk nor in embedded assets; LLM runs without system prompt");
     }
@@ -820,6 +818,17 @@ impl LanguageServer for Backend {
         if let Some(info) = _param.client_info {
             debug!("Client_info: {:?}", info);
         }
+
+        // クライアントの workDoneProgress 対応を記録する(completion 中の進捗表示に使う)。
+        let wdp_supported = _param
+            .capabilities
+            .window
+            .as_ref()
+            .and_then(|w| w.work_done_progress)
+            .unwrap_or(false);
+        self.work_done_progress_supported
+            .store(wdp_supported, std::sync::atomic::Ordering::Relaxed);
+        debug!("client workDoneProgress support: {}", wdp_supported);
 
         if let Some(opt) = _param.initialization_options {
             debug!("initialization_options: {:?}", opt);
@@ -1192,15 +1201,19 @@ impl LanguageServer for Backend {
 
         let uri = params.text_document.uri.as_str();
 
-        self.highlighter.initialize();
-
         let vec = {
-            let mut lines = self.text.get(uri).expect("Failed to get text").to_vec();
-            let tokens = lines
-                .iter_mut()
-                .map(|l| self.highlighter.tokenize(l))
-                .collect::<Vec<_>>();
-            Highlighter::to_semantic_tokens(tokens)
+            // 共有ストアの行を直接更新する(get_mut)。深さを 0 から畳み込みながら全行を
+            // 処理することで、各行の tag / bracket_depth_after キャッシュが書き戻され、
+            // 以降の completion がそのまま再利用できる(陳腐化キャッシュもここで修復される)。
+            let mut lines = self.text.get_mut(uri).expect("Failed to get text");
+            let mut depth = 0u32;
+            let mut per_line = Vec::with_capacity(lines.len());
+            for line in lines.iter_mut() {
+                let (toks, d) = self.highlighter.tokenize_with_depth(line, depth);
+                depth = d;
+                per_line.push(toks);
+            }
+            Highlighter::to_semantic_tokens(per_line)
                 .into_iter()
                 .map(|t| SemanticToken {
                     delta_line: t.delta_line,
@@ -1226,8 +1239,6 @@ impl LanguageServer for Backend {
         let uri = pos.text_document.uri.as_str();
         let line_no = pos.position.line as usize;
         let utf16_offset = pos.position.character as usize;
-
-        self.highlighter.initialize();
 
         let mut tmp: RefMut<_, _> = match self.text.try_get_mut(uri) {
             TryResult::Locked | TryResult::Absent => return Ok(None),
@@ -1297,8 +1308,6 @@ impl LanguageServer for Backend {
         let line_no = params.text_document_position.position.line as usize;
         let offset = params.text_document_position.position.character as usize;
         let (context, before) = {
-            self.highlighter.initialize(); // TODO 正しいdepthを割り当てたい
-
             let before = cursor_context::before_sentences_upto(
                 // tmp.as_mut_slice(),
                 &self.text,
@@ -1350,11 +1359,21 @@ impl LanguageServer for Backend {
                 TryResult::Present(t) => t,
             };
 
+            // カーソル行までの括弧深さを畳み込み、0..=line_no のトークン tag を確定させる。
+            // これにより classify_complesion_mode の in_bracket 判定(tag == InBracket)が
+            // 行をまたぐ台詞でも正しく機能する。
+            self.highlighter
+                .ensure_bracket_depth(tmp.as_mut_slice(), line_no);
+
             let highlighter = &self.highlighter;
             let context = cursor_context::classify_complesion_mode(
                 tmp.as_mut_slice(),
                 line_no,
                 offset,
+                // このクロージャはカーソル行より後方の行(next_token フォールバック)専用。
+                // 後方行の tag は in_bracket 判定に使われない(in_bracket はカーソル以前の
+                // before_tkn のみ参照し、EmptyBracket/BeforeClosingBracket は品詞ベースの
+                // is_bracket_close で判定する)ため、深さ未考慮のトークン化で問題ない。
                 |line| {
                     line.tokens = highlighter.text_to_lindera_token(line.text.as_str());
                 },
@@ -1387,6 +1406,18 @@ impl LanguageServer for Backend {
         debug!("Prompt: {:?}", chapter);
         let prompt = prompt.replace("{{CHAPTER}}", chapter);
 
+        // LLM 応答待ちの間、クライアントへ進捗を表示する(Zed の activity indicator)。
+        // クライアントがリクエストに付けた workDoneToken があれば優先し、
+        // 無ければサーバ発トークンを window/workDoneProgress/create で登録する。
+        let progress = CompletionProgress::begin(
+            &self.client,
+            self.work_done_progress_supported
+                .load(std::sync::atomic::Ordering::Relaxed),
+            params.work_done_progress_params.work_done_token.clone(),
+            "候補を生成しています…",
+        )
+        .await;
+
         let mut completion_id = 0u32;
         let raw = self
             .use_llm_with_option(options, async |l| {
@@ -1413,11 +1444,23 @@ impl LanguageServer for Backend {
             })
             .await;
 
+        // 成功・失敗どちらでも進捗表示を消す(キャンセルで drop された場合は Drop ガードが送る)。
+        if let Some(progress) = progress {
+            progress.finish().await;
+        }
+
         match raw {
             Ok(response) => {
                 debug!("raw Ok.");
 
                 let mut pending: Vec<PendingCandidate> = Vec::new();
+
+                // カーソル位置にゼロ幅の text_edit を張る。textEdit を持たない補完アイテムは
+                // クライアントが「カーソル直前の単語」を暗黙のフィルタクエリにするため、
+                // かな漢字の途中で発火すると生成文がその prefix に一致せず候補ごと消えてしまう
+                // (句点・改行・括弧の直後は暗黙クエリが空になるため偶然表示されていた)。
+                // ゼロ幅 Range を明示することでクエリは常に空になり、確実に表示される。
+                let cursor = Position::new(line_no as u32, offset as u32);
 
                 let items = response
                     .lines()
@@ -1454,21 +1497,26 @@ impl LanguageServer for Backend {
                             .record_candidate(completion_id, &sr, r, &mut pending);
 
                         debug!("Completion Item");
+                        let text_edit = Some(CompletionTextEdit::Edit(TextEdit {
+                            range: Range::new(cursor, cursor),
+                            new_text: sr.clone(),
+                        }));
                         if sr.chars().count() > 25 {
                             CompletionItem {
                                 label: shorten(&sr, 25),
                                 kind: Some(CompletionItemKind::TEXT),
                                 documentation: Some(Documentation::MarkupContent(MarkupContent {
                                     kind: MarkupKind::Markdown,
-                                    value: sr.clone(),
+                                    value: sr,
                                 })),
-                                insert_text: Some(sr),
+                                text_edit,
                                 ..Default::default()
                             }
                         } else {
                             CompletionItem {
                                 label: sr,
                                 kind: Some(CompletionItemKind::TEXT),
+                                text_edit,
                                 ..Default::default()
                             }
                         }
@@ -1642,6 +1690,107 @@ fn apply_changes<T: AsRef<str>>(lines: &mut Vec<LineData>, text: T, range: Range
 
     let end = end_line.min(lines.len() - 1);
     lines.splice(start_line..=end, new_lines);
+
+    // 括弧深さは前方の全行に依存する累積量。編集行以降のキャッシュを無効化する。
+    // (新規行は from_str の時点で None。既存の後続行に残る陳腐化した Some をここで落とす。
+    //  Option への None 代入だけなので、行数が多くてもコストは無視できる)
+    let clear_from = start_line.min(lines.len());
+    for l in lines[clear_from..].iter_mut() {
+        l.bracket_depth_after = None;
+    }
+}
+
+/// completion 実行中に LSP WorkDoneProgress を表示するためのガード。
+/// LLM 応答待ちの間、Zed の activity indicator(左下ステータスバー)に「処理中」を出す。
+/// Zed のタイムアウト/再入力による $/cancelRequest で completion の future が
+/// drop された場合でも、Drop 実装が必ず End 通知を送り、表示の残留を防ぐ。
+struct CompletionProgress {
+    client: Client,
+    token: ProgressToken,
+    finished: bool,
+}
+
+impl CompletionProgress {
+    /// 進捗表示を開始する。
+    /// - クライアントがリクエストに workDoneToken を付けてきた場合はそれを使う(create 不要)
+    /// - 無ければ window/workDoneProgress/create でサーバ発トークンを登録する
+    ///   (クライアントが window.workDoneProgress 非対応、または create 拒否なら None)
+    async fn begin(
+        client: &Client,
+        supported: bool,
+        client_token: Option<ProgressToken>,
+        message: impl Into<String>,
+    ) -> Option<Self> {
+        let token = match client_token {
+            // リクエスト付属トークン(LSP 仕様上 create は不要)
+            Some(t) => t,
+            None => {
+                if !supported {
+                    return None;
+                }
+                static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let token = ProgressToken::String(format!(
+                    "54/completion/{}",
+                    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
+                if let Err(e) = client
+                    .send_request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
+                        token: token.clone(),
+                    })
+                    .await
+                {
+                    debug!("WorkDoneProgressCreate rejected: {:?}", e);
+                    return None;
+                }
+                token
+            }
+        };
+
+        // OngoingProgress は型パラメータ付きでフィールド保持が煩雑なため使わず、
+        // End 通知は send_end() で直接送る(ここでは begin 通知の送信だけが目的)。
+        let _ = client
+            .progress(token.clone(), "LLM補完を生成中")
+            .with_message(message)
+            .begin()
+            .await;
+
+        Some(Self {
+            client: client.clone(),
+            token,
+            finished: false,
+        })
+    }
+
+    /// End 通知を送って進捗表示を消す(正常終了経路)。
+    async fn finish(mut self) {
+        self.finished = true;
+        Self::send_end(&self.client, self.token.clone()).await;
+    }
+
+    async fn send_end(client: &Client, token: ProgressToken) {
+        client
+            .send_notification::<notification::Progress>(ProgressParams {
+                token,
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
+                    message: None,
+                })),
+            })
+            .await;
+    }
+}
+
+impl Drop for CompletionProgress {
+    fn drop(&mut self) {
+        debug!("CompletionProgress::drop");
+        if !self.finished {
+            // キャンセル等で future ごと drop された場合。Drop 内では await できないため
+            // 別タスクで End を送る(送らないと Zed 側の進捗表示が残留し続ける)。
+            debug!("Finish progress");
+            let client = self.client.clone();
+            let token = self.token.clone();
+            tokio::spawn(async move { Self::send_end(&client, token).await });
+        }
+    }
 }
 
 impl Backend {
@@ -2077,22 +2226,12 @@ impl Backend {
     }
 }
 
-#[derive(Embed)]
-#[folder = "../data/"]
-struct Asset;
-
-/// 埋め込みアセットからプロンプトを読み込み、YAML frontmatter を本文と分離して返す。
+/// アセットからプロンプトを読み込み、YAML frontmatter を本文と分離して返す。
 ///
 /// - アセットが見つからない場合は `None`(欠如時の扱いは呼び出し側に委ねる)。
 /// - frontmatter が無い・パースに失敗した場合は本文をそのまま・空の data を返す。
 pub(crate) fn load_prompt(name: &str) -> Option<(String, HashMap<String, String>)> {
-    let template: String = match load_prompt_from_disk(name) {
-        Some(s) => s,
-        None => {
-            let asset = Asset::get(name)?;
-            String::from_utf8_lossy(asset.data.as_ref()).into_owned()
-        }
-    };
+    let template = assets::load(name)?;
     let matter = gray_matter::Matter::<gray_matter::engine::YAML>::new();
     // いったん Pod として受け、スカラー値を文字列へ正規化する。
     // HashMap<String, String> へ直接デシリアライズすると、frontmatter に数値や真偽値が
@@ -2112,14 +2251,6 @@ pub(crate) fn load_prompt(name: &str) -> Option<(String, HashMap<String, String>
         }
     }
     Some((body, data))
-}
-
-/// 実行ファイルと同じディレクトリの `data/<name>` があれば、そちらを優先して読む
-/// (再ビルドせずにプロンプトを編集して試すための dev 用フック)。無ければ `None`。
-fn load_prompt_from_disk(name: &str) -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    std::fs::read_to_string(dir.join("data").join(name)).ok()
 }
 
 /// frontmatter の Pod を文字列へ正規化する。
@@ -2227,6 +2358,7 @@ async fn main() {
         db: Arc::new(FlightRecorder::new(&db_path)),
         character_cache: CharacterCache::new(),
         update_states: DashMap::new(),
+        work_done_progress_supported: std::sync::atomic::AtomicBool::new(false),
     })
     .finish();
 
@@ -2460,7 +2592,7 @@ mod tests {
             「娑羅双樹」の花の色、「盛者必衰」の理をあらはす。"
         ));
         let hl = Highlighter::new();
-        hl.initialize();
+        // 各行とも括弧は行内で閉じるので、深さ0起点の行単位 tokenize で足りる
         ls.iter_mut().for_each(|l| {
             hl.tokenize(l);
         });

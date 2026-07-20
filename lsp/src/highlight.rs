@@ -134,7 +134,6 @@ pub struct Highlighter {
     /// Lindera トークナイザ。キャラ名のユーザー辞書差し替え(`rebuild_user_dictionary`)が
     /// あるため RwLock で内部可変にしている。
     tokenizer: RwLock<lindera::tokenizer::Tokenizer>,
-    bracket_depth: std::sync::atomic::AtomicU32,
     /// キャラクター一覧(名前+aliases、複合名分割済み)。人名ハイライトの絞り込みに使う。
     /// character_cache 側の更新経路(初期化スキャン/保存/外部ファイル監視)から `set_allowed_names` 経由で差し替えられる。
     allowed_names: RwLock<HashSet<String>>,
@@ -160,20 +159,8 @@ impl Highlighter {
 
         Self {
             tokenizer: RwLock::new(tokenizer),
-            bracket_depth: std::sync::atomic::AtomicU32::new(0),
             allowed_names: RwLock::new(HashSet::new()),
         }
-    }
-
-    #[cfg(test)]
-    pub fn in_bracket() -> Self {
-        let tmp = Self::new();
-        tmp.bracket_depth.store(1, Relaxed);
-        tmp
-    }
-
-    pub fn initialize(&self) {
-        self.bracket_depth.store(0, Relaxed);
     }
 
     /// 人名ハイライトの許可名集合(キャラ名+aliases)を差し替える。
@@ -284,61 +271,133 @@ impl Highlighter {
                     details: t.details().iter().map(|s| s.to_string()).collect(),
                     byte_start: t.byte_start,
                     byte_end: t.byte_end,
-                    tag: TokenStatus::Normal, // TODO 括弧の深さはどうしようねぇ
+                    // tag は行の開始深さに依存するため、ここでは仮値。
+                    // `tag_line_depth` が深さを畳み込みながら確定させる。
+                    tag: TokenStatus::Normal,
                 })
             })
             .collect()
     }
 
-    /// テキストを受け取り、ハイライト用トークン列を返す。
+    /// 単一行を `start_depth` 起点でタグ付けし、行終端の括弧深さを返す。
     ///
-    /// Lindera を用いて形態素解析を行い、語種に基づくトークン種別を生成します。
-    pub fn tokenize(&self, line: &mut LineData) -> Vec<SemanticToken> {
-        // debug!(
-        //     "Highlighter::tokenize {}",
-        //     crate::shorten_middle(line.text.as_str(), 45)
-        // );
+    /// - `line.tokens` が空なら Lindera で遅延トークン化する
+    /// - 各トークンの `tag` を InBracket/Normal に**明示的に**設定する
+    ///   (キャッシュ済みトークンを異なる深さで再タグ付けするケースがあるため、
+    ///    InBracket → Normal への戻しも必要)
+    /// - `line.bracket_depth_after` に終端深さをキャッシュする
+    ///
+    /// 括弧開閉トークン自身の扱い:
+    /// - 括弧開: 自身はまだ外側(処理前の深さで判定) → その後 depth+1
+    /// - 括弧閉: depth-1 → 自身はもう外側(処理後の深さで判定)
+    fn tag_line_depth(&self, line: &mut LineData, start_depth: u32) -> u32 {
         // 遅延解析
         if line.tokens.is_empty() {
             trace!("lazy tokenize");
             line.tokens = self.text_to_lindera_token(&line.text);
+        }
+
+        let mut depth = start_depth;
+        for token in line.tokens.iter_mut() {
+            match (
+                token.details[0].as_str(),
+                token.details.get(1).map(|d| d.as_str()),
+            ) {
+                ("記号", Some("括弧開")) => {
+                    token.tag = if depth > 0 {
+                        TokenStatus::InBracket
+                    } else {
+                        TokenStatus::Normal
+                    };
+                    depth += 1;
+                }
+                ("記号", Some("括弧閉")) => {
+                    depth = depth.saturating_sub(1);
+                    token.tag = if depth > 0 {
+                        TokenStatus::InBracket
+                    } else {
+                        TokenStatus::Normal
+                    };
+                }
+                _ => {
+                    token.tag = if depth > 0 {
+                        TokenStatus::InBracket
+                    } else {
+                        TokenStatus::Normal
+                    };
+                }
+            }
+        }
+
+        line.bracket_depth_after = Some(depth);
+        depth
+    }
+
+    /// `line_no` 行の終端深さを保証する畳み込み。
+    ///
+    /// `bracket_depth_after` が Some ならそれを返す(O(1) 高速パス)。
+    /// None なら後方へ遡り、最寄りのキャッシュ済み行(無ければ行0, depth=0)から
+    /// `line_no` まで `tag_line_depth` で前向きに畳み直す。
+    /// 副作用として、再計算した範囲の全トークンの `tag` が正しく設定される。
+    ///
+    /// `apply_changes` が編集行以降の `bracket_depth_after` を一括 None にする規約
+    /// (前方累積量の無効化)と対になっており、定常の打鍵(編集行=カーソル行)では
+    /// 再計算は1行分だけで済む。
+    pub fn ensure_bracket_depth(&self, lines: &mut [LineData], line_no: usize) -> u32 {
+        if lines.is_empty() {
+            return 0;
+        }
+        let line_no = line_no.min(lines.len() - 1);
+        if let Some(d) = lines[line_no].bracket_depth_after {
+            return d;
+        }
+
+        // 最寄りのキャッシュ済み祖先を後方探索
+        let mut start = line_no;
+        while start > 0 && lines[start - 1].bracket_depth_after.is_none() {
+            start -= 1;
+        }
+        let mut depth = if start == 0 {
+            0
+        } else {
+            lines[start - 1].bracket_depth_after.unwrap()
         };
-        trace!("{}", line.tokens.len());
+
+        // キャッシュが見つかった所から line_no まで前向きに畳み直す
+        for line in &mut lines[start..=line_no] {
+            depth = self.tag_line_depth(line, depth);
+        }
+        depth
+    }
+
+    /// テキストを受け取り、ハイライト用トークン列と行終端の括弧深さを返す。
+    ///
+    /// `tag_line_depth` でタグ付けした後、語種と括弧内外に基づいて
+    /// ハイライト用のトークン種別を生成する。
+    pub fn tokenize_with_depth(
+        &self,
+        line: &mut LineData,
+        start_depth: u32,
+    ) -> (Vec<SemanticToken>, u32) {
+        let end_depth = self.tag_line_depth(line, start_depth);
 
         let mut result = Vec::new();
         let allowed = self.allowed_names.read();
-        line.tokens.iter_mut().for_each(|token| {
-            let details = token.details.clone();
-            // 人名判定に使う表層文字列。byte_start/byte_endはトークン生成時点で確定しているため、
-            // classify呼び出し前に計算しておく。
+        for token in line.tokens.iter() {
+            // 人名判定に使う表層文字列
             let surface = &line.text[token.byte_start..token.byte_end];
 
-            // 括弧開閉はモード dispatch の外で処理する（常に括弧外扱い）。
-            // 括弧開: kind確定("comment") → depth加算（自身はまだ外側）
-            // 括弧閉: depth減算 → kind確定("comment")（自身はもう外側）
-            // それ以外: 現在のdepthでモードを決定し classify へ委譲
-            let kind = match (details[0].as_str(), details.get(1).map(|d| d.as_str())) {
-                ("記号", Some("括弧開")) => {
-                    let d = self.bracket_depth.load(Relaxed);
-                    if d > 0 {
-                        token.tag = TokenStatus::InBracket;
-                    }
-                    self.bracket_depth.store(d + 1, Relaxed);
-                    Some("comment")
+            // 括弧開閉自身は常に "comment"。それ以外は tag(tag_line_depth が確定済み)で
+            // 括弧内外モードを分けて classify へ委譲する。
+            let kind = match (
+                token.details[0].as_str(),
+                token.details.get(1).map(|d| d.as_str()),
+            ) {
+                ("記号", Some("括弧開")) | ("記号", Some("括弧閉")) => Some("comment"),
+                _ if token.tag == TokenStatus::InBracket => {
+                    Self::classify_bracket(&token.details, surface, &allowed)
                 }
-                ("記号", Some("括弧閉")) => {
-                    let d = self.bracket_depth.load(Relaxed).saturating_sub(1);
-                    self.bracket_depth.store(d, Relaxed);
-                    if d > 0 {
-                        token.tag = TokenStatus::InBracket;
-                    }
-                    Some("comment")
-                }
-                _ if self.bracket_depth.load(Relaxed) > 0 => {
-                    token.tag = TokenStatus::InBracket;
-                    Self::classify_bracket(&details, surface, &allowed)
-                }
-                _ => Self::classify_normal(&details, surface, &allowed),
+                _ => Self::classify_normal(&token.details, surface, &allowed),
             };
 
             if let Some(k) = kind {
@@ -348,9 +407,17 @@ impl Highlighter {
 
                 result.push(SemanticToken::from_kind(start as u32, length as u32, k));
             }
-        });
+        }
 
-        result
+        (result, end_depth)
+    }
+
+    /// 深さ0(括弧外)起点の `tokenize_with_depth`。単一行・深さ0前提の呼び出し向け互換ラッパ。
+    /// 本体コードは深さを明示する `tokenize_with_depth`/`ensure_bracket_depth` を使うため、
+    /// 現在はテスト専用。
+    #[allow(dead_code)]
+    pub fn tokenize(&self, line: &mut LineData) -> Vec<SemanticToken> {
+        self.tokenize_with_depth(line, 0).0
     }
 
     /// 通常モードでの品詞→トークン種別マッピング。
@@ -478,10 +545,16 @@ mod tests {
         assert_eq!(t.modifier, 0);
     }
 
+    /// 括弧内モード(開始深さ1)でトークン化するテスト用ヘルパ。
+    fn tokenize_in_bracket(h: &Highlighter, line: &mut LineData) -> Vec<SemanticToken> {
+        h.tokenize_with_depth(line, 1).0
+    }
+
     #[test]
     fn test_tokenize_conversation_produces_tokens() {
-        let hilighter = Highlighter::in_bracket();
-        let tokens = hilighter.tokenize(&mut LineData::from_str("これはテストです。").unwrap());
+        let hilighter = Highlighter::new();
+        let tokens =
+            tokenize_in_bracket(&hilighter, &mut LineData::from_str("これはテストです。").unwrap());
         assert!(
             !tokens.is_empty(),
             "tokenize_conversation should produce tokens"
@@ -526,8 +599,8 @@ mod tests {
 
     #[test]
     fn test_tokenize_conversation_unknown_words() {
-        let hilighter = Highlighter::in_bracket();
-        let tokens = hilighter.tokenize(&mut LineData::from_str("がびがび").unwrap());
+        let hilighter = Highlighter::new();
+        let tokens = tokenize_in_bracket(&hilighter, &mut LineData::from_str("がびがび").unwrap());
         // "がびがび" は名詞として扱われるはず
         assert_eq!(tokens[0].token_type, SemanticTokenType::String as u32);
     }
@@ -561,8 +634,8 @@ mod tests {
     #[test]
     fn test_unregistered_person_name_in_bracket_is_string() {
         // 括弧内モードでは、許可名集合に無い語は一般名詞と同じ string にフォールバックする。
-        let h = Highlighter::in_bracket();
-        let tokens = h.tokenize(&mut LineData::from_str("田中").unwrap());
+        let h = Highlighter::new();
+        let tokens = tokenize_in_bracket(&h, &mut LineData::from_str("田中").unwrap());
         assert_eq!(tokens.len(), 1, "{:?}", tokens);
         assert_eq!(tokens[0].token_type, SemanticTokenType::String as u32);
     }
@@ -587,8 +660,9 @@ mod tests {
 
     #[test]
     fn test_encode_semantic_tokens_same_line_uses_relative_start() {
-        let hilighter = Highlighter::in_bracket();
-        let tokens = hilighter.tokenize(&mut LineData::from_str("これはテストです。").unwrap());
+        let hilighter = Highlighter::new();
+        let tokens =
+            tokenize_in_bracket(&hilighter, &mut LineData::from_str("これはテストです。").unwrap());
         let encoded = Highlighter::to_semantic_tokens([tokens.clone()]);
         assert!(encoded.len() >= 3);
         assert_eq!(encoded[1].delta_line, 0);
@@ -613,11 +687,11 @@ mod tests {
     */
     #[test]
     fn test_encode_semantic_tokens_skips_empty_lines_with_line_gap() {
-        let hilighter = Highlighter::in_bracket();
+        let hilighter = Highlighter::new();
         let encoded = Highlighter::to_semantic_tokens(
             ["これはテストです。", "", "これはテストです。"]
                 .iter()
-                .map(|s| hilighter.tokenize(&mut LineData::from_str(s).unwrap()))
+                .map(|s| tokenize_in_bracket(&hilighter, &mut LineData::from_str(s).unwrap()))
                 .collect::<Vec<_>>(),
         );
         assert!(encoded.len() >= 6);
@@ -627,8 +701,9 @@ mod tests {
 
     #[test]
     fn test_encode_semantic_tokens_preserves_length_type_modifier() {
-        let hilighter = Highlighter::in_bracket();
-        let source = hilighter.tokenize(&mut LineData::from_str("これはテストです。").unwrap());
+        let hilighter = Highlighter::new();
+        let source =
+            tokenize_in_bracket(&hilighter, &mut LineData::from_str("これはテストです。").unwrap());
 
         let encoded = Highlighter::to_semantic_tokens([source.clone()]);
 
@@ -647,8 +722,8 @@ mod tests {
     #[test]
     fn test_particle_ha_is_skipped_outside_bracket() {
         // 括弧内モードでは許可名一致以外すべて string に丸められる
-        let h = Highlighter::in_bracket();
-        let tokens = h.tokenize(&mut &mut LineData::from_str("猫は").unwrap());
+        let h = Highlighter::new();
+        let tokens = tokenize_in_bracket(&h, &mut LineData::from_str("猫は").unwrap());
         assert_eq!(tokens.len(), 2, "猫は should produce 2 token");
         assert_eq!(tokens[0].token_type, SemanticTokenType::String as u32);
     }
@@ -710,10 +785,11 @@ mod tests {
 
     #[test]
     fn test_bracket_mode_persists_across_tokenize_calls() {
-        // 複数行にまたがる括弧でモードが行をまたいで保持される
+        // 複数行にまたがる括弧で、深さを戻り値で次の行へ引き継ぐ
         let h = Highlighter::new();
-        h.tokenize(&mut LineData::from_str("「猫").unwrap()); // 括弧開 → depth=1
-        let inside = h.tokenize(&mut LineData::from_str("猫は").unwrap()); // 括弧内 → は が "string"
+        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「猫").unwrap(), 0); // 括弧開 → depth=1
+        assert_eq!(d, 1);
+        let (inside, d) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d); // 括弧内 → は が "string"
         // [猫(keyword), は(string)]
         assert_eq!(
             inside.len(),
@@ -725,8 +801,9 @@ mod tests {
             SemanticTokenType::String as u32,
             "助詞 should be string when inside bracket across lines"
         );
-        h.tokenize(&mut LineData::from_str("」").unwrap()); // 括弧閉 → depth=0
-        let outside = h.tokenize(&mut LineData::from_str("猫は").unwrap()); // 括弧外 → は スキップ
+        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d); // 括弧閉 → depth=0
+        assert_eq!(d, 0);
+        let (outside, _) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d); // 括弧外 → は スキップ
         assert_eq!(
             outside.len(),
             0,
@@ -738,25 +815,88 @@ mod tests {
     fn test_nested_brackets_depth() {
         // ネストした括弧でdepthが正しく管理される
         let h = Highlighter::new();
-        h.tokenize(&mut LineData::from_str("「").unwrap()); // depth=1
-        h.tokenize(&mut LineData::from_str("「").unwrap()); // depth=2
-        let inner = h.tokenize(&mut LineData::from_str("猫は").unwrap()); // depth=2 → は=string
+        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「").unwrap(), 0); // depth=1
+        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「").unwrap(), d); // depth=2
+        assert_eq!(d, 2);
+        let (inner, d) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d); // depth=2 → は=string
         assert_eq!(inner.len(), 2, "should be in bracket mode at depth 2");
         assert_eq!(inner[1].token_type, SemanticTokenType::String as u32);
-        h.tokenize(&mut LineData::from_str("」").unwrap()); // depth=1
-        let still_inside = h.tokenize(&mut LineData::from_str("猫は").unwrap()); // depth=1 → は=string
+        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d); // depth=1
+        let (still_inside, d) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d); // depth=1 → は=string
         assert_eq!(
             still_inside.len(),
             2,
             "should still be in bracket mode at depth 1"
         );
         assert_eq!(still_inside[1].token_type, SemanticTokenType::String as u32);
-        h.tokenize(&mut LineData::from_str("」").unwrap()); // depth=0
-        let outside = h.tokenize(&mut LineData::from_str("猫は").unwrap()); // depth=0 → は スキップ
+        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d); // depth=0
+        assert_eq!(d, 0);
+        let (outside, _) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d); // depth=0 → は スキップ
         assert_eq!(
             outside.len(),
             0,
             "should be outside bracket mode at depth 0"
+        );
+    }
+
+    #[test]
+    fn test_ensure_bracket_depth_fast_path_and_fold() {
+        // 全行フォールド後は O(1) 高速パス(キャッシュ値がそのまま返る)。
+        let h = Highlighter::new();
+        let mut lines: Vec<LineData> = ["「セリフ１」", "「セリフ２"]
+            .iter()
+            .map(|s| LineData::from_str(s).unwrap())
+            .collect();
+
+        // 行1(2行目)まで畳み込み: 行0 は閉じて depth=0、行1 は開きっぱなしで depth=1
+        assert_eq!(h.ensure_bracket_depth(&mut lines, 1), 1);
+        assert_eq!(lines[0].bracket_depth_after, Some(0));
+        assert_eq!(lines[1].bracket_depth_after, Some(1));
+
+        // キャッシュ済みなので再要求してもそのまま返る(高速パス)
+        assert_eq!(h.ensure_bracket_depth(&mut lines, 0), 0);
+        assert_eq!(h.ensure_bracket_depth(&mut lines, 1), 1);
+
+        // 行0 の「セリフ１」中身は InBracket、行頭の「と行末の」は Normal(括弧外扱い)
+        assert_eq!(lines[0].tokens.first().unwrap().tag, TokenStatus::Normal);
+        assert!(
+            lines[0]
+                .tokens
+                .iter()
+                .skip(1)
+                .take(lines[0].tokens.len() - 2)
+                .all(|t| t.tag == TokenStatus::InBracket),
+            "{:?}",
+            lines[0].tokens
+        );
+        assert_eq!(lines[0].tokens.last().unwrap().tag, TokenStatus::Normal);
+    }
+
+    #[test]
+    fn test_ensure_bracket_depth_refold_after_invalidation() {
+        // 陳腐化修復: 上方の行が変わって以降のキャッシュが None 化されたとき、
+        // 再フォールドで新しい深さ・タグに更新されること。
+        let h = Highlighter::new();
+        let mut lines: Vec<LineData> = ["こんにちは。", "猫は"]
+            .iter()
+            .map(|s| LineData::from_str(s).unwrap())
+            .collect();
+        assert_eq!(h.ensure_bracket_depth(&mut lines, 1), 0);
+        assert!(lines[1].tokens.iter().all(|t| t.tag == TokenStatus::Normal));
+
+        // 行0 を「こんにちは(開きっぱなし)へ編集 → apply_changes 相当の無効化
+        lines[0] = LineData::from_str("「こんにちは。").unwrap();
+        lines[1].bracket_depth_after = None; // 編集行以降の一括 None クリア相当
+
+        // 再フォールドすると行1 は括弧内になる(タグも InBracket に更新される)
+        assert_eq!(h.ensure_bracket_depth(&mut lines, 1), 1);
+        assert!(
+            lines[1]
+                .tokens
+                .iter()
+                .all(|t| t.tag == TokenStatus::InBracket),
+            "{:?}",
+            lines[1].tokens
         );
     }
 }

@@ -55,26 +55,118 @@ flowchart LR
 
 ## 初期化オプション
 
-Zed 拡張またはクライアント設定から渡される JSON:
+Zed 拡張(`extension/src/lib.rs` の `language_server_initialization_options`)が settings.json の
+**`lsp.fifty-four.initialization_options`** を読み取り、そのまま `initialize` の
+`initializationOptions` として LSP へ渡す。`fifty-four` は `extension/extension.toml` の
+`id`(= Zed 拡張の識別子)と一致させる必要がある。
+
+**重要**: Zed の `LspSettings` は `binary` / `initialization_options` / `settings` という決まったフィールドしか解釈しない。`character_updater` や `llm` を `lsp.fifty-four` 直下に書くと**黙って無視され**、LLM が未初期化のまま補完実行時に `LlmError::NotInitialized` になる。必ず `initialization_options` の下にネストすること。
 
 ```json
 {
-  "character_updater": {
-    "enabled": true,
-    "min_chars": 1000,
-    "max_chars": 5000,
-    "idle_timeout_secs": 180
-  },
-  "llm": {
-    "ondemand": { "provider": "...", "model": "..." },
-    "deferred": { "provider": "...", "model": "..." }
+  "lsp": {
+    "fifty-four": {
+      "binary": {
+        "path": "...",
+        "arguments": [],
+        "env": {}
+      },
+      "initialization_options": {
+        "character_updater": {
+          "enabled": true,
+          "min_chars": 1000,
+          "max_chars": 5000,
+          "idle_timeout_secs": 180
+        },
+        "llm": {
+          "ondemand": { "provider": "...", "model": "..." },
+          "deferred": { "provider": "...", "model": "..." }
+        }
+      }
+    }
   }
 }
 ```
 
-`provider` は `google` / `openai` / `anthropic` / `xai` / `lmstudio` / `cloudflare` のいずれか。任意で `url`（エンドポイント上書き）・`capabilities`（`["structured_output","tool_calling"]`、未指定時はプロバイダ＋モデルから自動導出）を指定できる。
+`binary` / `initialization_options`(とその中の `character_updater` / `llm`)は**いずれも省略可能**。省略時の挙動は各節で説明する。以下、`character_updater` / `llm` の説明はすべて `initialization_options` 内に書く前提とする(節見出しではネストを省略して表記)。
 
-Cloudflare Workers AI を使う場合は `account_id`（Cloudflare アカウントID）が必須。エンドポイントは `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/` として自動組み立てされ、認証は環境変数 `CLOUDFLARE_API_TOKEN` から取得する:
+### `binary`
+
+LSP バイナリの起動コマンドを指示する(Zed 拡張側、`extension/src/lib.rs:20-32` が解釈)。
+
+| フィールド | 必須 | 説明 |
+|---|---|---|
+| `path` | 任意 | LSP 実行ファイルの絶対パス。**省略時**は拡張が (1) PATH 上の `fifty_four_lsp`(Windows は `.exe`)、(2) 拡張の作業ディレクトリ配下を再帰探索、の順にフォールバックする。開発ビルドを都度拾わせたい場合以外は明示指定を推奨(配布 `dist/` 直下に置けば再帰探索でも見つかるが、複数バージョンが混在すると意図しないものを拾う恐れがある) |
+| `arguments` | 任意 | 起動時の追加コマンドライン引数。現状 LSP 側は引数を解釈しないため通常不要 |
+| `env` | 任意 | 起動プロセスへ渡す環境変数。**注意**: settings.json は平文で保存されるため、`GEMINI_API_KEY` 等の API キーをここに書かない。API キーは OS のユーザー環境変数に設定し、Zed を完全再起動して継承させる |
+
+### `character_updater`
+
+バックグラウンドのキャラクター設定自動更新(`character_updater::run`)の発火条件。全フィールド省略可能、省略したフィールドは既定値(`lsp/src/character_updater.rs` の `DEFAULT_MIN_CHARS`=1000 / `DEFAULT_MAX_CHARS`=5000 / `DEFAULT_IDLE_SECS`=180、`enabled` は既定 `true`)を使う。`character_updater` キー自体を省略した場合も同様に全項目デフォルトで動作する。
+
+| フィールド | 既定値 | 説明 |
+|---|---|---|
+| `enabled` | `true` | `false` を明示した場合のみ無効化(`true` や未指定は有効) |
+| `min_chars` | `1000` | 直前の編集バーストが idle 確定した際、この文字数以上蓄積していれば発火 |
+| `max_chars` | `5000` | 編集継続中でもこの文字数に達したら idle を待たず即時発火 |
+| `idle_timeout_secs` | `180` | 編集が止まってからこの秒数経過で「バースト確定」とみなす |
+
+### `llm`
+
+補完(`ondemand`)とキャラ設定更新(`deferred`)それぞれに使う LLM 接続設定。**`llm` キー自体を省略すると両方とも初期化されず**、補完とキャラ設定自動更新は動作しない(セマンティックハイライトなど LLM 非依存の機能には影響しない)。
+
+- `ondemand`: `completion` ハンドラが使う、対話的な補完用。応答速度が UX に直結する。
+- `deferred`: `character_updater::run` が使う、バックグラウンド処理用。多少遅くても良い代わりに `reasoning_level` を高めに設定して精度を優先している(`character_updater.rs`)。
+- `deferred` を省略すると `ondemand` の設定へフォールバックする(warning ログを出力)。フォールバック自体は動作するが、補完用の軽量モデルでキャラ設定更新の推論も行うことになるため、明示設定を推奨。
+- 旧形式互換: `llm` 直下に `{"provider": ..., "model": ...}` をフラットに書いた場合、`ondemand` として解釈される(`deferred` 未指定なら同じ設定にフォールバック)。新規に書く場合は `ondemand`/`deferred` を明示する新形式を使うこと。
+
+各設定オブジェクト(`ondemand`/`deferred`)の共通フィールド:
+
+| フィールド | 必須 | 説明 |
+|---|---|---|
+| `provider` | **必須** | `google` / `openai` / `anthropic` / `xai` / `lmstudio` / `cloudflare` のいずれか |
+| `model` | 任意 | モデル名。省略時はプロバイダごとの既定モデル(例: `openai` → `gpt-5.3`)を使う |
+| `url` | 任意 | API エンドポイントの上書き。指定しなければプロバイダ既定(`lmstudio`/`cloudflare` はプロバイダ側が自動組み立て、他は genai のデフォルト)を使う |
+| `capabilities` | 任意 | `["structured_output", "tool_calling"]` の部分集合。省略時はプロバイダ+モデル名から自動導出(下表参照) |
+
+`capabilities` の自動導出(`llm.rs` の `default_capabilities`):
+
+| provider | 自動導出結果 |
+|---|---|
+| `google` / `openai` / `anthropic` | 常に `structured_output` + `tool_calling`(両対応前提) |
+| `xai` | `tool_calling` のみ |
+| `cloudflare` | モデル名に `instruct`/`hermes`/`qwen`/`mistral` を含む場合のみ `tool_calling`、それ以外は空 |
+| `lmstudio` | 常に空(ローカルモデルは多様なため自動判定しない。構造化出力に対応したモデルを使うなら `capabilities` で明示すること) |
+
+#### provider 別の追加要件(provider + model 以外に必要なもの)
+
+大手クラウド系(`google`/`openai`/`anthropic`/`xai`)は API キーを **OS の環境変数**(settings.json ではなく)から読む。設定漏れの場合は当該プロバイダのみ初期化が失敗する。
+
+| provider | 追加で必要なもの | 環境変数 |
+|---|---|---|
+| `google` | なし(provider + model のみ) | `GEMINI_API_KEY`(`GOOGLE_API_KEY` ではない点に注意) |
+| `openai` | なし | `OPENAI_API_KEY` |
+| `anthropic` | なし | `ANTHROPIC_API_KEY` |
+| `xai` | なし | `XAI_API_KEY` |
+| `lmstudio` | なし(認証不要のローカルサーバ前提)。既定エンドポイントは `http://localhost:1234/v1/`。別ホスト/ポートで動かす場合は `url` を明示 | 不要 |
+| `cloudflare` | `account_id`(Cloudflare アカウントID)が**必須**。未指定でも初期化はエラーにならないが warning が出てエンドポイントが不正になる | `CLOUDFLARE_API_TOKEN` |
+
+例1: LM Studio をリモートホストで動かす場合(`url` を明示、構造化出力対応モデルなら `capabilities` も明示):
+
+```json
+{
+  "llm": {
+    "ondemand": {
+      "provider": "lmstudio",
+      "model": "qwen3.5-2b",
+      "url": "http://192.168.1.50:1234/v1/",
+      "capabilities": ["structured_output"]
+    }
+  }
+}
+```
+
+例2: Cloudflare Workers AI(`account_id` 必須、モデルによっては `capabilities` を明示):
 
 ```json
 {
@@ -89,6 +181,46 @@ Cloudflare Workers AI を使う場合は `account_id`（Cloudflare アカウン�
       "account_id": "＜同上＞",
       "model": "@cf/meta/llama-3.1-8b-instruct",
       "capabilities": ["tool_calling"]
+    }
+  }
+}
+```
+
+例3: クラウド系プロバイダの最小構成(`ondemand`/`deferred` に別モデルを割り当てる典型例。API キーは事前に環境変数へ設定しておく):
+
+```json
+{
+  "llm": {
+    "ondemand": { "provider": "anthropic", "model": "claude-4.6-sonnet" },
+    "deferred": { "provider": "anthropic", "model": "claude-4.6-sonnet" }
+  }
+}
+```
+
+## FiftyFour 言語設定と LSP 起動の最低要件
+
+拡張(`extension/`)は「FiftyFour」という言語を定義し、対応ファイルを開いたときに LSP を自動起動する。
+
+- 言語定義: `extension/languages/fiftyfour/config.toml` の `path_suffixes = ["txt"]`。つまり**現状 `.txt` 拡張子のファイルのみ**が FiftyFour 言語として認識される(`.md` は対象外)。この設定はブラケット(`「」`等)の自動補完ルールも兼ねる。
+- 拡張のマニフェスト: `extension/extension.toml` の `[language_servers.fifty-four] languages = ["FiftyFour"]` が、この言語のファイルを開いたときに `fifty-four` LSP を起動する紐付け。
+- **LSP 起動に絶対必要なもの**はこの2点(拡張機能自体のインストール ＋ `.txt` ファイルを開くこと)のみで、`settings.json` の記述は必須ではない。`lsp.fifty-four.binary.path` を省略しても、拡張は PATH → 作業ディレクトリ再帰探索の順で `fifty_four_lsp(.exe)` を探し、見つかれば起動する(`extension/src/lib.rs:40-67`)。
+- ただし前述の通り `llm` を設定しない場合は補完・キャラ設定自動更新が動かない(LSP 自体は起動し、セマンティックハイライト等は機能する)。実用上の最低構成は次のとおり:
+
+```json
+{
+  "lsp": {
+    "fifty-four": {
+      "binary": { "path": "＜fifty_four_lsp(.exe) の絶対パス＞" },
+      "initialization_options": {
+        "llm": {
+          "ondemand": { "provider": "＜任意＞", "model": "＜任意＞" }
+        }
+      }
+    }
+  },
+  "languages": {
+    "FiftyFour": {
+      "language_servers": ["fifty-four"],
     }
   }
 }

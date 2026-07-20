@@ -5,6 +5,7 @@ use genai::chat::{ChatResponseFormat, JsonSpec};
 #[allow(unused_imports)]
 use log::{debug, error, info, warn};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -431,43 +432,151 @@ fn build_new_section_body(attr: &CharacterAttribute, new_text: &str, char_name: 
     }
 }
 
-fn build_semantic_merge_prompt(
-    char_name: &str,
-    attr_heading: &str,
-    old_body: &str,
-    new_body: &str,
-) -> String {
-    format!(
-        "\
-キャラクター設定の属性セクション本文を、意味が自然につながるようにマージしてください。
+/// バッチマージの1物理セクションぶんのタスク。
+/// 同一物理セクションへ解決される複数の更新項目は `new_body` に "\n" 連結で合流させ、
+/// 「1物理宛先 = 1タスク」を厳守する(後勝ち上書きによるデータ欠損の防止)。
+#[derive(Debug, PartialEq)]
+struct SectionMergeTask {
+    /// 物理セクションの表示見出し(プロンプト表示＆結果突き合わせの echo キー)。
+    heading: String,
+    /// 現在のセクション本文(計画時点のスナップショット、trim 済み)。
+    old_body: String,
+    /// このセクションに合流する新情報(複数 item は "\n" 連結)。
+    new_body: String,
+}
 
-# キャラクター
-{char_name}
+/// キャラ単位のマージ対象グループ。バッチプロンプトの1キャラブロックに対応する。
+#[derive(Debug)]
+struct CharMergeGroup {
+    file: PathBuf,
+    /// プロンプト表示＆echo キー。通常はキャラ見出しキー全文と同一。
+    /// 別ファイル間で見出しが衝突した場合のみ「見出し（ファイル名）」で一意化する。
+    display_name: String,
+    sections: Vec<SectionMergeTask>,
+}
 
-# 属性
-{attr_heading}
+/// バッチマージ結果の JSON スキーマ。
+/// `{"characters": [{"name", "sections": [{"heading", "merged_text"}]}]}` の入れ子で、
+/// name/heading はプロンプトで与えた文字列の復唱を要求する(結果突き合わせキー)。
+fn batch_merge_output_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "characters": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "sections": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "heading": { "type": "string" },
+                                    "merged_text": { "type": "string" }
+                                },
+                                "required": ["heading", "merged_text"]
+                            }
+                        }
+                    },
+                    "required": ["name", "sections"]
+                }
+            }
+        },
+        "required": ["characters"]
+    })
+}
 
-# 現在の設定
-{old_body}
+/// 1キャラぶんのマージ対象をプロンプトのキャラブロックへレンダリングする。
+/// 見出し階層(`##`/`###`/`####`)はテンプレートの「# キャラクター一覧」の下に入れ子になる。
+fn render_char_group(group: &CharMergeGroup) -> String {
+    let mut out = format!("## キャラクター: {}\n", group.display_name);
+    for sec in &group.sections {
+        out.push_str(&format!(
+            "\n### セクション: {}\n\n#### 現在の設定\n{}\n\n#### 新しく本文から読み取れた情報\n{}\n",
+            sec.heading,
+            sec.old_body.trim(),
+            sec.new_body.trim()
+        ));
+    }
+    out
+}
 
-# 新しく本文から読み取れた情報
-{new_body}
+/// バッチマージ用プロンプトを `data/prompt_semantic_merge_batch.md` から読み込み、
+/// `{{CHARACTERS}}` に全キャラブロックを埋めて返す。テンプレートを読めなければ `None`。
+fn build_batch_merge_prompt(groups: &[CharMergeGroup]) -> Option<String> {
+    let (template, _) = crate::load_prompt("prompt_semantic_merge_batch.md")?;
+    let characters = groups
+        .iter()
+        .map(render_char_group)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(template.replace("{{CHARACTERS}}", &characters))
+}
 
-# 出力ルール
-- 出力はマージ後の属性セクション本文のみ。見出し、説明、JSON、コードフェンスは出力しない。
-- 行頭に属性名のラベル(「口調：」「呼称：」等)を付けない。見出しで既に示されているため不要。
-- 「マージ後の文章：」のような、これから本文を書くことを説明する前置きも一切付けない。1行目からいきなり本文を書き始めること。
-  - 悪い例: 「マージ後の文章：\n落ち着いた性格。」
-  - 良い例: 「落ち着いた性格。」
-- 現在の設定をベースにし、消えていない既存情報は保持する。
-- 新情報が既存情報と同じ意味なら重複させず、より自然な一文または箇条書きに統合する。
-- 新情報が既存情報と矛盾・更新関係にある場合は、両方を機械的に並べず、矛盾しない表現へ合成する。必要なら「以前は」「現在は」「普段は」「状況によって」などの限定を使う。
-- 本文から読み取れない内容を推測で追加しない。
-- 既存の Markdown 箇条書きスタイルをできるだけ維持する。
-",
-        old_body = old_body.trim(),
-        new_body = new_body.trim(),
-    )
+/// バッチマージ応答をパースし、`(name, heading) -> merged_text` のマップを返す。
+/// 各 `merged_text` にはコードフェンス除去・前置きラベル除去を適用する。
+/// パース不能・スキーマ不一致の要素は黙って読み飛ばす(欠落分は呼び出し側で old 維持)。
+fn extract_batch_merges(raw: &str) -> HashMap<(String, String), String> {
+    let mut out = HashMap::new();
+    let Some(json) = extract_json(raw) else {
+        return out;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(json) else {
+        return out;
+    };
+    let Some(arr) = v.get("characters").and_then(|x| x.as_array()) else {
+        return out;
+    };
+    for ch in arr {
+        let Some(name) = ch.get("name").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        let Some(secs) = ch.get("sections").and_then(|x| x.as_array()) else {
+            continue;
+        };
+        for sec in secs {
+            let Some(heading) = sec.get("heading").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let Some(text) = sec.get("merged_text").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let cleaned = strip_merge_preamble(&sanitize_merged_section_text(text));
+            out.insert(
+                (name.trim().to_string(), heading.trim().to_string()),
+                cleaned,
+            );
+        }
+    }
+    out
+}
+
+/// バッチ結果マップから (display_name, heading) の結果を引く。
+/// 完全一致で見つからない場合、同名キャラ内で返却見出しを属性正規化して突き合わせる
+/// (LLM が「性格・口調」を「性格」へ縮めて復唱したケースの救済)。
+/// 候補が複数(曖昧)・皆無なら `None`(呼び出し側で old 維持=書かない)。
+fn lookup_merged<'a>(
+    merged: &'a HashMap<(String, String), String>,
+    display_name: &str,
+    heading: &str,
+    attr: &CharacterAttribute,
+) -> Option<&'a str> {
+    if let Some(m) = merged.get(&(display_name.to_string(), heading.to_string())) {
+        return Some(m.as_str());
+    }
+    let mut candidates = merged.iter().filter(|((n, h), _)| {
+        n == display_name
+            && h.split(['・', '、', ',', '/', ' '])
+                .filter_map(|s| CharacterAttribute::try_from(s).ok())
+                .any(|a| a == *attr)
+    });
+    let first = candidates.next();
+    match (first, candidates.next()) {
+        (Some((_, m)), None) => Some(m.as_str()),
+        _ => None,
+    }
 }
 
 fn sanitize_merged_section_text(response: &str) -> String {
@@ -521,66 +630,6 @@ fn strip_merge_preamble(text: &str) -> String {
     } else {
         text.to_string()
     }
-}
-
-/// マージ結果の JSON スキーマ(`{"merged_text": "..."}`)。
-/// structured output 対応モデルに使わせ、前置き混入を構造的に防ぐ。
-fn merge_output_schema() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "merged_text": { "type": "string" }
-        },
-        "required": ["merged_text"]
-    })
-}
-
-/// LLM の生応答からマージ後本文を取り出す。
-/// structured output で `{"merged_text": "..."}` が返っていればそれを使い、
-/// そうでなければ従来通り生テキストとして扱う(コードフェンス・前置きラベルを除去)。
-fn extract_merged_text(raw: &str) -> String {
-    if let Some(json_part) = extract_json(raw)
-        && let Ok(v) = serde_json::from_str::<Value>(json_part)
-        && let Some(s) = v.get("merged_text").and_then(|v| v.as_str())
-    {
-        return strip_merge_preamble(&sanitize_merged_section_text(s));
-    }
-    strip_merge_preamble(&sanitize_merged_section_text(raw))
-}
-
-async fn merge_section_text_semantically(
-    llm_client: &mut dyn LlmInterface,
-    char_name: &str,
-    attribute: &CharacterAttribute,
-    old_body: &str,
-    new_body: &str,
-) -> Result<Option<String>, crate::llm::LlmError> {
-    if new_body.trim().is_empty() {
-        return Ok(None);
-    }
-
-    let prompt =
-        build_semantic_merge_prompt(char_name, attribute.canonical_heading(), old_body, new_body);
-    llm_client.temperature(0.2);
-    llm_client.max_tokens(2048);
-    llm_client.reasoning_level(0.0);
-    if llm_client
-        .capabilities()
-        .contains(ModelCapability::STRUCTURED_OUTPUT)
-    {
-        llm_client.response_format(ChatResponseFormat::JsonSpec(JsonSpec::new(
-            "merged_section",
-            merge_output_schema(),
-        )));
-    }
-    llm_client.add(Content::Text(prompt));
-    let merged = extract_merged_text(&llm_client.chat().await?);
-
-    if merged.trim().is_empty() || merged.trim() == old_body.trim() {
-        return Ok(None);
-    }
-
-    Ok(Some(merged))
 }
 
 /// `run` タスクが完了・中断・panic したとき確実に `running = false` に戻す Drop ガード。
@@ -790,25 +839,199 @@ async fn collect_character_files(workspace: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// 正規化済みの更新項目列を characters/*.md に差し替え・追記・新規作成として適用する。
-/// `char_files` は値で受け取り、新規作成したファイルを push する
-/// (同一レスポンス内の後続 item が同じキャラの別属性を追記できるよう)。
-async fn apply_updates(
-    updates: &[UpdateItem],
-    update_id: i64,
-    mut char_files: Vec<PathBuf>,
-    workspace: &Path,
-    recorder: &FlightRecorder,
-    llm_client: &mut dyn LlmInterface,
+/// 宛先の物理セクションを一意に識別するキー(解決後セクション同一性)。
+/// 属性シノニム(「性格」/"personality")や多タグ見出し(「性格・口調」)は
+/// 同じ `sec_idx` に解決されるため、このキーで自然に1宛先へ合流する。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SectionKey {
+    file: PathBuf,
+    char_heading: String,
+    sec_idx: usize,
+}
+
+/// FlightRecorder へ item 単位で記録するために保持する、正規化済みの元更新項目。
+#[derive(Debug, Clone)]
+struct RecordInfo {
+    name: String,
+    attr_str: String,
+    new_text: String,
+}
+
+/// 計画フェーズが確定する、書き込み高々1回ぶんの解決済み操作。
+/// 同一物理宛先への複数の更新項目は必ず1つの操作へ合流させる
+/// (適用時の後勝ち上書きによるデータ欠損を構造的に防ぐ。Skip は書き込まないので対象外)。
+#[derive(Debug)]
+enum ResolvedOp {
+    /// 既存の非 Alias セクションへの意味マージ差し替え。マージ本文はバッチ結果マップを `key` で引く。
+    Merge {
+        file: PathBuf,
+        section_name: String,
+        attr: CharacterAttribute,
+        /// (display_name, セクション見出し) の echo キー。
+        key: (String, String),
+        old_body: String,
+        records: Vec<RecordInfo>,
+    },
+    /// 既存 Alias セクションの決定的マージ差し替え(本文は計画時点で確定済み)。
+    ReplaceAlias {
+        file: PathBuf,
+        section_name: String,
+        old: String,
+        merged: String,
+        records: Vec<RecordInfo>,
+    },
+    /// 既存キャラへの新規属性セクション追記。
+    AppendSection {
+        file: PathBuf,
+        section_name: String,
+        heading: &'static str,
+        body: String,
+        records: Vec<RecordInfo>,
+    },
+    /// 単一ファイル形式への新規キャラブロック追記(全属性を1ブロックへ集約)。
+    AppendCharacter {
+        file: PathBuf,
+        name: String,
+        sections: Vec<(&'static str, String)>,
+        records: Vec<RecordInfo>,
+    },
+    /// フォルダ形式の新規キャラファイル作成(全属性を集約)。
+    CreateFile {
+        name: String,
+        sections: Vec<(&'static str, String)>,
+        records: Vec<RecordInfo>,
+    },
+    /// 変更なし・解決不能などの確定スキップ(recorder に記録するだけで書き込まない)。
+    Skip {
+        record: RecordInfo,
+        note: &'static str,
+        old: Option<String>,
+    },
+}
+
+/// 物理セクションの表示見出しをタグ列から再構成する(「性格・口調」等)。
+/// `TaggedContent` は元見出し文字列を保持しないため canonical_heading の「・」結合で代用する。
+/// echo キーは「こちらが与えた文字列との往復一致」だけが要件なので、原文一致は不要。
+fn section_display_heading(tags: &[CharacterAttribute]) -> String {
+    tags.iter()
+        .map(|t| t.canonical_heading())
+        .collect::<Vec<_>>()
+        .join("・")
+}
+
+/// 未解決(新規)キャラへの更新を、同一キャラにつき1つの CreateFile/AppendCharacter へ集約する。
+/// 既出の新規キャラ名が今回の name を含む場合(「ジェフ・クライン」に対する「ジェフ」)も
+/// 同一キャラとみなし、逐次適用時の見出し部分一致と挙動を揃える。
+fn merge_into_new(
+    plan: &mut Vec<ResolvedOp>,
+    new_chars: &mut Vec<(Option<PathBuf>, String, usize)>,
+    scope: Option<PathBuf>,
+    name: &str,
+    attr: &CharacterAttribute,
+    new_text: &str,
+    rec: RecordInfo,
 ) {
-    debug!("character_updater: {} update(s) received", updates.len());
+    let existing = new_chars
+        .iter()
+        .find(|(s, n, _)| *s == scope && n.contains(name))
+        .map(|&(_, _, op_idx)| op_idx);
+
+    let Some(op_idx) = existing else {
+        match build_new_section_body(attr, new_text, name) {
+            Some(body) => {
+                let sections = vec![(attr.canonical_heading(), body)];
+                let op = match &scope {
+                    Some(f) => ResolvedOp::AppendCharacter {
+                        file: f.clone(),
+                        name: name.to_string(),
+                        sections,
+                        records: vec![rec],
+                    },
+                    None => ResolvedOp::CreateFile {
+                        name: name.to_string(),
+                        sections,
+                        records: vec![rec],
+                    },
+                };
+                plan.push(op);
+                new_chars.push((scope, name.to_string(), plan.len() - 1));
+            }
+            None => plan.push(ResolvedOp::Skip {
+                record: rec,
+                note: "no change",
+                old: None,
+            }),
+        }
+        return;
+    };
+
+    // 既出の新規キャラ op へ合流。同属性セクションが既にあれば本文へ連結する
+    // (plan[op_idx] を可変借用中は plan.push できないため、Skip はフラグ経由で後から積む)。
+    let mut skip_rec: Option<RecordInfo> = None;
+    if let ResolvedOp::AppendCharacter { sections, records, .. }
+    | ResolvedOp::CreateFile { sections, records, .. } = &mut plan[op_idx]
+    {
+        match sections
+            .iter_mut()
+            .find(|(h, _)| *h == attr.canonical_heading())
+        {
+            Some((_, body)) => {
+                let addition = if *attr == CharacterAttribute::Alias {
+                    merge_alias_bodies(body, new_text, name)
+                } else {
+                    Some(format!("{}\n{}", body, new_text))
+                };
+                match addition {
+                    Some(b) => {
+                        *body = b;
+                        records.push(rec);
+                    }
+                    None => skip_rec = Some(rec),
+                }
+            }
+            None => match build_new_section_body(attr, new_text, name) {
+                Some(b) => {
+                    sections.push((attr.canonical_heading(), b));
+                    records.push(rec);
+                }
+                None => skip_rec = Some(rec),
+            },
+        }
+    }
+    if let Some(record) = skip_rec {
+        plan.push(ResolvedOp::Skip {
+            record,
+            note: "no change",
+            old: None,
+        });
+    }
+}
+
+/// (A) 計画フェーズ: 生の更新項目列を、解決済み操作の列とバッチマージ対象グループへ変換する。
+/// ファイル内容は `snapshots`(計画時点のスナップショット)から読み、LLM は呼ばない純関数。
+/// キャラ・属性の解決はここで1度だけ確定し、適用フェーズでは再判定しない。
+fn plan_updates(
+    updates: &[UpdateItem],
+    char_files: &[PathBuf],
+    snapshots: &HashMap<PathBuf, String>,
+) -> (Vec<ResolvedOp>, Vec<CharMergeGroup>) {
+    let mut plan: Vec<ResolvedOp> = Vec::new();
+    let mut groups: Vec<CharMergeGroup> = Vec::new();
+
+    let mut parsed: HashMap<PathBuf, HashMap<String, crate::CharacterEntry>> = HashMap::new();
+    // 合流用インデックス群。値は plan / groups 内の位置。
+    let mut merge_by_section: HashMap<SectionKey, (usize, usize, usize)> = HashMap::new(); // (group, sec, op)
+    let mut alias_by_section: HashMap<SectionKey, usize> = HashMap::new();
+    let mut append_by_attr: HashMap<(PathBuf, String, &'static str), usize> = HashMap::new();
+    let mut group_by_char: HashMap<(PathBuf, String), usize> = HashMap::new();
+    // 新規キャラは見出しの contains 一致で合流させるため線形走査のリストを使う
+    let mut new_chars: Vec<(Option<PathBuf>, String, usize)> = Vec::new();
 
     for item in updates {
         let name = item.name.as_str();
         let attr_str = item.attribute.as_str();
-
         debug!(
-            "character_updater: processing update name={:?} attribute={:?} text={}",
+            "character_updater: planning update name={:?} attribute={:?} text={}",
             name,
             attr_str,
             shorten_middle(item.text.as_str(), 40)
@@ -821,270 +1044,671 @@ async fn apply_updates(
                     "character_updater: unknown attribute {:?} for {:?}, skip",
                     attr_str, name
                 );
-                recorder.record_character_section(
-                    update_id,
-                    name,
-                    attr_str,
-                    None,
-                    item.text.as_str(),
-                    false,
-                    Some("unknown attribute"),
-                );
+                plan.push(ResolvedOp::Skip {
+                    record: RecordInfo {
+                        name: item.name.clone(),
+                        attr_str: item.attribute.clone(),
+                        new_text: item.text.clone(),
+                    },
+                    note: "unknown attribute",
+                    old: None,
+                });
                 continue;
             }
         };
 
-        // 抽出/マージ LLM が誤って先頭に付与した属性ラベル(「口調：」等)を取り除く。
-        let new_text_owned = strip_attribute_label(item.text.as_str(), &attr);
-        let new_text = new_text_owned.as_str();
+        // 抽出 LLM が誤って先頭に付与した属性ラベル(「口調：」等)を取り除く。
+        let new_text = strip_attribute_label(item.text.as_str(), &attr);
+        let rec = RecordInfo {
+            name: item.name.clone(),
+            attr_str: item.attribute.clone(),
+            new_text: new_text.clone(),
+        };
 
-        // 対応ファイルを探す(このターンで新規作成したファイルも char_files に含まれる)
-        let target_file = find_character_file(&char_files, name).cloned();
+        // 対応ファイルを探す(見つからなければフォルダ形式の新規キャラとして集約)
+        let Some(file) = find_character_file(char_files, name).cloned() else {
+            merge_into_new(&mut plan, &mut new_chars, None, name, &attr, &new_text, rec);
+            continue;
+        };
+        let Some(content) = snapshots.get(&file) else {
+            plan.push(ResolvedOp::Skip {
+                record: rec,
+                note: "failed to read character file",
+                old: None,
+            });
+            continue;
+        };
+        let chars = parsed
+            .entry(file.clone())
+            .or_insert_with(|| parse_all_content(content));
+        // 見出しの部分一致に加え、登録済み aliases との完全一致でも同一人物と判定する
+        // (LLM が別呼称で返してきた場合の重複登録を防ぐ)。
+        let found = chars
+            .iter()
+            .find(|(k, entry)| k.contains(name) || entry.aliases.iter().any(|a| a == name))
+            .map(|(k, entry)| (k.clone(), entry.clone()));
 
-        if let Some(file_path) = target_file {
-            // ---- 既存ファイルへの操作 ----
-            let file_content = match tokio::fs::read_to_string(&file_path).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(
-                        "character_updater: failed to read character file {:?}: {}",
-                        file_path, e
-                    );
-                    recorder.record_character_section(
-                        update_id,
-                        name,
-                        attr_str,
-                        None,
-                        new_text,
-                        false,
-                        Some("failed to read character file"),
-                    );
-                    continue;
-                }
-            };
+        let Some((heading, entry)) = found else {
+            // 単一ファイル形式の新規キャラ
+            merge_into_new(
+                &mut plan,
+                &mut new_chars,
+                Some(file.clone()),
+                name,
+                &attr,
+                &new_text,
+                rec,
+            );
+            continue;
+        };
 
-            let chars = parse_all_content(&file_content);
-            // 見出しの部分一致に加え、登録済み aliases との完全一致でも同一人物と判定する
-            // (LLM が別呼称で返してきた場合の重複登録を防ぐ)。
-            let char_entry = chars
-                .iter()
-                .find(|(k, entry)| k.contains(name) || entry.aliases.iter().any(|a| a == name));
-
-            let (old_text_opt, new_content_opt): (Option<String>, Option<String>) = match char_entry
-            {
-                Some((heading, entry)) => {
-                    // キャラ見出しが存在する。alias 経由で一致した場合に備え、
-                    // セクション操作には見出しキー全文を使う(見出しは自分自身を contains する)。
-                    let section_name = heading.as_str();
-                    if let Some(sec) = entry.sections.iter().find(|s| s.tags.contains(&attr)) {
-                        // 既存属性セクション → マージ
-                        // Alias(呼称)は名前の列挙なので LLM 意味マージを使わず、
-                        // 決定的な箇条書きマージ(merge_alias_bodies)で崩れを防ぐ。
-                        let old = sec.text.trim().to_string();
-                        let merge_result: Result<Option<String>, crate::llm::LlmError> =
-                            if attr == CharacterAttribute::Alias {
-                                Ok(merge_alias_bodies(&old, new_text, name))
-                            } else {
-                                merge_section_text_semantically(llm_client, name, &attr, &old, new_text)
-                                    .await
-                            };
-                        let merged = match merge_result {
-                            Ok(Some(merged)) => merged,
-                            Ok(None) => {
-                                debug!(
-                                    "character_updater: {}/{} no change to merge, skip",
-                                    name, attr_str
-                                );
-                                recorder.record_character_section(
-                                    update_id,
-                                    name,
-                                    attr_str,
-                                    Some(&old),
-                                    new_text,
-                                    false,
-                                    Some("no change"),
-                                );
-                                continue;
-                            }
-                            Err(e) => {
-                                error!("character_updater: semantic merge failed: {}", e);
-                                recorder.record_character_section(
-                                    update_id,
-                                    name,
-                                    attr_str,
-                                    Some(&old),
-                                    new_text,
-                                    false,
-                                    Some("semantic merge failed"),
-                                );
-                                continue;
-                            }
-                        };
-                        // 意味マージ LLM がラベルを付けてきた場合の保険(Alias は既に箇条書きなので不要)。
-                        let merged = if attr == CharacterAttribute::Alias {
-                            merged
-                        } else {
-                            strip_attribute_label(&merged, &attr)
-                        };
-                        match replace_section(&file_content, section_name, &attr, &merged) {
-                            Some(c) => (Some(old), Some(c)),
-                            None => {
-                                warn!(
-                                    "character_updater: replace_section failed for {}/{}",
-                                    name, attr_str
-                                );
-                                recorder.record_character_section(
-                                    update_id,
-                                    name,
-                                    attr_str,
-                                    Some(&old),
-                                    new_text,
-                                    false,
-                                    Some("replace_section failed"),
-                                );
-                                continue;
-                            }
-                        }
+        let Some(sec_idx) = entry.sections.iter().position(|s| s.tags.contains(&attr)) else {
+            // 属性セクション未存在 → 追記(同一キャラ×属性の2件目以降は本文へ合流)
+            let akey = (file.clone(), heading.clone(), attr.canonical_heading());
+            if let Some(&op_idx) = append_by_attr.get(&akey) {
+                let mut skip_rec: Option<RecordInfo> = None;
+                if let ResolvedOp::AppendSection { body, records, .. } = &mut plan[op_idx] {
+                    let addition = if attr == CharacterAttribute::Alias {
+                        merge_alias_bodies(body, &new_text, name)
                     } else {
-                        // 属性セクションが未存在 → 追記(Alias は箇条書きへ正規化)
-                        let Some(body) = build_new_section_body(&attr, new_text, name) else {
-                            debug!(
-                                "character_updater: {}/{} no aliases to add, skip",
-                                name, attr_str
-                            );
-                            recorder.record_character_section(
-                                update_id,
-                                name,
-                                attr_str,
-                                None,
-                                new_text,
-                                false,
-                                Some("no change"),
-                            );
-                            continue;
-                        };
-                        match append_attribute_section(
-                            &file_content,
-                            section_name,
-                            attr.canonical_heading(),
-                            &body,
-                        ) {
-                            Some(c) => (None, Some(c)),
-                            None => {
-                                warn!(
-                                    "character_updater: append_attribute_section failed for {}/{}",
-                                    name, attr_str
-                                );
-                                recorder.record_character_section(
-                                    update_id,
-                                    name,
-                                    attr_str,
-                                    None,
-                                    new_text,
-                                    false,
-                                    Some("append_attribute_section failed"),
-                                );
-                                continue;
-                            }
+                        Some(format!("{}\n{}", body, new_text))
+                    };
+                    match addition {
+                        Some(b) => {
+                            *body = b;
+                            records.push(rec);
                         }
+                        None => skip_rec = Some(rec),
                     }
                 }
-                None => {
-                    // 単一ファイル形式の新規キャラ → キャラブロックを末尾追記(Alias は箇条書きへ正規化)
-                    let Some(body) = build_new_section_body(&attr, new_text, name) else {
+                if let Some(record) = skip_rec {
+                    plan.push(ResolvedOp::Skip {
+                        record,
+                        note: "no change",
+                        old: None,
+                    });
+                }
+            } else {
+                match build_new_section_body(&attr, &new_text, name) {
+                    Some(body) => {
+                        plan.push(ResolvedOp::AppendSection {
+                            file: file.clone(),
+                            section_name: heading.clone(),
+                            heading: attr.canonical_heading(),
+                            body,
+                            records: vec![rec],
+                        });
+                        append_by_attr.insert(akey, plan.len() - 1);
+                    }
+                    None => {
                         debug!(
                             "character_updater: {}/{} no aliases to add, skip",
                             name, attr_str
                         );
-                        recorder.record_character_section(
-                            update_id,
-                            name,
-                            attr_str,
-                            None,
-                            new_text,
-                            false,
-                            Some("no change"),
+                        plan.push(ResolvedOp::Skip {
+                            record: rec,
+                            note: "no change",
+                            old: None,
+                        });
+                    }
+                }
+            }
+            continue;
+        };
+
+        // 既存属性セクションが存在 → マージ対象
+        let skey = SectionKey {
+            file: file.clone(),
+            char_heading: heading.clone(),
+            sec_idx,
+        };
+        let old = entry.sections[sec_idx].text.trim().to_string();
+
+        if attr == CharacterAttribute::Alias {
+            // Alias(呼称)は名前の列挙なので LLM 意味マージを使わず決定的にマージする。
+            // 同一物理セクションに非 Alias のマージが既に立っている稀ケースは
+            // 安全側でスキップする(1宛先1書き込みの不変条件を守る)。
+            if merge_by_section.contains_key(&skey) {
+                plan.push(ResolvedOp::Skip {
+                    record: rec,
+                    note: "conflicting section op",
+                    old: Some(old),
+                });
+                continue;
+            }
+            if let Some(&op_idx) = alias_by_section.get(&skey) {
+                let current = match &plan[op_idx] {
+                    ResolvedOp::ReplaceAlias { merged, .. } => merged.clone(),
+                    _ => old.clone(),
+                };
+                match merge_alias_bodies(&current, &new_text, name) {
+                    Some(m) => {
+                        if let ResolvedOp::ReplaceAlias { merged, records, .. } =
+                            &mut plan[op_idx]
+                        {
+                            *merged = m;
+                            records.push(rec);
+                        }
+                    }
+                    None => plan.push(ResolvedOp::Skip {
+                        record: rec,
+                        note: "no change",
+                        old: Some(current),
+                    }),
+                }
+            } else {
+                match merge_alias_bodies(&old, &new_text, name) {
+                    Some(m) => {
+                        plan.push(ResolvedOp::ReplaceAlias {
+                            file: file.clone(),
+                            section_name: heading.clone(),
+                            old: old.clone(),
+                            merged: m,
+                            records: vec![rec],
+                        });
+                        alias_by_section.insert(skey, plan.len() - 1);
+                    }
+                    None => {
+                        debug!(
+                            "character_updater: {}/{} no change to merge, skip",
+                            name, attr_str
                         );
-                        continue;
-                    };
-                    let c = append_new_character(&file_content, name, attr.canonical_heading(), &body);
-                    (None, Some(c))
+                        plan.push(ResolvedOp::Skip {
+                            record: rec,
+                            note: "no change",
+                            old: Some(old),
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
+        // 非 Alias → バッチマージタスクへ合流
+        if alias_by_section.contains_key(&skey) {
+            plan.push(ResolvedOp::Skip {
+                record: rec,
+                note: "conflicting section op",
+                old: Some(old),
+            });
+            continue;
+        }
+        if let Some(&(gi, si, op_idx)) = merge_by_section.get(&skey) {
+            groups[gi].sections[si].new_body.push('\n');
+            groups[gi].sections[si].new_body.push_str(&new_text);
+            if let ResolvedOp::Merge { records, .. } = &mut plan[op_idx] {
+                records.push(rec);
+            }
+        } else {
+            let gi = match group_by_char.get(&(file.clone(), heading.clone())) {
+                Some(&gi) => gi,
+                None => {
+                    // 別ファイル間で見出しが衝突した場合のみ「見出し（ファイル名）」で echo キーを一意化
+                    let mut display = heading.clone();
+                    if groups
+                        .iter()
+                        .any(|g| g.display_name == display && g.file != file)
+                    {
+                        let stem = file
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        display = format!("{}（{}）", heading, stem);
+                    }
+                    groups.push(CharMergeGroup {
+                        file: file.clone(),
+                        display_name: display,
+                        sections: Vec::new(),
+                    });
+                    group_by_char.insert((file.clone(), heading.clone()), groups.len() - 1);
+                    groups.len() - 1
                 }
             };
+            let sec_heading = section_display_heading(&entry.sections[sec_idx].tags);
+            groups[gi].sections.push(SectionMergeTask {
+                heading: sec_heading.clone(),
+                old_body: old.clone(),
+                new_body: new_text.clone(),
+            });
+            plan.push(ResolvedOp::Merge {
+                file: file.clone(),
+                section_name: heading.clone(),
+                attr,
+                key: (groups[gi].display_name.clone(), sec_heading),
+                old_body: old,
+                records: vec![rec],
+            });
+            merge_by_section.insert(skey, (gi, groups[gi].sections.len() - 1, plan.len() - 1));
+        }
+    }
 
-            if let Some(content) = new_content_opt {
-                match tokio::fs::write(&file_path, format_markdown(&content)).await {
-                    Ok(_) => {
-                        info!("character_updater: updated {}/{}", name, attr_str);
-                        recorder.record_character_section(
-                            update_id,
-                            name,
-                            attr_str,
-                            old_text_opt.as_deref(),
-                            new_text,
-                            true,
-                            None,
-                        );
-                    }
+    (plan, groups)
+}
+
+/// (B) バッチマージ: 全キャラのマージ対象を1回の LLM 呼び出しで処理し、
+/// `(display_name, heading) -> merged_text` の結果マップを返す。
+/// 応答から期待キーが1件も引けない場合のみ、抽出フェーズと同様に1回だけ修正を要求する
+/// (部分欠落は全体リトライせず、適用フェーズで個別に old 維持へフォールバックする)。
+async fn run_batch_merge(
+    llm_client: &mut dyn LlmInterface,
+    groups: &[CharMergeGroup],
+) -> Result<HashMap<(String, String), String>, crate::llm::LlmError> {
+    let prompt =
+        build_batch_merge_prompt(groups).ok_or_else(|| crate::llm::LlmError::GenericError {
+            message: "prompt_semantic_merge_batch.md を読み込めませんでした".to_string(),
+        })?;
+    let schema_str = batch_merge_output_schema().to_string();
+    let structured = llm_client
+        .capabilities()
+        .contains(ModelCapability::STRUCTURED_OUTPUT);
+    // 出力上限はセクション数に比例させる(固定値だと複数タスクで途中切れする)
+    let total_sections: usize = groups.iter().map(|g| g.sections.len()).sum();
+    let max_tokens = (512 + 512 * total_sections as u32).min(8192);
+
+    // chat() がオプションをリセットするため、初回・リトライの両方で設定する
+    let set_llm_options = |llm_client: &mut dyn LlmInterface| {
+        llm_client.temperature(0.2);
+        llm_client.max_tokens(max_tokens);
+        llm_client.reasoning_level(0.0);
+        if structured {
+            llm_client.response_format(ChatResponseFormat::JsonSpec(JsonSpec::new(
+                "batch_merged_sections",
+                batch_merge_output_schema(),
+            )));
+        }
+    };
+
+    set_llm_options(llm_client);
+    if !structured {
+        llm_client.add(Content::Text(format!(
+            "回答は次のJSON schemaに厳密にしたがって生成せよ。\n\nJSON Schema:\n{}\n\n最終応答はスキーマに適合するJSONのみを出力し、JSON以外の文字は一切含めないこと。",
+            schema_str
+        )));
+    }
+    llm_client.add(Content::Text(prompt));
+    let resp = llm_client.chat().await?;
+    debug!(
+        "character_updater: batch merge response received :{}",
+        resp
+    );
+    let mut merged = extract_batch_merges(&resp);
+
+    // 全滅判定: 期待キーが1件も引けない応答はスキーマ不適合とみなす
+    let any_hit = |m: &HashMap<(String, String), String>| {
+        groups.iter().any(|g| {
+            g.sections
+                .iter()
+                .any(|s| m.contains_key(&(g.display_name.clone(), s.heading.clone())))
+        })
+    };
+    if !any_hit(&merged) {
+        warn!("character_updater: batch merge response does not conform to schema, retrying once");
+        set_llm_options(llm_client);
+        llm_client.add(Content::Text(format!(
+            "以下はスキーマに適合しない不正な応答である。JSON schemaに厳密に適合するJSONへ修正して出力し直せ。JSON以外の文字は一切含めないこと。\n\nJSON Schema:\n{}\n\n不正な応答:\n{}",
+            schema_str, resp
+        )));
+        match llm_client.chat().await {
+            Ok(retry_resp) => {
+                debug!(
+                    "character_updater: batch merge retry response received :{}",
+                    retry_resp
+                );
+                merged = extract_batch_merges(&retry_resp);
+            }
+            Err(e) => error!("character_updater: batch merge retry failed: {}", e),
+        }
+    }
+    Ok(merged)
+}
+
+/// records 内の全 item を同一の結果で FlightRecorder へ記録する。
+fn record_all(
+    recorder: &FlightRecorder,
+    update_id: i64,
+    records: &[RecordInfo],
+    old: Option<&str>,
+    success: bool,
+    note: Option<&str>,
+) {
+    for r in records {
+        recorder.record_character_section(
+            update_id,
+            &r.name,
+            &r.attr_str,
+            old,
+            &r.new_text,
+            success,
+            note,
+        );
+    }
+}
+
+/// Markdown を整形して書き込み、records 全件の成否を記録する。
+async fn write_and_record(
+    file: &Path,
+    content: &str,
+    update_id: i64,
+    records: &[RecordInfo],
+    old: Option<&str>,
+    recorder: &FlightRecorder,
+) {
+    match tokio::fs::write(file, format_markdown(content)).await {
+        Ok(_) => {
+            for r in records {
+                info!("character_updater: updated {}/{}", r.name, r.attr_str);
+            }
+            record_all(recorder, update_id, records, old, true, None);
+        }
+        Err(e) => {
+            error!("character_updater: failed to write {:?}: {}", file, e);
+            record_all(recorder, update_id, records, old, false, Some("write failed"));
+        }
+    }
+}
+
+/// (C) 適用フェーズ: 解決済み操作を逐次適用する。
+/// 各操作は書き込み直前にファイルを読み直す(read-fresh)ため、同一ファイル内の
+/// 先行書き込みと合成される(replace_section は対象セクションの行区間のみ差し替えるので
+/// 他セクションへの書き込みとは干渉しない)。
+/// `merged_map` が `None` の場合はバッチマージ自体が失敗している(全 Merge を old 維持で記録)。
+async fn apply_plan(
+    plan: Vec<ResolvedOp>,
+    merged_map: Option<&HashMap<(String, String), String>>,
+    update_id: i64,
+    workspace: &Path,
+    recorder: &FlightRecorder,
+) {
+    for op in plan {
+        match op {
+            ResolvedOp::Skip { record, note, old } => {
+                debug!(
+                    "character_updater: {}/{} skip: {}",
+                    record.name, record.attr_str, note
+                );
+                recorder.record_character_section(
+                    update_id,
+                    &record.name,
+                    &record.attr_str,
+                    old.as_deref(),
+                    &record.new_text,
+                    false,
+                    Some(note),
+                );
+            }
+            ResolvedOp::Merge {
+                file,
+                section_name,
+                attr,
+                key,
+                old_body,
+                records,
+            } => {
+                let looked = merged_map.and_then(|m| lookup_merged(m, &key.0, &key.1, &attr));
+                let Some(m) = looked else {
+                    // マージ結果が不確定なら書かない(old 維持)。
+                    let note = if merged_map.is_some() {
+                        "merge missing"
+                    } else {
+                        "semantic merge failed"
+                    };
+                    warn!(
+                        "character_updater: no batch merge result for {}/{}, keep old",
+                        key.0, key.1
+                    );
+                    record_all(recorder, update_id, &records, Some(&old_body), false, Some(note));
+                    continue;
+                };
+                // 意味マージ LLM がラベルを付けてきた場合の保険。
+                let m = strip_attribute_label(m, &attr);
+                if m.trim().is_empty() || m.trim() == old_body.trim() {
+                    debug!(
+                        "character_updater: {}/{} no change to merge, skip",
+                        key.0, key.1
+                    );
+                    record_all(
+                        recorder,
+                        update_id,
+                        &records,
+                        Some(&old_body),
+                        false,
+                        Some("no change"),
+                    );
+                    continue;
+                }
+                let content = match tokio::fs::read_to_string(&file).await {
+                    Ok(c) => c,
                     Err(e) => {
-                        error!("character_updater: failed to write {:?}: {}", file_path, e);
-                        recorder.record_character_section(
+                        warn!(
+                            "character_updater: failed to read character file {:?}: {}",
+                            file, e
+                        );
+                        record_all(
+                            recorder,
                             update_id,
-                            name,
-                            attr_str,
-                            old_text_opt.as_deref(),
-                            new_text,
+                            &records,
+                            Some(&old_body),
                             false,
-                            Some("write failed"),
+                            Some("failed to read character file"),
+                        );
+                        continue;
+                    }
+                };
+                match replace_section(&content, &section_name, &attr, &m) {
+                    Some(c) => {
+                        write_and_record(&file, &c, update_id, &records, Some(&old_body), recorder)
+                            .await
+                    }
+                    None => {
+                        warn!(
+                            "character_updater: replace_section failed for {}/{}",
+                            key.0, key.1
+                        );
+                        record_all(
+                            recorder,
+                            update_id,
+                            &records,
+                            Some(&old_body),
+                            false,
+                            Some("replace_section failed"),
                         );
                     }
                 }
             }
-        } else {
-            // ---- ファイルが見つからない → フォルダ形式の新規キャラ(Alias は箇条書きへ正規化) ----
-            let Some(body) = build_new_section_body(&attr, new_text, name) else {
-                debug!(
-                    "character_updater: {}/{} no aliases to add, skip",
-                    name, attr_str
-                );
-                recorder.record_character_section(
-                    update_id,
-                    name,
-                    attr_str,
-                    None,
-                    new_text,
-                    false,
-                    Some("no change"),
-                );
-                continue;
-            };
-            let chars_dir = workspace.join("characters");
-            match create_character_file(&chars_dir, name, attr.canonical_heading(), &body).await {
-                Some(new_path) => {
-                    info!("character_updater: created {}", new_path.display());
-                    recorder.record_character_section(
-                        update_id, name, attr_str, None, new_text, true, None,
-                    );
-                    char_files.push(new_path);
+            ResolvedOp::ReplaceAlias {
+                file,
+                section_name,
+                old,
+                merged,
+                records,
+            } => {
+                let content = match tokio::fs::read_to_string(&file).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(
+                            "character_updater: failed to read character file {:?}: {}",
+                            file, e
+                        );
+                        record_all(
+                            recorder,
+                            update_id,
+                            &records,
+                            Some(&old),
+                            false,
+                            Some("failed to read character file"),
+                        );
+                        continue;
+                    }
+                };
+                match replace_section(&content, &section_name, &CharacterAttribute::Alias, &merged)
+                {
+                    Some(c) => {
+                        write_and_record(&file, &c, update_id, &records, Some(&old), recorder)
+                            .await
+                    }
+                    None => {
+                        warn!(
+                            "character_updater: replace_section failed for {}/呼称",
+                            section_name
+                        );
+                        record_all(
+                            recorder,
+                            update_id,
+                            &records,
+                            Some(&old),
+                            false,
+                            Some("replace_section failed"),
+                        );
+                    }
                 }
-                None => {
-                    warn!(
-                        "character_updater: failed to create character file for {:?}",
-                        name
-                    );
-                    recorder.record_character_section(
-                        update_id,
-                        name,
-                        attr_str,
-                        None,
-                        new_text,
-                        false,
-                        Some("failed to create character file"),
-                    );
+            }
+            ResolvedOp::AppendSection {
+                file,
+                section_name,
+                heading,
+                body,
+                records,
+            } => {
+                let content = match tokio::fs::read_to_string(&file).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(
+                            "character_updater: failed to read character file {:?}: {}",
+                            file, e
+                        );
+                        record_all(
+                            recorder,
+                            update_id,
+                            &records,
+                            None,
+                            false,
+                            Some("failed to read character file"),
+                        );
+                        continue;
+                    }
+                };
+                match append_attribute_section(&content, &section_name, heading, &body) {
+                    Some(c) => {
+                        write_and_record(&file, &c, update_id, &records, None, recorder).await
+                    }
+                    None => {
+                        warn!(
+                            "character_updater: append_attribute_section failed for {}/{}",
+                            section_name, heading
+                        );
+                        record_all(
+                            recorder,
+                            update_id,
+                            &records,
+                            None,
+                            false,
+                            Some("append_attribute_section failed"),
+                        );
+                    }
+                }
+            }
+            ResolvedOp::AppendCharacter {
+                file,
+                name,
+                sections,
+                records,
+            } => {
+                let content = match tokio::fs::read_to_string(&file).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(
+                            "character_updater: failed to read character file {:?}: {}",
+                            file, e
+                        );
+                        record_all(
+                            recorder,
+                            update_id,
+                            &records,
+                            None,
+                            false,
+                            Some("failed to read character file"),
+                        );
+                        continue;
+                    }
+                };
+                let c = append_new_character_block(&content, &name, &sections);
+                write_and_record(&file, &c, update_id, &records, None, recorder).await;
+            }
+            ResolvedOp::CreateFile {
+                name,
+                sections,
+                records,
+            } => {
+                let chars_dir = workspace.join("characters");
+                match create_character_file(&chars_dir, &name, &sections).await {
+                    Some(new_path) => {
+                        info!("character_updater: created {}", new_path.display());
+                        record_all(recorder, update_id, &records, None, true, None);
+                    }
+                    None => {
+                        warn!(
+                            "character_updater: failed to create character file for {:?}",
+                            name
+                        );
+                        record_all(
+                            recorder,
+                            update_id,
+                            &records,
+                            None,
+                            false,
+                            Some("failed to create character file"),
+                        );
+                    }
                 }
             }
         }
     }
+}
+
+/// 正規化済みの更新項目列を characters/*.md へ適用する。
+/// (A) 計画: 全項目を解決済み操作へ変換(同一物理宛先は合流) →
+/// (B) バッチマージ: 既存セクションへの意味マージを1回の LLM 呼び出しで実行 →
+/// (C) 適用: 操作を逐次適用し、FlightRecorder へ item 単位で記録する。
+async fn apply_updates(
+    updates: &[UpdateItem],
+    update_id: i64,
+    char_files: Vec<PathBuf>,
+    workspace: &Path,
+    recorder: &FlightRecorder,
+    llm_client: &mut dyn LlmInterface,
+) {
+    debug!("character_updater: {} update(s) received", updates.len());
+
+    // (A) 計画: 各ファイルを1回だけスナップショットして宛先を確定する
+    let mut snapshots: HashMap<PathBuf, String> = HashMap::new();
+    for f in &char_files {
+        match tokio::fs::read_to_string(f).await {
+            Ok(c) => {
+                snapshots.insert(f.clone(), c);
+            }
+            Err(e) => warn!(
+                "character_updater: failed to read character file {:?}: {}",
+                f, e
+            ),
+        }
+    }
+    let (plan, groups) = plan_updates(updates, &char_files, &snapshots);
+
+    // (B) バッチマージ(対象が無ければ LLM を呼ばない)
+    let merged_map = if groups.is_empty() {
+        Some(HashMap::new())
+    } else {
+        match run_batch_merge(llm_client, &groups).await {
+            Ok(m) => Some(m),
+            Err(e) => {
+                error!("character_updater: semantic merge failed: {}", e);
+                None
+            }
+        }
+    };
+
+    // (C) 適用
+    apply_plan(plan, merged_map.as_ref(), update_id, workspace, recorder).await;
 }
 
 /// ファイル一覧からキャラ名に対応するファイルを探す。
@@ -1200,6 +1824,31 @@ fn append_new_character(
     out
 }
 
+/// ファイル末尾へ新規キャラブロックを全属性まとめて追記する。
+/// 先頭セクションは `append_new_character`、以降は `append_attribute_section` を連鎖させる
+/// (逐次適用と同じ出力になる)。
+fn append_new_character_block(
+    file_text: &str,
+    char_name: &str,
+    sections: &[(&'static str, String)],
+) -> String {
+    let mut iter = sections.iter();
+    let Some((heading, body)) = iter.next() else {
+        return file_text.to_string();
+    };
+    let mut out = append_new_character(file_text, char_name, heading, body);
+    for (heading, body) in iter {
+        match append_attribute_section(&out, char_name, heading, body) {
+            Some(c) => out = c,
+            None => warn!(
+                "character_updater: failed to append section {} to new character {}",
+                heading, char_name
+            ),
+        }
+    }
+    out
+}
+
 /// ファイル stem として使えない文字(`/ \ : * ? " < > |` および制御文字)を `_` に置換する。
 /// キャラクター見出し(`# name`)には原名を使うため、このサニタイズはパス生成のみに適用する。
 fn sanitize_file_stem(name: &str) -> String {
@@ -1217,11 +1866,11 @@ fn sanitize_file_stem(name: &str) -> String {
 /// `chars_dir/<name>.md` を新規作成してパスを返す。作成に失敗した場合は `None`。
 /// - ファイル名は `sanitize_file_stem` でサニタイズする(見出しは元の `name` を維持)。
 /// - `chars_dir` が存在しない場合は `create_dir_all` で生成する。
+/// - `sections` の全属性を1ファイルにまとめて書き出す(同一 run 内の順序依存を排除)。
 async fn create_character_file(
     chars_dir: &Path,
     name: &str,
-    attr_heading: &str,
-    body: &str,
+    sections: &[(&'static str, String)],
 ) -> Option<PathBuf> {
     let stem = sanitize_file_stem(name);
     if stem.trim_matches('_').is_empty() {
@@ -1240,7 +1889,10 @@ async fn create_character_file(
     }
     let path = chars_dir.join(format!("{}.md", stem));
     // 見出しには原名を使う
-    let content = format!("# {}\n\n## {}\n\n{}\n", name, attr_heading, body.trim_end());
+    let mut content = format!("# {}\n", name);
+    for (heading, body) in sections {
+        content.push_str(&format!("\n## {}\n\n{}\n", heading, body.trim_end()));
+    }
     match tokio::fs::write(&path, format_markdown(&content)).await {
         Ok(_) => {
             debug!("character_updater: created {:?}", path);
@@ -1329,14 +1981,55 @@ mod tests {
     }
 
     #[test]
-    fn test_build_semantic_merge_prompt_requests_meaningful_merge() {
+    fn test_build_batch_merge_prompt_requests_meaningful_merge() {
+        let groups = vec![CharMergeGroup {
+            file: PathBuf::from("characters.md"),
+            display_name: "ジェフ".to_string(),
+            sections: vec![SectionMergeTask {
+                heading: "背景".to_string(),
+                old_body: "- 予備役上がり。".to_string(),
+                new_body: "- 元警備隊員。".to_string(),
+            }],
+        }];
         let prompt =
-            build_semantic_merge_prompt("ジェフ", "背景", "- 予備役上がり。", "- 元警備隊員。");
+            build_batch_merge_prompt(&groups).expect("prompt_semantic_merge_batch.md should load");
         assert!(prompt.contains("意味が自然につながるようにマージ"));
         assert!(prompt.contains("両方を機械的に並べず"));
         assert!(prompt.contains("矛盾しない表現へ合成"));
+        assert!(prompt.contains("## キャラクター: ジェフ"));
+        assert!(prompt.contains("### セクション: 背景"));
         assert!(prompt.contains("- 予備役上がり。"));
         assert!(prompt.contains("- 元警備隊員。"));
+        assert!(
+            prompt.contains("そのまま返すこと"),
+            "name/heading の復唱指示が含まれること"
+        );
+    }
+
+    #[test]
+    fn test_render_char_group_lists_all_sections() {
+        let group = CharMergeGroup {
+            file: PathBuf::from("characters.md"),
+            display_name: "ジェフ".to_string(),
+            sections: vec![
+                SectionMergeTask {
+                    heading: "性格".to_string(),
+                    old_body: "- 落ち着いている。".to_string(),
+                    new_body: "- 冷静。".to_string(),
+                },
+                SectionMergeTask {
+                    heading: "背景".to_string(),
+                    old_body: "- 予備役上がり。".to_string(),
+                    new_body: "- 元警備隊員。".to_string(),
+                },
+            ],
+        };
+        let out = render_char_group(&group);
+        assert!(out.starts_with("## キャラクター: ジェフ"));
+        assert!(out.contains("### セクション: 性格"));
+        assert!(out.contains("### セクション: 背景"));
+        assert!(out.contains("#### 現在の設定\n- 落ち着いている。"));
+        assert!(out.contains("#### 新しく本文から読み取れた情報\n- 冷静。"));
     }
 
     #[test]
@@ -1445,21 +2138,376 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_merged_text_from_structured_json() {
-        let raw = r#"{"merged_text": "落ち着いた性格。"}"#;
-        assert_eq!(extract_merged_text(raw), "落ち着いた性格。");
+    fn test_extract_batch_merges_nested_json() {
+        let raw = r#"{"characters": [
+            {"name": "ジェフ", "sections": [
+                {"heading": "性格", "merged_text": "落ち着いた性格。"},
+                {"heading": "背景", "merged_text": "- 予備役上がり。"}]},
+            {"name": "シルビア", "sections": [
+                {"heading": "口調", "merged_text": "丁寧語。"}]}]}"#;
+        let merged = extract_batch_merges(raw);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(
+            merged[&("ジェフ".to_string(), "性格".to_string())],
+            "落ち着いた性格。"
+        );
+        assert_eq!(
+            merged[&("シルビア".to_string(), "口調".to_string())],
+            "丁寧語。"
+        );
     }
 
     #[test]
-    fn test_extract_merged_text_json_with_preamble_inside() {
-        let raw = r#"{"merged_text": "マージ後の文章：\n落ち着いた性格。"}"#;
-        assert_eq!(extract_merged_text(raw), "落ち着いた性格。");
+    fn test_extract_batch_merges_strips_fence_and_preamble() {
+        // merged_text 内のコードフェンス・前置きラベルは要素単位で除去される
+        let raw = r#"{"characters": [{"name": "ジェフ", "sections": [
+            {"heading": "性格", "merged_text": "マージ後の文章：\n落ち着いた性格。"}]}]}"#;
+        let merged = extract_batch_merges(raw);
+        assert_eq!(
+            merged[&("ジェフ".to_string(), "性格".to_string())],
+            "落ち着いた性格。"
+        );
     }
 
     #[test]
-    fn test_extract_merged_text_plain_text_fallback() {
-        let raw = "```markdown\nマージ後の文章：\n落ち着いた性格。\n```";
-        assert_eq!(extract_merged_text(raw), "落ち着いた性格。");
+    fn test_extract_batch_merges_non_json_returns_empty() {
+        assert!(extract_batch_merges("これはJSONではない").is_empty());
+        // 旧単発形式は受理しない(全滅としてリトライに回る)
+        assert!(extract_batch_merges(r#"{"merged_text": "旧形式"}"#).is_empty());
+    }
+
+    #[test]
+    fn test_lookup_merged_exact_and_normalized_fallback() {
+        let mut m = HashMap::new();
+        m.insert(("ジェフ".to_string(), "性格".to_string()), "A".to_string());
+        // 完全一致
+        assert_eq!(
+            lookup_merged(&m, "ジェフ", "性格", &CharacterAttribute::Personality),
+            Some("A")
+        );
+        // echo が縮んだケース: 期待見出しは「性格・口調」だが応答は「性格」→ 属性正規化で一意に一致
+        assert_eq!(
+            lookup_merged(&m, "ジェフ", "性格・口調", &CharacterAttribute::Personality),
+            Some("A")
+        );
+        // 名前不一致は不採用(old 維持)
+        assert_eq!(
+            lookup_merged(&m, "シルビア", "性格", &CharacterAttribute::Personality),
+            None
+        );
+    }
+
+    #[test]
+    fn test_lookup_merged_ambiguous_returns_none() {
+        let mut m = HashMap::new();
+        m.insert(("ジェフ".to_string(), "性格".to_string()), "A".to_string());
+        m.insert(
+            ("ジェフ".to_string(), "性格・口調".to_string()),
+            "B".to_string(),
+        );
+        // 「気質」(Personality へ正規化)で引くと両方が候補 → 曖昧なので採用しない
+        assert_eq!(
+            lookup_merged(&m, "ジェフ", "気質", &CharacterAttribute::Personality),
+            None
+        );
+    }
+
+    // ---- run_batch_merge のテスト ----
+
+    /// テスト専用の最小 LlmInterface 実装。あらかじめ積んだ応答列を `chat()` 呼び出しごとに
+    /// 1つずつ返す(FIFO)。応答が尽きたら空文字を返す。
+    #[derive(Debug)]
+    struct FakeLlmClient {
+        responses: std::collections::VecDeque<String>,
+        call_count: usize,
+    }
+
+    impl FakeLlmClient {
+        fn with_responses(responses: &[&str]) -> Self {
+            Self {
+                responses: responses.iter().map(|s| s.to_string()).collect(),
+                call_count: 0,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmInterface for FakeLlmClient {
+        async fn chat(&mut self) -> Result<String, crate::llm::LlmError> {
+            self.call_count += 1;
+            Ok(self.responses.pop_front().unwrap_or_default())
+        }
+        async fn with_model(&mut self, _model: &str) -> Result<String, crate::llm::LlmError> {
+            Ok(String::new())
+        }
+        fn add(&mut self, _prompt: Content) {}
+        fn build_content(&self) -> String {
+            String::new()
+        }
+        fn get_model(&self) -> &str {
+            "fake-model"
+        }
+        fn clear(&mut self) {}
+        fn cache(&mut self, _prompt: Content) -> Result<String, crate::llm::LlmError> {
+            Ok(String::new())
+        }
+        fn fetch(&self, _hash: &str) -> Option<&Content> {
+            None
+        }
+        fn fetch_all(&self) -> Vec<Content> {
+            Vec::new()
+        }
+        fn remove(&mut self, _hash: String) {}
+        fn capabilities(&self) -> ModelCapability {
+            ModelCapability::STRUCTURED_OUTPUT
+        }
+        fn max_tokens(&mut self, _n: u32) {}
+        fn temperature(&mut self, _v: f64) {}
+        fn top_p(&mut self, _v: f64) {}
+        fn stop_sequences(&mut self, _seqs: Vec<String>) {}
+        fn seed(&mut self, _v: u64) {}
+        fn reasoning_effort(&mut self, _effort: genai::chat::ReasoningEffort) {}
+        fn reasoning_level(&mut self, _level: f64) {}
+        fn response_format(&mut self, _fmt: ChatResponseFormat) {}
+        fn service_tier(&mut self, _tier: genai::chat::ServiceTier) {}
+        fn verbosity(&mut self, _v: genai::chat::Verbosity) {}
+        fn add_tool(&mut self, _tool: Box<dyn crate::llm::LlmTool>) {}
+        async fn respond_tool(
+            &self,
+            _tools: &[genai::chat::ToolCall],
+        ) -> Result<genai::chat::ChatRequest, crate::llm::LlmError> {
+            Err(crate::llm::LlmError::NotImplemented)
+        }
+    }
+
+    fn one_group() -> Vec<CharMergeGroup> {
+        vec![CharMergeGroup {
+            file: PathBuf::from("characters.md"),
+            display_name: "ジェフ".to_string(),
+            sections: vec![SectionMergeTask {
+                heading: "性格".to_string(),
+                old_body: "- 落ち着いている。".to_string(),
+                new_body: "- 冷静。".to_string(),
+            }],
+        }]
+    }
+
+    #[tokio::test]
+    async fn test_run_batch_merge_succeeds_on_first_response() {
+        let groups = one_group();
+        let mut fake = FakeLlmClient::with_responses(&[
+            r#"{"characters": [{"name": "ジェフ", "sections": [{"heading": "性格", "merged_text": "冷静で落ち着いている。"}]}]}"#,
+        ]);
+        let merged = run_batch_merge(&mut fake, &groups).await.unwrap();
+        assert_eq!(fake.call_count, 1, "1回で成功すればリトライしないこと");
+        assert_eq!(
+            merged[&("ジェフ".to_string(), "性格".to_string())],
+            "冷静で落ち着いている。"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_batch_merge_retries_once_on_total_miss() {
+        let groups = one_group();
+        let mut fake = FakeLlmClient::with_responses(&[
+            "これはスキーマに適合しない応答です",
+            r#"{"characters": [{"name": "ジェフ", "sections": [{"heading": "性格", "merged_text": "冷静で落ち着いている。"}]}]}"#,
+        ]);
+        let merged = run_batch_merge(&mut fake, &groups).await.unwrap();
+        assert_eq!(fake.call_count, 2, "全滅時は1回だけリトライすること");
+        assert_eq!(
+            merged[&("ジェフ".to_string(), "性格".to_string())],
+            "冷静で落ち着いている。"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_batch_merge_no_retry_on_partial_hit() {
+        // 2キャラのうち1件しか返らなくても、部分欠落は全体リトライしない
+        // (欠落側は呼び出し側=apply_plan で old 維持にフォールバックする)。
+        let groups = vec![
+            CharMergeGroup {
+                file: PathBuf::from("characters.md"),
+                display_name: "ジェフ".to_string(),
+                sections: vec![SectionMergeTask {
+                    heading: "性格".to_string(),
+                    old_body: "- 落ち着いている。".to_string(),
+                    new_body: "- 冷静。".to_string(),
+                }],
+            },
+            CharMergeGroup {
+                file: PathBuf::from("characters.md"),
+                display_name: "シルビア".to_string(),
+                sections: vec![SectionMergeTask {
+                    heading: "口調".to_string(),
+                    old_body: "- 丁寧語。".to_string(),
+                    new_body: "- 敬語。".to_string(),
+                }],
+            },
+        ];
+        let mut fake = FakeLlmClient::with_responses(&[
+            r#"{"characters": [{"name": "ジェフ", "sections": [{"heading": "性格", "merged_text": "冷静で落ち着いている。"}]}]}"#,
+        ]);
+        let merged = run_batch_merge(&mut fake, &groups).await.unwrap();
+        assert_eq!(fake.call_count, 1, "部分欠落では全体リトライしないこと");
+        assert!(merged.contains_key(&("ジェフ".to_string(), "性格".to_string())));
+        assert!(
+            !merged.contains_key(&("シルビア".to_string(), "口調".to_string())),
+            "欠落分はマップに無いこと(apply_plan 側で old 維持)"
+        );
+    }
+
+    // ---- plan_updates のテスト ----
+
+    const PLAN_MD: &str = "\
+# ジェフ
+
+## 性格・口調
+
+- 落ち着いている。
+
+## 呼称
+
+- クライン艦長
+
+# シルビア
+
+## 性格
+
+- 真面目。
+";
+
+    fn plan_input(items: &[(&str, &str, &str)]) -> Vec<UpdateItem> {
+        items
+            .iter()
+            .map(|(n, a, t)| UpdateItem {
+                name: n.to_string(),
+                attribute: a.to_string(),
+                text: t.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_plan_updates_merges_attribute_synonyms_into_one_task() {
+        let file = PathBuf::from("characters.md");
+        let snapshots = HashMap::from([(file.clone(), PLAN_MD.to_string())]);
+        let updates = plan_input(&[
+            ("ジェフ", "性格", "- 冷静。"),
+            ("ジェフ", "personality", "- 短気な一面。"),
+        ]);
+        let (plan, groups) = plan_updates(&updates, &[file], &snapshots);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].sections.len(),
+            1,
+            "属性シノニムは1タスクへ合流すること"
+        );
+        assert_eq!(groups[0].sections[0].new_body, "- 冷静。\n- 短気な一面。");
+        let merges: Vec<_> = plan
+            .iter()
+            .filter(|op| matches!(op, ResolvedOp::Merge { .. }))
+            .collect();
+        assert_eq!(merges.len(), 1, "Merge op は1宛先1つであること");
+        if let ResolvedOp::Merge { records, .. } = merges[0] {
+            assert_eq!(records.len(), 2, "合流しても両 item の記録が残ること");
+        }
+    }
+
+    #[test]
+    fn test_plan_updates_merges_multi_tag_heading_into_one_task() {
+        let file = PathBuf::from("characters.md");
+        let snapshots = HashMap::from([(file.clone(), PLAN_MD.to_string())]);
+        let updates = plan_input(&[
+            ("ジェフ", "性格", "- 冷静。"),
+            ("ジェフ", "口調", "- ぶっきらぼう。"),
+        ]);
+        let (_plan, groups) = plan_updates(&updates, &[file], &snapshots);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].sections.len(),
+            1,
+            "多タグ見出し(性格・口調)への2属性は同一物理セクションの1タスクへ合流すること"
+        );
+        assert!(groups[0].sections[0].new_body.contains("- 冷静。"));
+        assert!(groups[0].sections[0].new_body.contains("- ぶっきらぼう。"));
+        assert_eq!(groups[0].sections[0].heading, "性格・口調");
+    }
+
+    #[test]
+    fn test_plan_updates_groups_by_character() {
+        let file = PathBuf::from("characters.md");
+        let snapshots = HashMap::from([(file.clone(), PLAN_MD.to_string())]);
+        let updates = plan_input(&[
+            ("ジェフ", "性格", "- 冷静。"),
+            ("シルビア", "性格", "- 几帳面。"),
+        ]);
+        let (_plan, groups) = plan_updates(&updates, &[file], &snapshots);
+        assert_eq!(groups.len(), 2, "キャラごとに別グループになること");
+        let names: Vec<_> = groups.iter().map(|g| g.display_name.as_str()).collect();
+        assert!(names.contains(&"ジェフ"));
+        assert!(names.contains(&"シルビア"));
+    }
+
+    #[test]
+    fn test_plan_updates_alias_is_deterministic_not_batched() {
+        let file = PathBuf::from("characters.md");
+        let snapshots = HashMap::from([(file.clone(), PLAN_MD.to_string())]);
+        let updates = plan_input(&[("ジェフ", "呼称", "艦長")]);
+        let (plan, groups) = plan_updates(&updates, &[file], &snapshots);
+        assert!(groups.is_empty(), "Alias は LLM バッチに載せないこと");
+        assert!(
+            plan.iter()
+                .any(|op| matches!(op, ResolvedOp::ReplaceAlias { .. })),
+            "決定的マージの ReplaceAlias になること"
+        );
+    }
+
+    #[test]
+    fn test_plan_updates_aggregates_new_character_into_single_create() {
+        // 対応ファイルが無い名前 → CreateFile 1つに全属性を集約(順序依存の排除)
+        let updates = plan_input(&[
+            ("新キャラ", "性格", "- 明るい。"),
+            ("新キャラ", "背景", "- 謎の過去。"),
+        ]);
+        let (plan, groups) = plan_updates(&updates, &[], &HashMap::new());
+        assert!(groups.is_empty(), "新規キャラは LLM マージ対象にならないこと");
+        let creates: Vec<_> = plan
+            .iter()
+            .filter(|op| matches!(op, ResolvedOp::CreateFile { .. }))
+            .collect();
+        assert_eq!(creates.len(), 1, "同一新規キャラは1つの CreateFile に集約されること");
+        if let ResolvedOp::CreateFile { sections, records, .. } = creates[0] {
+            assert_eq!(sections.len(), 2);
+            assert_eq!(records.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_plan_missing_merge_keeps_old() {
+        // バッチ結果から対象キーが欠落 → old 維持(ファイルを書き換えない)
+        let dir = std::env::temp_dir().join("ff_batch_merge_missing_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("characters.md");
+        std::fs::write(&file, PLAN_MD).unwrap();
+
+        let snapshots = HashMap::from([(file.clone(), PLAN_MD.to_string())]);
+        let updates = plan_input(&[("ジェフ", "性格", "- 冷静。")]);
+        let (plan, groups) = plan_updates(&updates, std::slice::from_ref(&file), &snapshots);
+        assert_eq!(groups.len(), 1);
+
+        let recorder = FlightRecorder::new(&dir.join("flight.db"));
+        let update_id = recorder.record_character_update("test://uri", "test-model", "prompt");
+        apply_plan(plan, Some(&HashMap::new()), update_id, &dir, &recorder).await;
+
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            PLAN_MD,
+            "マージ結果欠落時はファイルが書き換えられないこと"
+        );
+        drop(recorder);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- strip_attribute_label のテスト ----
