@@ -10,6 +10,7 @@
 | [project-structure.md](project-structure.md) | ディレクトリ構成、クレート一覧 |
 | [lsp-handlers.md](lsp-handlers.md) | LSP ハンドラと提供機能 |
 | [completion.md](completion.md) | 文章補完フロー、CursorContext |
+| [zed-completion-filtering.md](zed-completion-filtering.md) | Zed の補完フィルタ機構と「括弧内で候補が出ない」問題の調査記録 |
 | [character-updater.md](character-updater.md) | キャラクター設定自動更新 |
 | [data-layer.md](data-layer.md) | インメモリ状態、SQLite スキーマ |
 

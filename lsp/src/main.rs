@@ -730,6 +730,33 @@ fn node_to_plain_text<'a>(node: &'a AstNode<'a>) -> String {
     result
 }
 
+/// completion の候補に付ける `filter_text` を組み立てる。
+/// クライアント(Zed)が「カーソル直前の語」を暗黙のフィルタクエリにする対策として、
+/// カーソル手前の行テキスト全体を返す(`main.rs` の `completion` ハンドラ参照)。
+/// どこを語境界と見なされても、そのクエリは必ずこの文字列の連続部分列になり一致する。
+/// カーソル直前の「語」を返す。判定基準は Zed 本体の `CharClassifier::kind_with`
+/// (crates/language/src/buffer.rs)と同一の `c.is_alphanumeric() || c == '_'` で、
+/// Rust の `is_alphanumeric()` は Unicode の Letter/Number カテゴリを見るため
+/// かな・漢字も語文字として連続列に含まれる(非語になるのは括弧・句読点・空白等)。
+///
+/// Zed はこの語を暗黙のフィルタクエリとして候補の label と照合するため、
+/// LSP 補完の一般的な作法(トークンを置換し newText がトークンで始まる)に
+/// 合わせて候補を組み立てる際、置換対象・接頭辞として使う。
+/// FiftyFour 言語は `completion_query_characters`/`word_characters` を
+/// 定義していないため、Zed 側もこの既定の英数字判定のみで語境界を決める。
+fn precursor_word(line_text: &str, utf16_offset: usize) -> &str {
+    let end = crate::types::utf16_to_byte_offset(line_text, utf16_offset);
+    let prefix = &line_text[..end];
+    let start = prefix
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(end);
+    &prefix[start..]
+}
+
 pub fn shorten(s: &str, len: usize) -> String {
     if s.chars().count() > len {
         s.chars().take(len - 2).collect::<String>() + "……"
@@ -1307,7 +1334,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri.as_str();
         let line_no = params.text_document_position.position.line as usize;
         let offset = params.text_document_position.position.character as usize;
-        let (context, before) = {
+        let (context, before, precursor_token) = {
             let before = cursor_context::before_sentences_upto(
                 // tmp.as_mut_slice(),
                 &self.text,
@@ -1378,7 +1405,21 @@ impl LanguageServer for Backend {
                     line.tokens = highlighter.text_to_lindera_token(line.text.as_str());
                 },
             );
-            (context, before)
+
+            // Zed は補完候補を「カーソル直前の語」で暗黙にフィルタし、候補の
+            // label.filter_text()(既定では label 自身)と照合する。filter_text
+            // フィールドは label 文字列に含まれる部分でなければ無視される
+            // (crates/language_core/src/code_label.rs の filter_range 構築)ため、
+            // label に無い任意の文字列を仕込んでフィルタを回避することはできない。
+            // 通常の LSP 補完と同じ作法(直前の語トークンを置換し、newText を
+            // トークンで始める)に合わせることで、Zed のクエリ(=そのトークン)が
+            // 必ず label の接頭辞になり表示される。
+            let precursor_token = tmp
+                .get(line_no)
+                .map(|l| precursor_word(l.text.as_str(), offset).to_string()) // TODO: precursor_tokenが長すぎる
+                .unwrap_or_default();
+
+            (context, before, precursor_token)
         };
 
         let prompt_fn = Backend::ctx_to_prompt_name(context);
@@ -1409,6 +1450,7 @@ impl LanguageServer for Backend {
         // LLM 応答待ちの間、クライアントへ進捗を表示する(Zed の activity indicator)。
         // クライアントがリクエストに付けた workDoneToken があれば優先し、
         // 無ければサーバ発トークンを window/workDoneProgress/create で登録する。
+        // Drop ガードで必ずprogressの終了がが送られる
         let progress = CompletionProgress::begin(
             &self.client,
             self.work_done_progress_supported
@@ -1444,23 +1486,27 @@ impl LanguageServer for Backend {
             })
             .await;
 
-        // 成功・失敗どちらでも進捗表示を消す(キャンセルで drop された場合は Drop ガードが送る)。
-        if let Some(progress) = progress {
-            progress.finish().await;
-        }
-
         match raw {
             Ok(response) => {
                 debug!("raw Ok.");
 
                 let mut pending: Vec<PendingCandidate> = Vec::new();
 
-                // カーソル位置にゼロ幅の text_edit を張る。textEdit を持たない補完アイテムは
-                // クライアントが「カーソル直前の単語」を暗黙のフィルタクエリにするため、
-                // かな漢字の途中で発火すると生成文がその prefix に一致せず候補ごと消えてしまう
-                // (句点・改行・括弧の直後は暗黙クエリが空になるため偶然表示されていた)。
-                // ゼロ幅 Range を明示することでクエリは常に空になり、確実に表示される。
+                // Zed は補完候補を「カーソル直前の語」で暗黙にフィルタし、
+                // 候補の label.filter_text()(既定では label 自身)と照合する。
+                // filter_text フィールドは label 文字列に含まれる部分文字列でなければ
+                // 無視されるため、label に無い任意の文字列でフィルタを回避することはできない
+                // (crates/language_core/src/code_label.rs の filter_range 構築を確認済み)。
+                // そこで通常の LSP 補完と同じ作法を取る: 直前の語トークン
+                // (precursor_token)を置換対象にし、newText/label をトークンで始める。
+                // これで Zed のクエリ(=そのトークン)が必ず label の接頭辞になり表示される。
+                // トークンが空(句点・改行・括弧の直後)ならクエリも空になり従来どおり表示される。
                 let cursor = Position::new(line_no as u32, offset as u32);
+                let precursor_len = crate::types::utf16_len(&precursor_token) as u32;
+                let edit_start = Position::new(
+                    line_no as u32,
+                    offset.saturating_sub(precursor_len as usize) as u32,
+                );
 
                 let items = response
                     .lines()
@@ -1497,25 +1543,33 @@ impl LanguageServer for Backend {
                             .record_candidate(completion_id, &sr, r, &mut pending);
 
                         debug!("Completion Item");
+                        // newText/label は「直前の語トークン + 続き」。置換 range も
+                        // トークン先頭からカーソルまでにすることで、確定時は
+                        // トークンがトークン+続きへ置き換わり実質続きの挿入になる。
+                        let new_text = format!("{precursor_token}{sr}");
                         let text_edit = Some(CompletionTextEdit::Edit(TextEdit {
-                            range: Range::new(cursor, cursor),
-                            new_text: sr.clone(),
+                            range: Range::new(edit_start, cursor),
+                            new_text: new_text.clone(),
                         }));
-                        if sr.chars().count() > 25 {
+                        if new_text.chars().count() > 25 {
                             CompletionItem {
-                                label: shorten(&sr, 25),
+                                label: shorten(&new_text, 25),
                                 kind: Some(CompletionItemKind::TEXT),
+                                filter_text: Some(precursor_token.clone()),
                                 documentation: Some(Documentation::MarkupContent(MarkupContent {
                                     kind: MarkupKind::Markdown,
                                     value: sr,
                                 })),
+                                insert_text: Some(new_text.clone()),
+                                insert_text_mode: Some(InsertTextMode::AS_IS),
                                 text_edit,
                                 ..Default::default()
                             }
                         } else {
                             CompletionItem {
-                                label: sr,
+                                label: new_text.clone(),
                                 kind: Some(CompletionItemKind::TEXT),
+                                filter_text: Some(precursor_token.clone()),
                                 text_edit,
                                 ..Default::default()
                             }
@@ -2394,6 +2448,53 @@ mod tests {
 
     fn lines(s: &str) -> Vec<LineData> {
         s.lines().map(|l| LineData::from_str(l).unwrap()).collect()
+    }
+
+    // ---- precursor_word のテスト ----
+    // Rust の is_alphanumeric() はかな漢字も Unicode Letter として true を返すため
+    // 語文字とみなされる(Zed の CharClassifier::kind_with も同じ判定基準)。
+    // 括弧・句読点・空白のみが非語として境界になる。
+
+    #[test]
+    fn test_precursor_word_returns_word_run_up_to_cursor() {
+        // 開き括弧「は非語なので、そこで区切られ「起きたら」だけが返る
+        let out = precursor_word("「起きたら教えて", 5); // "「起きたら" まで(5 u16)
+        assert_eq!(out, "起きたら");
+    }
+
+    #[test]
+    fn test_precursor_word_stops_at_punctuation() {
+        // 句点の直後はトークンが空
+        let out = precursor_word("……した。", 5);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn test_precursor_word_offset_zero_is_empty() {
+        assert_eq!(precursor_word("起きたら教えて", 0), "");
+    }
+
+    #[test]
+    fn test_precursor_word_clamps_past_end() {
+        let s = "起きた";
+        assert_eq!(precursor_word(s, 100), s);
+    }
+
+    #[test]
+    fn test_precursor_word_alphanumeric_and_underscore() {
+        assert_eq!(precursor_word("foo_bar123", 10), "foo_bar123");
+        // 直前が非語(スペース)ならそこで止まる
+        assert_eq!(precursor_word("say foo_bar123", 14), "foo_bar123");
+    }
+
+    #[test]
+    fn test_precursor_word_surrogate_pair() {
+        // "a𠮷b": a=1u16, 𠮷=2u16(サロゲートペア), b=1u16。いずれも語文字扱い。
+        let s = "a𠮷b";
+        assert_eq!(precursor_word(s, 1), "a");
+        assert_eq!(precursor_word(s, 3), "a𠮷"); // 𠮷 の直後
+        // ペア中間(u16オフセット2)は utf16_to_byte_offset が文字の直後へ丸める
+        assert_eq!(precursor_word(s, 2), "a𠮷");
     }
 
     /// load_prompt と同じ frontmatter 正規化を文字列入力で再現する(Asset 非依存のテスト用)。
