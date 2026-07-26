@@ -1,5 +1,7 @@
+use crate::character::{CharacterAttribute, parse_all_content, split_aliases};
+use crate::flight_recorder::FlightRecorder;
 use crate::llm::{Content, LlmInterface, ModelCapability};
-use crate::{CharacterAttribute, FlightRecorder, parse_all_content, shorten_middle, split_aliases};
+use crate::text::shorten_middle;
 use dashmap::DashMap;
 use genai::chat::{ChatResponseFormat, JsonSpec};
 #[allow(unused_imports)]
@@ -313,7 +315,7 @@ pub fn replace_section(
 /// パースと同じ `comrak_options` を使い、折返しなし(width=0)・箇条書き "-" で出力する。
 /// セクション差し替え・追記の繰り返しで生じる空行や記法の不揃いを、書き込みのたびに整える。
 fn format_markdown(text: &str) -> String {
-    let mut options = crate::comrak_options();
+    let mut options = crate::character::comrak_options();
     // インデント型ではなくフェンス型でコードブロックを保持する
     // (replace_section 等の行走査が ``` フェンスを前提にしているため)。
     options.render.prefer_fenced = true;
@@ -506,7 +508,7 @@ fn render_char_group(group: &CharMergeGroup) -> String {
 /// バッチマージ用プロンプトを `data/prompt_semantic_merge_batch.md` から読み込み、
 /// `{{CHARACTERS}}` に全キャラブロックを埋めて返す。テンプレートを読めなければ `None`。
 fn build_batch_merge_prompt(groups: &[CharMergeGroup]) -> Option<String> {
-    let (template, _) = crate::load_prompt("prompt_semantic_merge_batch.md")?;
+    let (template, _) = crate::frontmatter::load_prompt("prompt_semantic_merge_batch.md")?;
     let characters = groups
         .iter()
         .map(render_char_group)
@@ -697,7 +699,7 @@ pub async fn run(
     );
 
     // 2. プロンプトを読み込み、frontmatter を分離(補完側と共通のヘルパを使用)
-    let (prompt_body, frontmatter_data) = match crate::load_prompt("prompt_character_update.md") {
+    let (prompt_body, frontmatter_data) = match crate::frontmatter::load_prompt("prompt_character_update.md") {
         Some(v) => v,
         None => {
             error!("prompt_character_update.md not found");
@@ -1018,7 +1020,7 @@ fn plan_updates(
     let mut plan: Vec<ResolvedOp> = Vec::new();
     let mut groups: Vec<CharMergeGroup> = Vec::new();
 
-    let mut parsed: HashMap<PathBuf, HashMap<String, crate::CharacterEntry>> = HashMap::new();
+    let mut parsed: HashMap<PathBuf, HashMap<String, crate::character::CharacterEntry>> = HashMap::new();
     // 合流用インデックス群。値は plan / groups 内の位置。
     let mut merge_by_section: HashMap<SectionKey, (usize, usize, usize)> = HashMap::new(); // (group, sec, op)
     let mut alias_by_section: HashMap<SectionKey, usize> = HashMap::new();
@@ -1729,7 +1731,7 @@ fn find_character_file<'a>(files: &'a [PathBuf], name: &str) -> Option<&'a PathB
 /// `main.rs` の `detect_char_level_str` (comrak AST ベース) に委譲する。
 /// 検出できない場合は `None`。
 fn detect_levels(file_text: &str) -> Option<(u8, u8)> {
-    let cl = crate::detect_char_level_str(file_text);
+    let cl = crate::character::detect_char_level_str(file_text);
     (cl != 0).then(|| (cl, cl + 1))
 }
 
@@ -2483,6 +2485,9 @@ mod tests {
         }
     }
 
+    // FlightRecorder::new(パス指定) は debug ビルドにしか無いため(release は no-op スタブ)、
+    // `cargo test --release` でもコンパイルできるよう cfg で囲う。
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn test_apply_plan_missing_merge_keeps_old() {
         // バッチ結果から対象キーが欠落 → old 維持(ファイルを書き換えない)

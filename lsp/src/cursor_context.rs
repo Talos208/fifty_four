@@ -362,9 +362,8 @@ pub fn before_sentences_upto(
 
 #[cfg(test)]
 mod tests {
-    use crate::CursorContext;
-    use crate::Highlighter;
-    use crate::LineData;
+    use crate::highlight::Highlighter;
+    use crate::types::{CursorContext, LineData};
     use crate::cursor_context::before_sentences_upto;
     use crate::cursor_context::classify_complesion_mode;
     use crate::cursor_context::token_at;

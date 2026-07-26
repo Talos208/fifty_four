@@ -4,7 +4,7 @@
 
 ## 1. LSPサーバーエージェント
 
-`main.rs` に実装されている Language Server Protocol (LSP) の基本的なサーバー機能を提供するエージェントです。
+`backend.rs` に実装されている Language Server Protocol (LSP) の基本的なサーバー機能を提供するエージェントです（`main.rs` はエントリポイントとしてサーバー起動処理のみを行い、`Backend` 構造体とハンドラ実装は `backend.rs` に切り出されています）。
 
 ### 主な機能
 

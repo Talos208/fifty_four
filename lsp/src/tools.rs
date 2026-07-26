@@ -1,8 +1,8 @@
-use crate::llm::{LlmError, LlmTool};
-use crate::{
-    CharacterAttribute, CharacterCache, FileCacheEntry, find_character_file_path,
-    parse_all_content, shorten_middle,
+use crate::character::{
+    CharacterAttribute, CharacterCache, FileCacheEntry, find_character_file_path, parse_all_content,
 };
+use crate::llm::{LlmError, LlmTool};
+use crate::text::shorten_middle;
 use async_trait::async_trait;
 #[allow(unused_imports)]
 use log::debug;
