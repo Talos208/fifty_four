@@ -49,6 +49,46 @@ pub(crate) fn pod_to_string(pod: &gray_matter::Pod) -> Option<String> {
     }
 }
 
+/// `{{NAME}}` プレースホルダを一度の走査で置換する。
+///
+/// `String::replace` を複数キーに対して連鎖させると、先の置換で埋め込まれた
+/// 値の中に別のプレースホルダ表記(例: 小説本文が偶然 `{{CHAPTER}}` という
+/// 文字列を含む場合)が紛れ込んでいたとき、後続の `replace` がそれも書き換えて
+/// しまう(テンプレートインジェクション)。この関数は出力バッファを一度しか
+/// 構築せず、置換後の文字列を再走査しないためその心配がない。
+///
+/// 未知のプレースホルダ(`vars` に無いキー)は `{{NAME}}` の形のまま残す。
+pub(crate) fn expand(template: &str, vars: &HashMap<&str, &str>) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        match after_open.find("}}") {
+            Some(end) => {
+                let key = &after_open[..end];
+                match vars.get(key) {
+                    Some(v) => out.push_str(v),
+                    None => {
+                        out.push_str("{{");
+                        out.push_str(key);
+                        out.push_str("}}");
+                    }
+                }
+                rest = &after_open[end + 2..];
+            }
+            None => {
+                // 閉じ "}}" が見つからない: 開き "{{" 以降をそのまま残して終了
+                out.push_str("{{");
+                rest = after_open;
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 pub(crate) fn pod_to_json_value(pod: &gray_matter::Pod) -> serde_json::Value {
     use gray_matter::Pod;
     match pod {
@@ -162,5 +202,51 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["updates"]["type"], "array");
         assert_eq!(fm.get("max_tokens").map(|s| s.as_str()), Some("4096"));
+    }
+
+    // ---- expand のテスト ----
+
+    #[test]
+    fn test_expand_replaces_multiple_placeholders() {
+        let mut vars = HashMap::new();
+        vars.insert("CHAPTER", "5");
+        vars.insert("TEXT", "本文");
+        assert_eq!(
+            expand("第{{CHAPTER}}章: {{TEXT}}", &vars),
+            "第5章: 本文"
+        );
+    }
+
+    #[test]
+    fn test_expand_does_not_double_expand_injected_placeholder() {
+        // 回帰: 本文が偶然 "{{CHAPTER}}" という文字列を含んでいても、
+        // TEXT展開後の結果を再走査して二重展開しないこと
+        // (String::replaceの連鎖だとこれが起きる)。
+        let mut vars = HashMap::new();
+        vars.insert("TEXT", "a{{CHAPTER}}b");
+        vars.insert("CHAPTER", "X");
+        assert_eq!(
+            expand("{{TEXT}}", &vars),
+            "a{{CHAPTER}}b",
+            "TEXT展開結果に含まれる{{CHAPTER}}は再展開されないこと"
+        );
+    }
+
+    #[test]
+    fn test_expand_leaves_unknown_placeholder_untouched() {
+        let vars = HashMap::new();
+        assert_eq!(expand("見出し{{UNKNOWN}}続き", &vars), "見出し{{UNKNOWN}}続き");
+    }
+
+    #[test]
+    fn test_expand_no_placeholder_returns_as_is() {
+        let vars = HashMap::new();
+        assert_eq!(expand("プレースホルダなし", &vars), "プレースホルダなし");
+    }
+
+    #[test]
+    fn test_expand_unclosed_placeholder_left_as_is() {
+        let vars = HashMap::new();
+        assert_eq!(expand("前{{未閉じ", &vars), "前{{未閉じ");
     }
 }

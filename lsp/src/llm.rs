@@ -286,6 +286,12 @@ pub trait LlmInterface: Send + Sync + std::fmt::Debug {
     /// 正規化された reasoning/thinking effort を指定する (0.0..=1.0)。
     /// 0.0 = none、1.0 = そのプロバイダの最高 effort。範囲外は clamp。
     fn reasoning_level(&mut self, level: f64);
+
+    /// リクエスト単位のオプション(max_tokens/temperature/reasoning_level 等)を
+    /// 既定値へ戻す。呼び出し元がリクエストごとにオプションを設定し直す前に
+    /// 呼び、前回リクエストの設定が失敗・キャンセル時に持ち越されるのを防ぐ。
+    /// 既定実装は no-op(モックなどオプションを持たない実装向け)。
+    fn reset_options(&mut self) {}
     fn response_format(&mut self, fmt: ChatResponseFormat);
     fn service_tier(&mut self, tier: ServiceTier);
     fn verbosity(&mut self, v: Verbosity);
@@ -553,6 +559,12 @@ impl LlmInterface for LlmClient {
 
     async fn with_model(&mut self, model: &str) -> Result<String, LlmError> {
         // TODO AGENTS.mdをfrom_system()で投入
+        // 一時プロンプトはここで消費する(take)。この時点で chat_req へ焼き込まれるため、
+        // 以降の送信失敗やキャンセル(このasync fnのfutureがdropされる場合)があっても
+        // 次回呼び出しへ持ち越さない。以前は成功時のみ self.prompts.clear() していたため、
+        // 補完リクエストが連打でキャンセルされるとプロンプトが前回分ごと累積し続けていた。
+        let prompts = std::mem::take(&mut self.prompts);
+
         // chat_req はツール呼び出しの往復をまたいで会話履歴として保持・追記する。
         // (LLM API はステートレスなので、毎リクエストに全履歴を送る必要がある)
         let mut chat_req = ChatRequest::from_system(&self.sys_prompt)
@@ -562,7 +574,7 @@ impl LlmInterface for LlmClient {
                     Content::CacheEntry(h) => self.fetch(h)?.as_ref(),
                 }))
             }))
-            .append_messages(self.prompts.iter().filter_map(|c| {
+            .append_messages(prompts.iter().filter_map(|c| {
                 Some(ChatMessage::user(match c {
                     Content::Text(s) => s,
                     Content::CacheEntry(h) => self.fetch(h)?.as_ref(),
@@ -623,7 +635,7 @@ impl LlmInterface for LlmClient {
                 });
             };
 
-            self.prompts.clear(); // promptはクリア(chat_req に焼き込み済み)、キャッシュは保存
+            // prompts は with_model 冒頭で既に take 済み。キャッシュ(fetch_all側)は保存されたまま。
 
             if let Some(reason) = response.reasoning_content.as_ref() {
                 debug!("reasoning: {}", reason)
@@ -796,6 +808,10 @@ impl LlmInterface for LlmClient {
     fn reasoning_level(&mut self, level: f64) {
         let effort = self.provider.map_reasoning(level);
         self.options = std::mem::take(&mut self.options).with_reasoning_effort(effort);
+    }
+
+    fn reset_options(&mut self) {
+        self.options = ChatOptions::default();
     }
 
     fn response_format(&mut self, fmt: ChatResponseFormat) {
@@ -1067,5 +1083,26 @@ mod tests_tool_round {
         assert!(matches!(chat_req.messages[1].role, ChatRole::Assistant));
         assert!(matches!(chat_req.messages[2].role, ChatRole::User));
         assert_eq!(chat_req.messages[1].content.tool_calls().len(), 1);
+    }
+
+    /// 送信に失敗しても一時プロンプトを次リクエストへ持ち越さないこと。
+    /// (回帰: 補完連打時にプロンプトが前回分ごと累積し 3800 文字超まで膨張していた。
+    ///  原因は with_model の成功パスにしか self.prompts.clear() が無かったこと)
+    #[tokio::test]
+    async fn test_failed_chat_does_not_leak_prompts() {
+        // ポート1は予約済みで待ち受けが存在しない → 接続拒否で即エラーになる
+        let mut cl = LlmClientBuilder::from_value(
+            &serde_json::json!({"provider": "lmstudio", "url": "http://127.0.0.1:1/"}),
+        )
+        .build();
+
+        cl.add(Content::Text("テキスト：トン0トン".into()));
+        assert!(cl.chat().await.is_err(), "接続できずエラーになる前提");
+
+        assert!(
+            !cl.build_content().contains("トン0トン"),
+            "失敗したリクエストのプロンプトが残っている: {}",
+            cl.build_content()
+        );
     }
 }

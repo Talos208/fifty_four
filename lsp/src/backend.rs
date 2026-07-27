@@ -20,13 +20,13 @@ use dashmap::DashMap;
 use dashmap::mapref::one::RefMut;
 use dashmap::try_result::TryResult;
 use genai::chat::{ChatResponseFormat, JsonSpec, ReasoningEffort, ServiceTier, Verbosity};
+#[allow(unused_imports)]
+use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-#[allow(unused_imports)]
-use log::{debug, error, info, trace, warn};
 use tower_lsp_server::lsp_types::*;
 use tower_lsp_server::{Client, LanguageServer, UriExt};
 
@@ -527,10 +527,14 @@ impl LanguageServer for Backend {
         }
 
         let highlighter = &self.highlighter;
-        let hit =
-            crate::cursor_context::token_at(tmp.as_mut_slice(), line_no, utf16_offset, &mut |line| {
+        let hit = crate::cursor_context::token_at(
+            tmp.as_mut_slice(),
+            line_no,
+            utf16_offset,
+            &mut |line| {
                 line.tokens = highlighter.text_to_lindera_token(line.text.as_str());
-            });
+            },
+        );
         let Some((_ix, tkn)) = hit else {
             return Ok(None);
         };
@@ -675,8 +679,8 @@ impl LanguageServer for Backend {
 
         let prompt_fn = Backend::ctx_to_prompt_name(context);
         debug!("Prompt: {}", prompt_fn);
-        let (prompt, options) =
-            crate::frontmatter::load_prompt(prompt_fn).unwrap_or_else(|| panic!("{} not found", prompt_fn));
+        let (prompt, options) = crate::frontmatter::load_prompt(prompt_fn)
+            .unwrap_or_else(|| panic!("{} not found", prompt_fn));
 
         let workspace = &self
             .client
@@ -696,13 +700,24 @@ impl LanguageServer for Backend {
             .unwrap();
         let chapter = chapter.file_prefix().unwrap().to_str().unwrap_or("99");
         debug!("Prompt: {:?}", chapter);
-        let prompt = prompt.replace("{{CHAPTER}}", chapter);
+
+        // 本文をプロンプトへ埋め込む(単一パス展開。本文が偶然 "{{CHAPTER}}" 等の
+        // プレースホルダ表記を含んでいても再走査で二重展開されない。frontmatter::expand
+        // 参照)。テンプレートが {{TEXT}} を持たない(未更新の md)場合のみ、従来どおり
+        // 本文を別メッセージとして追加するフォールバックを使う。
+        let text_body = before.join("");
+        let mut vars = HashMap::from([("CHAPTER", chapter), ("TEXT", text_body.as_str())]);
+        let prompt = crate::frontmatter::expand(&prompt, &vars);
+
+        // 直前テキストの末尾文字。候補への句点前置要否の判定に使う
+        // (decorate_candidate参照。読点等の直後には句点を重ねない)。
+        let prev_tail = text_body.chars().next_back();
 
         // LLM 応答待ちの間、クライアントへ進捗を表示する(Zed の activity indicator)。
         // クライアントがリクエストに付けた workDoneToken があれば優先し、
         // 無ければサーバ発トークンを window/workDoneProgress/create で登録する。
         // Drop ガードで必ずprogressの終了がが送られる
-        let progress = CompletionProgress::begin(
+        let _progress = CompletionProgress::begin(
             &self.client,
             self.work_done_progress_supported
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -720,7 +735,6 @@ impl LanguageServer for Backend {
                 ));
                 l.add_tool(crate::tools::PlotInfoTool::new(workspace));
                 l.add(Content::Text(prompt));
-                l.add(Content::Text(before.join("")));
 
                 l.reasoning_level(0.0); // 速度優先
 
@@ -759,35 +773,10 @@ impl LanguageServer for Backend {
                     offset.saturating_sub(precursor_len as usize) as u32,
                 );
 
-                let items = response
-                    .lines()
+                let items = crate::cursor_context::extract_candidate_lines(&response)
+                    .into_iter()
                     .map(|r| {
-                        let sr = match context {
-                            CursorContext::BeforeClosingBracket => {
-                                if !r.starts_with('。') {
-                                    "。".to_string() + r
-                                } else if r.ends_with('。') {
-                                    r.strip_suffix("。").unwrap_or(r).to_string()
-                                } else {
-                                    r.to_string()
-                                }
-                            }
-                            CursorContext::EmptyBracket => {
-                                if r.ends_with('。') {
-                                    r.strip_suffix("。").unwrap_or(r).to_string()
-                                } else {
-                                    r.to_string()
-                                }
-                            }
-                            CursorContext::AfterClosingBracket => "\n".to_string() + r,
-                            _ => {
-                                if !r.ends_with('。') {
-                                    r.to_string() + "。"
-                                } else {
-                                    r.to_string()
-                                }
-                            }
-                        };
+                        let sr = crate::cursor_context::decorate_candidate(context, r, prev_tail);
 
                         debug!("record candidate");
                         self.db
@@ -1018,6 +1007,9 @@ impl Backend {
         let mut ref_llm = self.llm.lock().await;
 
         if let Some(llm) = ref_llm.deref_mut() {
+            // 前回リクエストの max_tokens/temperature/reasoning_level 等が
+            // 失敗・キャンセル時に持ち越されないよう、適用前に既定値へ戻す。
+            llm.reset_options();
             if let Some(v) = option.get("max_tokens")
                 && let Ok(n) = v.parse::<u32>()
             {

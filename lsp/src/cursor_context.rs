@@ -204,7 +204,10 @@ pub fn token_at(
         "line_no: {}, utf16_offset: {}, byte_offset: {}",
         line_no, utf16_offset, byte_offset
     );
-    trace!("{}", texts[line_no].text.chars().take(45).collect::<String>());
+    trace!(
+        "{}",
+        texts[line_no].text.chars().take(45).collect::<String>()
+    );
 
     texts[line_no]
         .tokens // Linderaは半角スペースをtokenにしない
@@ -222,8 +225,8 @@ fn cursor_tkn(
 ) -> (usize, usize, Option<CachedLinderaToken>) {
     debug!("cursor_tkn");
 
-    let find_result = token_at(texts, line_no, utf16_offset, tokenize_line_no)
-        .map(|(ix, tkn)| (ix, Some(tkn)));
+    let find_result =
+        token_at(texts, line_no, utf16_offset, tokenize_line_no).map(|(ix, tkn)| (ix, Some(tkn)));
 
     let ix_at_end = texts[line_no].tokens.len();
 
@@ -360,13 +363,92 @@ pub fn before_sentences_upto(
     result
 }
 
+/// LLM の生レスポンスを、候補行の列へ分割する。
+///
+/// モデルはまれに「これから挙げる候補の意図」を独り言のように書き出してから
+/// 空行を挟んで実際の候補を続けることがある(観測例: 意図説明2行 + 空行 + 実際の
+/// 候補3行、という計6行の応答)。これをそのまま `.lines()` するとダミー候補が
+/// 混入し、空行自体も `decorate_candidate` の既定分岐で「。」だけの幽霊候補になる。
+///
+/// このため、応答内に空行があれば**最後の空行より後ろ**を実際の候補群とみなし、
+/// そこに実質的な行が1つでもあればそちらを採用する(モデルが前置きと本題を
+/// 空行で区切る、という観測された振る舞いに対する経験則)。空行が無い、または
+/// 空行の後ろに実質的な行が無い(末尾の空行のみ等)場合は、全体から空行だけを
+/// 除いたものを返す。
+pub(crate) fn extract_candidate_lines(response: &str) -> Vec<&str> {
+    let lines: Vec<&str> = response.lines().collect();
+    let last_blank = lines.iter().rposition(|l| l.trim().is_empty());
+    let segment: &[&str] = match last_blank {
+        Some(idx) if lines[idx + 1..].iter().any(|l| !l.trim().is_empty()) => {
+            debug!("Irregal response: {:?}", lines[0..idx].join("\\n"));
+            &lines[idx + 1..]
+        }
+        _ => &lines[..],
+    };
+    segment
+        .iter()
+        .copied()
+        .filter(|l| !l.trim().is_empty())
+        .collect()
+}
+
+/// 前文の末尾がこの文字なら、続く候補の先頭に句点「。」を前置しない。
+/// 読点・句点・感嘆符等の直後に句点を重ねると不自然になるほか、
+/// 開き括弧の直後(会話の書き出し)にも句点は不要。
+fn ends_with_no_period_needed(c: char) -> bool {
+    matches!(c, '、' | '。' | '！' | '？' | '…' | '―' | '「' | '『')
+}
+
+/// LLM の生候補(1行)を、カーソル文脈と直前テキストの末尾文字に応じて整形する。
+///
+/// `prev_tail` はカーソル直前の文字(=候補の直前に来る文字。無ければ `None`)。
+/// `BeforeClosingBracket`(閉じ括弧の直前)では、句点の付与/除去を独立した
+/// 2ステップとして扱う:
+///   1. 候補末尾の「。」は常に除去する(`」` の直前に句点は置かない慣習のため)
+///   2. 候補先頭への「。」前置は、前文が読点等で終わっていない場合のみ行う
+/// 以前は if/else if/else の排他分岐だったため、候補が「。」で終わる場合に
+/// 末尾除去が働かず `。わかった。` のような二重句点が生じていた。
+pub(crate) fn decorate_candidate(
+    context: CursorContext,
+    raw: &str,
+    prev_tail: Option<char>,
+) -> String {
+    match context {
+        CursorContext::BeforeClosingBracket => {
+            let trimmed = raw.strip_suffix('。').unwrap_or(raw);
+            let needs_period =
+                !trimmed.starts_with('。') && !prev_tail.is_some_and(ends_with_no_period_needed);
+            if needs_period {
+                format!("。{trimmed}")
+            } else {
+                trimmed.to_string()
+            }
+        }
+        CursorContext::EmptyBracket => {
+            if let Some(t) = raw.strip_suffix('。') {
+                t.to_string()
+            } else {
+                raw.to_string()
+            }
+        }
+        CursorContext::AfterClosingBracket => "\n".to_string() + raw,
+        _ => {
+            if !raw.ends_with('。') {
+                raw.to_string() + "。"
+            } else {
+                raw.to_string()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::highlight::Highlighter;
-    use crate::types::{CursorContext, LineData};
     use crate::cursor_context::before_sentences_upto;
     use crate::cursor_context::classify_complesion_mode;
     use crate::cursor_context::token_at;
+    use crate::highlight::Highlighter;
+    use crate::types::{CursorContext, LineData};
     use dashmap::DashMap;
     // use indoc::indoc;
     use regex::Regex;
@@ -480,10 +562,7 @@ mod tests {
     fn empty_bracket() {
         let mut text = lines("「」");
         let td = TestData::new();
-        assert_eq!(
-            td.classify(&mut text, 0, 1),
-            CursorContext::EmptyBracket
-        );
+        assert_eq!(td.classify(&mut text, 0, 1), CursorContext::EmptyBracket);
     }
 
     // TODO Linderaの挙動で、このパターンは適切に動かない
@@ -562,10 +641,7 @@ mod tests {
         let mut text = lines("これは途中");
         let td = TestData::new();
         let offset = text[0].text.chars().count();
-        assert_eq!(
-            td.classify(&mut text, 0, offset),
-            CursorContext::Other
-        );
+        assert_eq!(td.classify(&mut text, 0, offset), CursorContext::Other);
     }
 
     #[test]
@@ -573,20 +649,14 @@ mod tests {
         let mut text = lines("　これは段落頭");
         let td = TestData::new();
         let offset = 0;
-        assert_eq!(
-            td.classify(&mut text, 0, offset),
-            CursorContext::Other
-        );
+        assert_eq!(td.classify(&mut text, 0, offset), CursorContext::Other);
     }
 
     #[test]
     fn other_empty_document() {
         let mut text = lines("");
         let td = TestData::new();
-        assert_eq!(
-            td.classify(&mut text, 0, 0),
-            CursorContext::Other
-        );
+        assert_eq!(td.classify(&mut text, 0, 0), CursorContext::Other);
     }
 
     #[test]
@@ -607,10 +677,7 @@ mod tests {
         // → next_significantが」 → BeforeClosingBracket
         let mut text = lines("「『内側』」");
         let td = TestData::new();
-        assert_eq!(
-            td.classify(&mut text, 0, 0),
-            CursorContext::Other
-        );
+        assert_eq!(td.classify(&mut text, 0, 0), CursorContext::Other);
 
         let offset = "「『内側』".chars().count();
         assert_eq!(
@@ -730,9 +797,12 @@ mod tests {
         let td = TestData::new();
 
         let mut tokenize = |line: &mut LineData| td.tokenize(line);
-        let inside = token_at(&mut texts, 0, 1, &mut tokenize)
-            .expect("utf16_offset=1 should hit a token");
-        assert_eq!(&texts[0].text[inside.1.byte_start..inside.1.byte_end], "田中");
+        let inside =
+            token_at(&mut texts, 0, 1, &mut tokenize).expect("utf16_offset=1 should hit a token");
+        assert_eq!(
+            &texts[0].text[inside.1.byte_start..inside.1.byte_end],
+            "田中"
+        );
 
         let mut tokenize = |line: &mut LineData| td.tokenize(line);
         let after = token_at(&mut texts, 0, 2, &mut tokenize)
@@ -742,7 +812,10 @@ mod tests {
             (inside.1.byte_start, inside.1.byte_end),
             "「田中」の直後は別トークンにヒットするはず"
         );
-        assert_eq!(after.1.byte_start, inside.1.byte_end, "境界が「田中」の直後(バイト6)であること");
+        assert_eq!(
+            after.1.byte_start, inside.1.byte_end,
+            "境界が「田中」の直後(バイト6)であること"
+        );
     }
 
     #[test]
@@ -772,5 +845,159 @@ mod tests {
         // ミスしていた、UTF-16化の差分を検証するケース。
         let (_, tkn) = token_at(&mut texts, 0, 3, &mut noop).expect("offset=3 should hit");
         assert_eq!(&texts[0].text[tkn.byte_start..tkn.byte_end], "田中");
+    }
+
+    // ---- decorate_candidate のテスト ----
+
+    #[test]
+    fn test_decorate_before_closing_bracket_after_touten_no_period() {
+        // 回帰: 「そうか、」の直後で補完すると「。わかった」の「。」が
+        // 前文の読点と重なって「、。」になっていた。
+        use crate::cursor_context::decorate_candidate;
+        let got = decorate_candidate(CursorContext::BeforeClosingBracket, "わかった", Some('、'));
+        assert_eq!(got, "わかった", "読点の直後には句点を前置しないこと");
+    }
+
+    #[test]
+    fn test_decorate_before_closing_bracket_strips_trailing_period_even_with_touten_prev() {
+        use crate::cursor_context::decorate_candidate;
+        let got = decorate_candidate(
+            CursorContext::BeforeClosingBracket,
+            "わかった。",
+            Some('、'),
+        );
+        assert_eq!(got, "わかった");
+    }
+
+    #[test]
+    fn test_decorate_before_closing_bracket_strips_trailing_period_normally() {
+        // 以前の排他分岐では「先頭に。が無い」branchに入り、末尾の「。」が
+        // 除去されず「。わかった。」のような二重句点になっていた。
+        use crate::cursor_context::decorate_candidate;
+        let got = decorate_candidate(
+            CursorContext::BeforeClosingBracket,
+            "わかった。",
+            Some('田'),
+        );
+        assert_eq!(
+            got, "。わかった",
+            "通常文字の後は前置しつつ、末尾の句点は除去すること"
+        );
+    }
+
+    #[test]
+    fn test_decorate_before_closing_bracket_prepends_period_after_normal_char() {
+        use crate::cursor_context::decorate_candidate;
+        let got = decorate_candidate(CursorContext::BeforeClosingBracket, "わかった", Some('田'));
+        assert_eq!(got, "。わかった");
+    }
+
+    #[test]
+    fn test_decorate_before_closing_bracket_no_prev_tail_prepends_period() {
+        // 前文が空(行頭など)の場合は従来どおり前置する。
+        use crate::cursor_context::decorate_candidate;
+        let got = decorate_candidate(CursorContext::BeforeClosingBracket, "わかった", None);
+        assert_eq!(got, "。わかった");
+    }
+
+    #[test]
+    fn test_decorate_before_closing_bracket_candidate_already_starts_with_period() {
+        use crate::cursor_context::decorate_candidate;
+        let got = decorate_candidate(
+            CursorContext::BeforeClosingBracket,
+            "。わかった",
+            Some('田'),
+        );
+        assert_eq!(got, "。わかった", "既に句点始まりなら重ねて前置しないこと");
+    }
+
+    #[test]
+    fn test_decorate_empty_bracket_strips_trailing_period() {
+        use crate::cursor_context::decorate_candidate;
+        assert_eq!(
+            decorate_candidate(CursorContext::EmptyBracket, "そうか。", Some('「')),
+            "そうか"
+        );
+        assert_eq!(
+            decorate_candidate(CursorContext::EmptyBracket, "そうか", Some('「')),
+            "そうか"
+        );
+    }
+
+    #[test]
+    fn test_decorate_after_closing_bracket_prepends_newline() {
+        use crate::cursor_context::decorate_candidate;
+        assert_eq!(
+            decorate_candidate(CursorContext::AfterClosingBracket, "地の文", Some('」')),
+            "\n地の文"
+        );
+    }
+
+    #[test]
+    fn test_decorate_other_appends_period_unless_present() {
+        use crate::cursor_context::decorate_candidate;
+        assert_eq!(
+            decorate_candidate(CursorContext::Other, "続きの文", Some('。')),
+            "続きの文。"
+        );
+        assert_eq!(
+            decorate_candidate(CursorContext::Other, "続きの文。", Some('。')),
+            "続きの文。"
+        );
+    }
+
+    // ---- extract_candidate_lines のテスト ----
+
+    #[test]
+    fn test_extract_candidate_lines_drops_preamble_before_last_blank_line() {
+        // 回帰: モデルが意図説明2行→空行→実際の候補3行、という応答を返し、
+        // 意図説明が候補として混入していた(DB実データで再現した件)。
+        use crate::cursor_context::extract_candidate_lines;
+        let response = "目前の平穏と、いつ何時始まるかの懸念をつなぐ一文。\n\
+                         原少将の艦隊が置かれた状況を掘り下げ、次なる展開への導入とする。\n\
+                         \n\
+                         海図台に向き直り、緊張した空気が張り詰めていた。\n\
+                         はるか水平線の彼方に不審な影を認めなかった。\n\
+                         いつ敵情が現れても即座に対応できるよう命じた。";
+        let got = extract_candidate_lines(response);
+        assert_eq!(
+            got,
+            vec![
+                "海図台に向き直り、緊張した空気が張り詰めていた。",
+                "はるか水平線の彼方に不審な影を認めなかった。",
+                "いつ敵情が現れても即座に対応できるよう命じた。",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_candidate_lines_no_blank_line_keeps_all() {
+        use crate::cursor_context::extract_candidate_lines;
+        let response = "候補1\n候補2\n候補3";
+        assert_eq!(
+            extract_candidate_lines(response),
+            vec!["候補1", "候補2", "候補3"]
+        );
+    }
+
+    #[test]
+    fn test_extract_candidate_lines_trailing_blank_line_does_not_discard_all() {
+        // 末尾に空行があるだけの場合(最後の空行の後ろに実質行が無い)は
+        // 前置き扱いせず、全体から空行だけを除いたものを返す。
+        use crate::cursor_context::extract_candidate_lines;
+        let response = "候補1\n候補2\n候補3\n\n";
+        assert_eq!(
+            extract_candidate_lines(response),
+            vec!["候補1", "候補2", "候補3"]
+        );
+    }
+
+    #[test]
+    fn test_extract_candidate_lines_filters_blank_lines_without_preamble() {
+        use crate::cursor_context::extract_candidate_lines;
+        let response = "候補1\n\n候補2\n候補3";
+        // 空行はあるが、後ろに実質行がある場合はその空行以降のみを採用する仕様どおり、
+        // 空行より前の"候補1"は前置き扱いで捨てられる(観測された振る舞いに合わせた仕様)。
+        assert_eq!(extract_candidate_lines(response), vec!["候補2", "候補3"]);
     }
 }

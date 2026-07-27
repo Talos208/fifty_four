@@ -732,6 +732,10 @@ pub async fn run(
 
         let update_id = recorder.record_character_update(&uri, &model_name, &prompt);
 
+        // llm_client は周期実行間で使い回される(background_llm)ため、前回サイクルの
+        // response_format 等が失敗・キャンセル時に持ち越されないよう先にリセットする。
+        llm_client.reset_options();
+
         let structured = llm_client
             .capabilities()
             .contains(ModelCapability::STRUCTURED_OUTPUT);
@@ -1307,8 +1311,10 @@ async fn run_batch_merge(
     let total_sections: usize = groups.iter().map(|g| g.sections.len()).sum();
     let max_tokens = (512 + 512 * total_sections as u32).min(8192);
 
-    // chat() がオプションをリセットするため、初回・リトライの両方で設定する
+    // chat() は成功時のみオプションをリセットするため、初回・リトライの両方で
+    // reset_options() から設定し直す(前回サイクル/前回試行の残留を防ぐ)
     let set_llm_options = |llm_client: &mut dyn LlmInterface| {
+        llm_client.reset_options();
         llm_client.temperature(0.2);
         llm_client.max_tokens(max_tokens);
         llm_client.reasoning_level(0.0);
