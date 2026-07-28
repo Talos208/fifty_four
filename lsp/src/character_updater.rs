@@ -1,7 +1,7 @@
 use crate::character::{CharacterAttribute, parse_all_content, split_aliases};
 use crate::flight_recorder::FlightRecorder;
 use crate::llm::{Content, LlmInterface, ModelCapability};
-use crate::text::shorten_middle;
+use crate::text::{extract_json, shorten_middle};
 use dashmap::DashMap;
 use genai::chat::{ChatResponseFormat, JsonSpec};
 #[allow(unused_imports)]
@@ -97,13 +97,6 @@ pub struct UpdateItem {
     pub name: String,
     pub attribute: String,
     pub text: String,
-}
-
-/// LLM 応答からコードフェンスや前後の説明文を除いた JSON 部分を取り出す。
-fn extract_json(response: &str) -> Option<&str> {
-    let start = response.find('{')?;
-    let end = response.rfind('}')?;
-    (start <= end).then(|| &response[start..=end])
 }
 
 /// JSON 値をセクション本文向けの可読文字列へフラット化する。

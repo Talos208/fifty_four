@@ -58,9 +58,33 @@ pub(crate) struct Backend {
     character_cache: CharacterCache,
     // URI ごとのキャラクター更新トリガー状態
     update_states: DashMap<String, Arc<parking_lot::Mutex<UpdateState>>>,
+    // URI ごとの直近で実際に LLM を呼んだ code_action 呼び出し時刻(デバウンス用)。
+    // 詳細は `CODE_ACTION_DEBOUNCE` のドキュメント参照。
+    code_action_last_call: DashMap<String, std::time::Instant>,
     // クライアントが window/workDoneProgress をサポートするか(initialize で判定)
     work_done_progress_supported: std::sync::atomic::AtomicBool,
 }
+
+/// code_action のデバウンス時間。
+///
+/// Zed は codeAction リクエストに trigger_kind を一切送らない(常に None)ため、サーバ側は
+/// 「メニューから明示的に起動」と「選択/カーソル変更のたびの自動ポーリング(250ms
+/// デバウンス、Zed 側 `CODE_ACTIONS_DEBOUNCE_TIMEOUT`)」を区別できない。加えて Zed は
+/// 選択が変わるたびに前回のフェッチを新しいものへ差し替える(`$/cancelRequest` で古い
+/// リクエストの future を drop する)ため、ユーザーの操作テンポが LLM 応答より速いと
+/// 一度も完走できずに稲妻マークが出ない、という問題が起きる。
+///
+/// sleep して「自分が最新か」を確認する方式ではなく、`code_action_last_call` に記録した
+/// 直近の(実際に LLM まで進んだ)呼び出し時刻と比較するだけの、待ちを挟まない実装。
+/// 前回の呼び出しからこの時間内なら即 `Ok(None)` で弾き(bounce)、この時間以上経って
+/// いれば即座に LLM を呼ぶ(単発の明示的起動には一切待ちが乗らない)。
+///
+/// トレードオフ: 短時間に複数回呼ばれた場合、character_updater の idle_trigger のように
+/// 「最後の1回」が確実に生き残るわけではない(その後方に呼び出しが無ければ弾かれたまま
+/// 誰も LLM を呼ばずに終わる)。実運用では Zed 自身も選択安定後にしか送らない
+/// (250msデバウンス)ため、連打が起きるのは短時間に選択をいじり続けた場合に限られ、
+/// その場合は最後の調整を取りこぼしても選び直せば済む、という前提で許容している。
+const CODE_ACTION_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(800);
 
 fn build_llm_client(cfg: &serde_json::Value) -> Box<dyn LlmInterface> {
     let sys_prompt = crate::assets::load("system.md");
@@ -269,6 +293,15 @@ impl LanguageServer for Backend {
                     },
                 ),
             ),
+            // 選択範囲(無ければカーソルの文)を LLM で書き換える code action。
+            // 「※」があればそこに当てはまる語、無ければ表現改善の候補を複数提示する。
+            code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+                code_action_kinds: Some(vec![CodeActionKind::REFACTOR_REWRITE]),
+                resolve_provider: Some(false),
+                work_done_progress_options: WorkDoneProgressOptions {
+                    work_done_progress: None,
+                },
+            })),
             completion_provider: Some(CompletionOptions {
                 resolve_provider: None,
                 trigger_characters: Some(vec!["、".into(), "「".into(), "『".into()]),
@@ -466,6 +499,8 @@ impl LanguageServer for Backend {
 
         self.text.remove(params.text_document.uri.as_str());
         self.update_states.remove(params.text_document.uri.as_str());
+        self.code_action_last_call
+            .remove(params.text_document.uri.as_str());
     }
 
     /// ドキュメント全体に対する semantic tokens の問い合わせに応答します。
@@ -589,6 +624,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri.as_str();
         let line_no = params.text_document_position.position.line as usize;
         let offset = params.text_document_position.position.character as usize;
+
         let (context, before, precursor_token) = {
             let before = crate::cursor_context::before_sentences_upto(
                 // tmp.as_mut_slice(),
@@ -722,6 +758,7 @@ impl LanguageServer for Backend {
             self.work_done_progress_supported
                 .load(std::sync::atomic::Ordering::Relaxed),
             params.work_done_progress_params.work_done_token.clone(),
+            "LLM補完を生成中",
             "候補を生成しています…",
         )
         .await;
@@ -843,6 +880,218 @@ impl LanguageServer for Backend {
                 Err(tower_lsp_server::jsonrpc::Error::invalid_params(
                     err.to_string(),
                 ))
+            }
+        }
+    }
+
+    /// 選択範囲(無ければカーソルの文)を LLM で書き換える code action。
+    ///
+    /// - 対象内に「※」があれば、そこに当てはまる語の候補を複数提示する
+    /// - 無ければ、意味を変えずに表現を改善した候補を複数提示する
+    ///
+    /// Zed はガター電球の表示判定のため、カーソル移動のたびにこのハンドラを叩く。
+    /// 無条件に LLM を呼ぶとレイテンシ・コストが破綻するため、次の2段階でゲートする:
+    /// 1. `trigger_kind == INVOKED`、または `trigger_kind` 未送信(`None`)かつ選択範囲が
+    ///    ある場合のみ先へ進む(`AUTOMATIC`、または未送信でカーソルのみは `Ok(None)`)。
+    /// 2. 前回 LLM まで進んだ呼び出しから `CODE_ACTION_DEBOUNCE` 未満なら `Ok(None)` で
+    ///    弾く(sleep せず、前回呼び出し時刻との比較のみ)。
+    async fn code_action(
+        &self,
+        params: CodeActionParams,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<CodeActionResponse>> {
+        debug!(
+            "code_action: trigger_kind={:?}, range={:?}",
+            params.context.trigger_kind, params.range
+        );
+
+        let has_selection = params.range.start != params.range.end;
+        let should_run = match params.context.trigger_kind {
+            Some(CodeActionTriggerKind::INVOKED) => true,
+            None => has_selection,
+            _ => false,
+        };
+        if !should_run {
+            debug!(
+                "code_action: skip (trigger_kind={:?}, has_selection={})",
+                params.context.trigger_kind, has_selection
+            );
+            return Ok(None);
+        }
+
+        let uri = params.text_document.uri.as_str();
+
+        // デバウンス: 前回実際に LLM まで進んだ呼び出しからこの時間内なら弾く(sleep はしない)。
+        // 詳細は `CODE_ACTION_DEBOUNCE` のドキュメント参照。
+        let now = std::time::Instant::now();
+        let bounced = self
+            .code_action_last_call
+            .get(uri)
+            .is_some_and(|last| now.duration_since(*last) < CODE_ACTION_DEBOUNCE);
+        if bounced {
+            debug!("code_action: bounced (uri={})", uri);
+            return Ok(None);
+        }
+        self.code_action_last_call.insert(uri.to_string(), now);
+
+        // 対象範囲・モード・対象テキストを1回のロックで確定する(before_sentences_upto は
+        // 自前でロックを取るため、その前にこのロックを解放しておく必要がある)。
+        let (target_range, mode, target_text) = {
+            let mut tmp: RefMut<_, _> = match self.text.try_get_mut(uri) {
+                TryResult::Locked | TryResult::Absent => return Ok(None),
+                TryResult::Present(t) => t,
+            };
+            let highlighter = &self.highlighter;
+            let target_range = if has_selection {
+                params.range
+            } else {
+                crate::cursor_context::sentence_range_at(
+                    tmp.as_mut_slice(),
+                    params.range.start.line as usize,
+                    params.range.start.character as usize,
+                    |line| {
+                        line.tokens = highlighter.text_to_lindera_token(line.text.as_str());
+                    },
+                )
+            };
+            let mode = crate::code_action::decide_mode(tmp.as_slice(), target_range);
+            let target_text = crate::code_action::slice_range(tmp.as_slice(), target_range);
+            (target_range, mode, target_text)
+        };
+
+        if target_text.trim().is_empty() {
+            debug!("code_action: target_text is empty, skip");
+            return Ok(None);
+        }
+
+        // LLMの起動をちょっと待つ（Zed側でdropされるの待ち）
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let before = crate::cursor_context::before_sentences_upto(
+            &self.text,
+            uri,
+            target_range.start.line as usize,
+            target_range.start.character as usize,
+            10,
+            |ln| {
+                let mut t = match self.text.try_get_mut(uri) {
+                    TryResult::Locked | TryResult::Absent => return,
+                    TryResult::Present(t) => t,
+                };
+                let Some(l) = t.get_mut(ln) else { return };
+                l.tokens = self.highlighter.text_to_lindera_token(l.text.as_str());
+            },
+        );
+
+        let prompt_name = match mode {
+            crate::code_action::ActionMode::FillMark { .. } => "prompt_fill_mark.md",
+            crate::code_action::ActionMode::Rephrase => "prompt_rephrase.md",
+        };
+        let (prompt, options) = match crate::frontmatter::load_prompt(prompt_name) {
+            Some(v) => v,
+            None => {
+                error!("{} not found", prompt_name);
+                return Ok(None);
+            }
+        };
+
+        let workspace = &self
+            .client
+            .workspace_folders()
+            .await
+            .unwrap_or(None)
+            .unwrap_or(vec![])
+            .first()
+            .map(|v| v.uri.to_file_path().unwrap().into_owned())
+            .unwrap_or_default();
+
+        let chapter = params.text_document.uri.to_file_path().unwrap();
+        let chapter = chapter.file_prefix().unwrap().to_str().unwrap_or("99");
+
+        let before_text = before.join("");
+        let vars = HashMap::from([
+            ("CHAPTER", chapter),
+            ("TEXT", before_text.as_str()),
+            ("TARGET", target_text.as_str()),
+        ]);
+        let prompt = crate::frontmatter::expand(&prompt, &vars);
+
+        let _progress = CompletionProgress::begin(
+            &self.client,
+            self.work_done_progress_supported
+                .load(std::sync::atomic::Ordering::Relaxed),
+            params.work_done_progress_params.work_done_token.clone(),
+            "書き換え候補を生成中",
+            "候補を生成しています…",
+        )
+        .await;
+
+        let raw = self
+            .use_llm_with_option(options, async |l| {
+                l.add_tool(crate::tools::CharacterInfoTool::new(
+                    workspace,
+                    self.character_cache.clone(),
+                ));
+                l.add_tool(crate::tools::PlotInfoTool::new(workspace));
+                l.add(Content::Text(prompt));
+
+                l.reasoning_level(0.0); // 速度優先
+
+                l.chat().await
+            })
+            .await;
+
+        match raw {
+            Ok(response) => {
+                let candidates = crate::code_action::parse_candidates(&response);
+                if candidates.is_empty() {
+                    debug!("code_action: no candidates extracted");
+                    return Ok(None);
+                }
+
+                let edit_range = match mode {
+                    crate::code_action::ActionMode::FillMark { mark } => mark,
+                    crate::code_action::ActionMode::Rephrase => target_range,
+                };
+
+                let actions = candidates
+                    .into_iter()
+                    .map(|candidate| {
+                        // 切り詰め不要。CodeActionではtitleが長すぎると自動的に末尾を切りつめ、titleを documentation 相当として表示する
+                        let edit = WorkspaceEdit {
+                            changes: Some(HashMap::from([(
+                                params.text_document.uri.clone(),
+                                vec![TextEdit {
+                                    range: edit_range,
+                                    new_text: candidate.clone(),
+                                }],
+                            )])),
+                            ..Default::default()
+                        };
+                        CodeActionOrCommand::CodeAction(CodeAction {
+                            title: candidate,
+                            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                            edit: Some(edit),
+                            ..Default::default()
+                        })
+                    })
+                    .collect();
+
+                Ok(Some(actions))
+            }
+            Err(err) => {
+                error!("Error on code_action: {:?}", err);
+
+                if let LlmError::LlmBusy { retry_after: _ } = err {
+                    self.client
+                        .show_message(
+                            MessageType::WARNING,
+                            "現在LLMが混雑しています。しばらくしてから再度試してください",
+                        )
+                        .await;
+                }
+
+                // code action で Err を返すとクライアント側の挙動が読めないため None にする。
+                Ok(None)
             }
         }
     }
@@ -971,6 +1220,7 @@ impl Backend {
             db: Arc::new(FlightRecorder::open_default()),
             character_cache: CharacterCache::new(),
             update_states: DashMap::new(),
+            code_action_last_call: DashMap::new(),
             work_done_progress_supported: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -1087,14 +1337,27 @@ impl Backend {
 
             let result = proc(llm).await;
 
-            // schema が指定されていた場合、レスポンスが valid JSON であることを検証する
+            // schema が指定されていた場合、レスポンスが valid JSON であることを検証する。
+            // そのままパースできない場合は、コードフェンスや前置きを剥がした `{...}` を
+            // 切り出して再試行する(構造化出力非対応のモデルは、プロンプトで JSON を
+            // 要求しても ```json フェンスを付けてくることがある)。
             if has_schema {
                 return result.and_then(|s| {
-                    serde_json::from_str::<serde_json::Value>(&s)
-                        .map(|_| s)
-                        .map_err(|e| LlmError::JsonParseError {
-                            message: format!("LLM response is not valid JSON: {}", e),
-                        })
+                    if serde_json::from_str::<serde_json::Value>(&s).is_ok() {
+                        return Ok(s);
+                    }
+                    match crate::text::extract_json(&s) {
+                        Some(json) if serde_json::from_str::<serde_json::Value>(json).is_ok() => {
+                            debug!("schema: salvaged JSON from fenced/prefixed response");
+                            Ok(json.to_string())
+                        }
+                        _ => Err(LlmError::JsonParseError {
+                            message: format!(
+                                "LLM response is not valid JSON: {}",
+                                crate::text::shorten(&s, 200)
+                            ),
+                        }),
+                    }
                 });
             }
             return result;

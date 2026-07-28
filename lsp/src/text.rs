@@ -34,6 +34,17 @@ pub(crate) fn precursor_word(line_text: &str, utf16_offset: usize) -> &str {
     &prefix[start..]
 }
 
+/// LLM 応答からコードフェンスや前後の説明文を除いた JSON 部分を取り出す。
+///
+/// 構造化出力(`ChatResponseFormat::JsonSpec`)非対応のモデルにプロンプトで JSON を
+/// 要求すると、```json フェンスや「以下が結果です」といった前置きが付いてくることがある。
+/// 最初の `{` から最後の `}` までを切り出すことでそれらを落とす。
+pub(crate) fn extract_json(response: &str) -> Option<&str> {
+    let start = response.find('{')?;
+    let end = response.rfind('}')?;
+    (start <= end).then(|| &response[start..=end])
+}
+
 pub(crate) fn shorten(s: &str, len: usize) -> String {
     if s.chars().count() > len {
         s.chars().take(len - 2).collect::<String>() + "……"
@@ -125,6 +136,29 @@ mod tests {
 
     fn lines(s: &str) -> Vec<LineData> {
         s.lines().map(|l| LineData::from_str(l).unwrap()).collect()
+    }
+
+    // ---- shorten_middle のテスト ----
+    // code action のメニュー項目で使う。
+    // 長い候補でも「文末がどう変わったか」が見えることが要件。
+
+    #[test]
+    fn test_shorten_middle_keeps_head_and_tail() {
+        let s: String = (0..100)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let got = shorten_middle(&s, 60);
+        assert_eq!(got.chars().count(), 60);
+        // 先頭48文字 + "……" + 末尾10文字
+        assert!(got.starts_with(&s.chars().take(48).collect::<String>()));
+        assert!(got.ends_with(&s.chars().skip(90).collect::<String>()));
+        assert!(got.contains("……"));
+    }
+
+    #[test]
+    fn test_shorten_middle_returns_as_is_when_within_limit() {
+        let s = "一文目です。二文目です。三文目です。";
+        assert_eq!(shorten_middle(s, 60), s);
     }
 
     // ---- precursor_word のテスト ----

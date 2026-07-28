@@ -24,6 +24,7 @@ impl CompletionProgress {
         client: &Client,
         supported: bool,
         client_token: Option<ProgressToken>,
+        title: impl Into<String>,
         message: impl Into<String>,
     ) -> Option<Self> {
         let token = match client_token {
@@ -54,7 +55,7 @@ impl CompletionProgress {
         // OngoingProgress は型パラメータ付きでフィールド保持が煩雑なため使わず、
         // End 通知は send_end() で直接送る(ここでは begin 通知の送信だけが目的)。
         let _ = client
-            .progress(token.clone(), "LLM補完を生成中")
+            .progress(token.clone(), title)
             .with_message(message)
             .begin()
             .await;

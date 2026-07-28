@@ -9,6 +9,7 @@ flowchart LR
         open["did_open / did_change / did_close"]
         sem["semantic_tokens_full"]
         comp["completion"]
+        ca["code_action"]
         cfg["did_change_configuration"]
     end
 
@@ -16,6 +17,7 @@ flowchart LR
         sync["テキスト同期 (incremental)"]
         highlight["セマンティックハイライト"]
         complete["LLM 文章補完"]
+        rewrite["LLM 書き換え(※穴埋め/表現改善)"]
         charupd["キャラ設定自動更新 (非同期)"]
     end
 
@@ -24,6 +26,8 @@ flowchart LR
     open --> charupd
     sem --> highlight
     comp --> complete
+    ca -- "候補を保留" --> comp
+    comp -- "保留があれば消費" --> rewrite
 ```
 
 ## ハンドラ一覧
@@ -37,7 +41,8 @@ flowchart LR
 | `did_change` | 増分更新、補完選択の記録 (debug)、キャラ更新トリガ、トークン refresh |
 | `did_close` | ドキュメント状態のクリーンアップ |
 | `semantic_tokens_full` | Lindera 形態素解析 → 品詞ベースの色分け |
-| `completion` | カーソル文脈に応じた LLM 補完候補生成 |
+| `completion` | カーソル文脈に応じた LLM 補完候補生成。`code_action` が置いた保留中の書き換え候補があれば、それを優先して返す(下記参照) |
+| `code_action` | 選択範囲(無ければカーソルの文)を LLM で書き換える。対象に「※」があればそこに当てはまる語、無ければ表現改善の候補を複数提示する。ユーザーが明示的に要求した場合(`trigger_kind == INVOKED`、または未送信で選択範囲あり)のみ LLM を呼ぶ(電球表示のための自動呼び出しでは呼ばない)。`CodeAction.title` は1行の短い文字列しか持てず(LSP 仕様に documentation 相当のフィールドが無い)長文・改行を表示できないため、候補そのものはメニューに出さず `Ok(None)` を返す。生成した候補は uri ごとに保留し(`Backend::pending_rewrite`)、`window/showMessage` でユーザーに通知する |
 | `did_change_configuration` | ランタイム設定変更 |
 | `did_change_workspace_folders` | ワークスペースフォルダ変更 |
 
@@ -51,6 +56,7 @@ flowchart LR
 | `positionEncoding` | `UTF16`（LSP必須ベースライン。Position.character はUTF-16コード単位） |
 | `semanticTokensProvider` | full のみ（range 無効）、FiftyFour / file スキーム |
 | `completionProvider` | トリガ: `、` `「` `『` / コミット: `。` `」` `』` |
+| `codeActionProvider` | `CodeActionKind::REFACTOR_REWRITE`。selection/cursor の文を LLM で書き換える |
 | `selectionRangeProvider` | 有効 |
 
 ## 初期化オプション
@@ -225,6 +231,28 @@ LSP バイナリの起動コマンドを指示する(Zed 拡張側、`extension/
   }
 }
 ```
+
+## code_action(※穴埋め/表現改善)と completion の連携
+
+`textDocument/codeAction` は `CodeAction.title`(1行の短い文字列)以外に候補内容を表示する
+場所を持たない(`CompletionItem.documentation` に相当するフィールドが LSP 仕様に無い)。
+長文や改行を含む書き換え候補をそのままメニューに出すと文末や2行目以降が見えなくなるため、
+このサーバでは次の2段構えにしている:
+
+1. `code_action` が LLM を呼び、候補(`{"candidates": [...]}` を要求する frontmatter の
+   `schema`。改行はエスケープされて JSON 文字列内に保たれる)を取得する。
+   `Backend::pending_rewrite: DashMap<uri, PendingRewrite>` に保留し、`Ok(None)` を返す
+   (電球メニューには何も表示されない)。`window/showMessage` で件数を通知する。
+2. ユーザーが completion(Ctrl+Space 等)を叩くと、`completion` ハンドラは冒頭で
+   `pending_rewrite` を確認する。該当 uri にエントリがあり、カーソル行が保留範囲の行内なら、
+   通常の「続きの文」補完をスキップしてこの候補を `CompletionItem` として返す(1回消費した
+   ら削除)。ラベルが25文字を超える場合は末尾を省略し、`documentation`
+   (`MarkupContent`、Markdown)に全文を出す(既存の「続きの文」補完と同じ表示方式)。
+   カーソルが保留範囲から大きく外れていれば古い候補とみなして捨て、通常の補完へ進む。
+
+**操作フロー**: 選択範囲(またはカーソルの文)に対して code action を明示的に起動 →
+`window/showMessage` の通知を待つ → 同じ位置で completion を呼ぶ → 候補一覧から選ぶ。
+1ステップの UX ではない点に注意。
 
 ## 内部処理（LSP ハンドラ外）
 

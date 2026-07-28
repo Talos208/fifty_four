@@ -4,6 +4,7 @@ mod assets;
 mod backend;
 mod character;
 mod character_updater;
+mod code_action;
 mod cursor_context;
 mod flight_recorder;
 mod frontmatter;

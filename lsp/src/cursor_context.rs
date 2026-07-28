@@ -4,6 +4,7 @@ use dashmap::DashMap;
 use log::{debug, error, trace};
 use std::cmp::max;
 use std::cmp::min;
+use tower_lsp_server::lsp_types::{Position, Range};
 
 fn is_bracket_open(token: &CachedLinderaToken) -> bool {
     token.details[0] == "記号" && token.details.get(1).map(|s| s.as_str()) == Some("括弧開")
@@ -179,6 +180,75 @@ pub fn classify_complesion_mode(
         return CursorContext::BeforeClosingBracket;
     }
     CursorContext::InBracketOther
+}
+
+/// カーソル位置(`line_no`, `utf16_offset`)を含む「文」の範囲を返す(code action の
+/// 対象範囲決定に使う。選択範囲が無いときのフォールバック)。
+///
+/// 文の境界は `is_end_of_sentence`(句点 or 括弧閉、`classify_complesion_mode` と同じ基準)。
+/// - 開始: カーソルより前方の直近の文末トークンの直後(無ければ文書先頭)
+/// - 終了: カーソル位置以降(カーソル自身のトークンを含む)の最初の文末トークンの直後、
+///   その記号自体を含む(無ければ文書末尾)
+pub(crate) fn sentence_range_at(
+    texts: &mut [LineData],
+    line_no: usize,
+    utf16_offset: usize,
+    mut tokenize_line_no: impl FnMut(&mut LineData),
+) -> Range {
+    if texts[line_no].tokens.is_empty() && !texts[line_no].text.is_empty() {
+        tokenize_line_no(&mut texts[line_no]);
+    }
+    let cursor_byte = crate::types::utf16_to_byte_offset(&texts[line_no].text, utf16_offset);
+    // カーソルを含む、またはカーソル以降の最初のトークンの index。
+    let cursor_ix = texts[line_no]
+        .tokens
+        .iter()
+        .position(|t| t.byte_end > cursor_byte)
+        .unwrap_or(texts[line_no].tokens.len());
+
+    // 開始: カーソルより前方を後方探索(before_token は token_index 未満のみを見るため
+    // カーソル自身のトークンは対象に含まれない)。
+    let (start_line, start_byte) = {
+        let (ln, _ix, tkn) = before_token(texts, line_no, cursor_ix, &mut tokenize_line_no, |t| {
+            is_end_of_sentence(&t)
+        });
+        match tkn {
+            Some(t) => (ln, t.byte_end),
+            None => (0, 0),
+        }
+    };
+
+    // 終了: カーソル位置(自身のトークン含む)から前方探索。
+    let (end_line, end_byte) = {
+        let mut ln = line_no;
+        let mut ix = cursor_ix;
+        loop {
+            if texts.get(ln).is_none() {
+                let last = texts.len().saturating_sub(1);
+                break (last, texts.get(last).map(|l| l.text.len()).unwrap_or(0));
+            }
+            if texts[ln].tokens.is_empty() && !texts[ln].text.is_empty() {
+                tokenize_line_no(&mut texts[ln]);
+            }
+            if let Some(tkn) = texts[ln].tokens.get(ix).cloned() {
+                if is_end_of_sentence(&tkn) {
+                    break (ln, tkn.byte_end);
+                }
+                ix += 1;
+            } else {
+                ln += 1;
+                ix = 0;
+            }
+        }
+    };
+
+    let start_char = crate::types::utf16_len(&texts[start_line].text[..start_byte]) as u32;
+    let end_char = crate::types::utf16_len(&texts[end_line].text[..end_byte]) as u32;
+
+    Range::new(
+        Position::new(start_line as u32, start_char),
+        Position::new(end_line as u32, end_char),
+    )
 }
 
 /// カーソル位置(`line_no`, `utf16_offset`)が指すトークンを、フォールバック無しで返す。
@@ -450,6 +520,7 @@ mod tests {
     use crate::highlight::Highlighter;
     use crate::types::{CursorContext, LineData};
     use dashmap::DashMap;
+    use tower_lsp_server::lsp_types::{Position, Range};
     // use indoc::indoc;
     use regex::Regex;
     use std::str::FromStr;
@@ -999,5 +1070,81 @@ mod tests {
         // 空行はあるが、後ろに実質行がある場合はその空行以降のみを採用する仕様どおり、
         // 空行より前の"候補1"は前置き扱いで捨てられる(観測された振る舞いに合わせた仕様)。
         assert_eq!(extract_candidate_lines(response), vec!["候補2", "候補3"]);
+    }
+
+    // ---- sentence_range_at のテスト ----
+
+    fn sentence_range(td: &TestData, texts: &mut Vec<LineData>, line_no: usize, offset: usize) -> Range {
+        crate::cursor_context::sentence_range_at(texts.as_mut_slice(), line_no, offset, |line| {
+            td.tokenize(line)
+        })
+    }
+
+    #[test]
+    fn test_sentence_range_single_sentence_whole_document() {
+        let mut text = lines("これは文章。");
+        let td = TestData::new();
+        let offset = "これは".chars().count();
+        let r = sentence_range(&td, &mut text, 0, offset);
+        let full = text[0].text.chars().count() as u32;
+        assert_eq!(r, Range::new(Position::new(0, 0), Position::new(0, full)));
+    }
+
+    #[test]
+    fn test_sentence_range_second_of_two_sentences() {
+        let mut text = lines("一文目です。二文目です。");
+        let td = TestData::new();
+        let offset = "一文目です。二文".chars().count();
+        let r = sentence_range(&td, &mut text, 0, offset);
+        let start = "一文目です。".chars().count() as u32;
+        let end = text[0].text.chars().count() as u32;
+        assert_eq!(r, Range::new(Position::new(0, start), Position::new(0, end)));
+    }
+
+    #[test]
+    fn test_sentence_range_cursor_on_trailing_period_included() {
+        // カーソルが句点自体の上にあっても、その文の末尾として扱われる。
+        let mut text = lines("一文目です。二文目です。");
+        let td = TestData::new();
+        let offset = "一文目です".chars().count(); // 「。」の直前(トークン境界)
+        let r = sentence_range(&td, &mut text, 0, offset);
+        let end = "一文目です。".chars().count() as u32;
+        assert_eq!(r, Range::new(Position::new(0, 0), Position::new(0, end)));
+    }
+
+    #[test]
+    fn test_sentence_range_dialogue_lines_crossing_lines() {
+        // 1行目・2行目とも「」で閉じる独立した文。カーソルは2行目の台詞内。
+        let mut text = lines("「セリフ１」\n「セリフ２」");
+        let td = TestData::new();
+        let offset = "「セリフ２".chars().count();
+        let r = sentence_range(&td, &mut text, 1, offset);
+        let line0_len = text[0].text.chars().count() as u32;
+        let line1_len = text[1].text.chars().count() as u32;
+        assert_eq!(
+            r,
+            Range::new(Position::new(0, line0_len), Position::new(1, line1_len))
+        );
+    }
+
+    #[test]
+    fn test_sentence_range_no_trailing_period_extends_to_document_end() {
+        // 末尾に句点が無い(執筆途中)場合は文書末尾までを対象とする。
+        let mut text = lines("一文目です。書きかけの文");
+        let td = TestData::new();
+        let offset = text[0].text.chars().count();
+        let r = sentence_range(&td, &mut text, 0, offset);
+        let start = "一文目です。".chars().count() as u32;
+        let end = text[0].text.chars().count() as u32;
+        assert_eq!(r, Range::new(Position::new(0, start), Position::new(0, end)));
+    }
+
+    #[test]
+    fn test_sentence_range_cursor_at_document_start() {
+        let mut text = lines("これは文章。次の文章。");
+        let td = TestData::new();
+        let r = sentence_range(&td, &mut text, 0, 0);
+        let end = "これは文章。".chars().count() as u32;
+        assert_eq!(r, Range::new(Position::new(0, 0), Position::new(0, end)));
     }
 }
