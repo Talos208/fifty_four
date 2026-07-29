@@ -208,25 +208,19 @@ LSP バイナリの起動コマンドを指示する(Zed 拡張側、`extension/
 拡張(`extension/`)は「FiftyFour」という言語を定義し、対応ファイルを開いたときに LSP を自動起動する。
 
 - 言語定義: `extension/languages/fiftyfour/config.toml` の `path_suffixes = ["txt"]`。つまり**現状 `.txt` 拡張子のファイルのみ**が FiftyFour 言語として認識される(`.md` は対象外)。この設定はブラケット(`「」`等)の自動補完ルールも兼ねる。
-- 拡張のマニフェスト: `extension/extension.toml` の `[language_servers.fifty-four] languages = ["FiftyFour"]` が、この言語のファイルを開いたときに `fifty-four` LSP を起動する紐付け。
+- 拡張のマニフェスト: `extension/extension.toml` の `[language_servers.fifty-four] languages = ["FiftyFour"]` が、この言語のファイルを開いたときに `fifty-four` LSP を起動する紐付けを**自動で**行う。`settings.json` に `languages.FiftyFour.language_servers` を書く必要はない。
 - **LSP 起動に絶対必要なもの**はこの2点(拡張機能自体のインストール ＋ `.txt` ファイルを開くこと)のみで、`settings.json` の記述は必須ではない。`lsp.fifty-four.binary.path` を省略しても、拡張は PATH → 作業ディレクトリ再帰探索の順で `fifty_four_lsp(.exe)` を探し、見つかれば起動する(`extension/src/lib.rs:40-67`)。
-- ただし前述の通り `llm` を設定しない場合は補完・キャラ設定自動更新が動かない(LSP 自体は起動し、セマンティックハイライト等は機能する)。実用上の最低構成は次のとおり:
+- ただし前述の通り `llm` を設定しない場合は補完・キャラ設定自動更新が動かない(LSP 自体は起動し、セマンティックハイライト等は機能する)。実用上の最低構成は次のとおり(`binary.path` は自動探索が効かない環境でのみ必要):
 
 ```json
 {
   "lsp": {
     "fifty-four": {
-      "binary": { "path": "＜fifty_four_lsp(.exe) の絶対パス＞" },
       "initialization_options": {
         "llm": {
           "ondemand": { "provider": "＜任意＞", "model": "＜任意＞" }
         }
       }
-    }
-  },
-  "languages": {
-    "FiftyFour": {
-      "language_servers": ["fifty-four"],
     }
   }
 }

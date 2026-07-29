@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use zed_extension_api as zed;
-use zed_extension_api::{serde_json, Command, Extension, LanguageServerId, Worktree};
+use zed_extension_api::{Command, Extension, LanguageServerId, Worktree, serde_json};
 
 /// 探索するLSPバイナリ名(拡張子なし)
 const LSP_BINARY_NAME: &str = "fifty_four_lsp";
@@ -27,7 +27,10 @@ impl Extension for FiftyFour {
             return Ok(Command {
                 command: path,
                 args: binary.arguments.unwrap_or_default(),
-                env: binary.env.map(|e| e.into_iter().collect()).unwrap_or_default(),
+                env: binary
+                    .env
+                    .map(|e| e.into_iter().collect())
+                    .unwrap_or_default(),
             });
         }
 
@@ -72,26 +75,11 @@ impl Extension for FiftyFour {
         language_server_id: &LanguageServerId,
         worktree: &Worktree,
     ) -> Result<Option<serde_json::Value>, String> {
-        let mut options =
+        let options =
             zed::settings::LspSettings::for_worktree(language_server_id.as_ref(), worktree)
                 .ok()
                 .and_then(|lsp_settings| lsp_settings.initialization_options.clone())
                 .unwrap_or_else(|| zed::serde_json::json!({}));
-
-        let options_obj = options
-            .as_object_mut()
-            .expect("initialization_options must be an object");
-
-        let enabled_features = options_obj
-            .entry("enabledFeatures")
-            .or_insert_with(|| zed::serde_json::json!({}));
-
-        if let Some(features_obj) = enabled_features.as_object_mut() {
-            // TODO
-            features_obj
-                .entry("onTypeFormatting")
-                .or_insert(zed::serde_json::Value::Bool(false));
-        }
 
         Ok(Some(options))
     }
