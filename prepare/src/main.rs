@@ -65,7 +65,10 @@ fn package(release: bool, target: Option<&str>) {
     let profile_label = if release { "release" } else { "debug" };
 
     match target {
-        Some(t) => println!("Building fifty_four_lsp ({}, target={})...", profile_label, t),
+        Some(t) => println!(
+            "Building fifty_four_lsp ({}, target={})...",
+            profile_label, t
+        ),
         None => println!("Building fifty_four_lsp ({})...", profile_label),
     }
     let mut build_args = vec!["-p", "fifty_four_lsp"];
@@ -91,10 +94,12 @@ fn package(release: bool, target: Option<&str>) {
     };
     let dist_dir = repo_root.join("dist").join(&dist_name);
     if dist_dir.exists() {
-        fs::remove_dir_all(&dist_dir)
-            .unwrap_or_else(|e| panic!("削除に失敗 {:?}: {}", dist_dir, e));
+        // dist_dir 自体の削除・再作成はしない(Google Drive 等の同期対象になっていると
+        // フォルダの再作成で同期が競合するため)。中身だけを消す。
+        remove_dir_contents(&dist_dir);
+    } else {
+        fs::create_dir_all(&dist_dir).unwrap_or_else(|e| panic!("作成に失敗 {:?}: {}", dist_dir, e));
     }
-    fs::create_dir_all(&dist_dir).unwrap_or_else(|e| panic!("作成に失敗 {:?}: {}", dist_dir, e));
 
     copy_file(&src_wasm, &dist_dir.join("extension.wasm"));
     copy_file(
@@ -175,7 +180,12 @@ fn build_extension_wasm(ext_dir: &Path, release: bool) -> PathBuf {
 
     let out = ext_dir.join("extension.wasm");
     fs::write(&out, &stripped).unwrap_or_else(|e| panic!("書き込みに失敗 {:?}: {}", out, e));
-    println!("wrote {:?} ({} bytes, stripped from {})", out, stripped.len(), input.len());
+    println!(
+        "wrote {:?} ({} bytes, stripped from {})",
+        out,
+        stripped.len(),
+        input.len()
+    );
     out
 }
 
@@ -299,6 +309,26 @@ fn copy_file(src: &Path, dst: &Path) {
 }
 
 /// `src` 配下を `dst` へ丸ごと再帰コピーする(シンボリックリンクは辿らない)。
+/// `dir` 直下のエントリをすべて削除する(`dir` 自体は残す)。
+/// Google Drive 等の同期対象ディレクトリを `dist_dir` に指定された場合、
+/// ディレクトリ自体を消して作り直すと同期が競合するため、中身だけを消す用途。
+fn remove_dir_contents(dir: &Path) {
+    for entry in fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("ディレクトリの読み取りに失敗 {:?}: {}", dir, e))
+        .flatten()
+    {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .unwrap_or_else(|e| panic!("file_type の取得に失敗 {:?}: {}", path, e));
+        if file_type.is_dir() {
+            fs::remove_dir_all(&path).unwrap_or_else(|e| panic!("削除に失敗 {:?}: {}", path, e));
+        } else {
+            fs::remove_file(&path).unwrap_or_else(|e| panic!("削除に失敗 {:?}: {}", path, e));
+        }
+    }
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap_or_else(|e| panic!("ディレクトリの作成に失敗 {:?}: {}", dst, e));
     for entry in fs::read_dir(src)
