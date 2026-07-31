@@ -12,7 +12,7 @@
 | [completion.md](completion.md) | 文章補完フロー、CursorContext |
 | [zed-completion-filtering.md](zed-completion-filtering.md) | Zed の補完フィルタ機構と「括弧内で候補が出ない」問題の調査記録 |
 | [character-updater.md](character-updater.md) | キャラクター設定自動更新 |
-| [acp-agent.md](acp-agent.md) | ACP エージェント、チャット内容の補完コンテキスト化 |
+| [acp-agent.md](acp-agent.md) | ACP プロキシ、チャット内容の補完コンテキスト化 |
 | [data-layer.md](data-layer.md) | インメモリ状態、SQLite スキーマ |
 
 ## 概要
@@ -25,6 +25,6 @@
 
 中心機能は **Lindera による日本語形態素解析** と **LLM による文章補完・キャラクター設定の自動更新**。
 
-同じバイナリを `--acp` 付きで起動すると **ACP エージェント**として動き、Zed の Agent Panel
-からのチャットを中継する。会話の要約は補完のコンテキストとして LSP 側へ渡る
-（[acp-agent.md](acp-agent.md)）。
+同じバイナリを `--acp` 付きで起動すると **ACP プロキシ**として動き、Zed と上流の ACP
+エージェント（Claude Code など）のあいだで会話を素通ししながら覗き見る。その要約は
+補完のコンテキストとして LSP 側へ渡る（[acp-agent.md](acp-agent.md)）。

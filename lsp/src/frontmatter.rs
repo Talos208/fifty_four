@@ -297,9 +297,8 @@ mod tests {
     }
 
     #[test]
-    fn test_chat_prompts_have_no_unsupplied_placeholder() {
+    fn test_chat_digest_prompt_has_no_unsupplied_placeholder() {
         // crate::acp が渡す変数
-        assert_no_leftover_placeholder("prompt_chat.md", &["HISTORY", "MESSAGE"]);
         assert_no_leftover_placeholder("prompt_chat_digest.md", &["HISTORY"]);
     }
 }

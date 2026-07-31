@@ -1,48 +1,54 @@
-//! ACP (Agent Client Protocol) エージェント。
+//! ACP (Agent Client Protocol) プロキシ。
 //!
-//! `fifty_four_lsp --acp` で起動したときのモード。Zed の Agent Panel から
-//! stdio 越しに接続され、作者とのチャットを LLM へ中継する。
+//! `fifty_four_lsp --acp` で起動したときのモード。Zed と作者が普段使っている
+//! ACP エージェント(Claude Code や Gemini CLI など)の**あいだに挟まり**、
+//! 会話を素通しさせながら覗き見る。
 //!
-//! 目的はチャット UI を足すことそのものではなく、**作者が「いま何を書こうと
-//! しているか」を LSP の短文生成へ渡す**こと。1ターンごとに会話を要約し、
-//! [`crate::chat_context`] のファイルへ書き出す。LSP 側は補完・code action の
-//! プロンプト組み立て時にそれを読んで `{{CHAT}}` へ埋め込む。
+//! 目的はチャット機能を提供することではなく、**作者が「いま何を書こうとしているか」を
+//! LSP の短文生成へ渡す**こと。1ターンごとに会話を要約して [`crate::chat_context`] の
+//! ファイルへ書き出し、LSP 側が補完・code action のプロンプトへ `{{CHAT}}` として埋め込む。
+//!
+//! チャットの応答そのものは上流エージェントが作るので、この実装は応答を生成しない。
+//! 作者は普段どおりツール実行やファイル閲覧のできるエージェントと話せる。
+//!
+//! # 構成
+//!
+//! ```text
+//! Zed ──stdio──> fifty_four_lsp --acp
+//!                  └─ ConductorImpl
+//!                       ├─ FiftyFourProxy  (このモジュール)
+//!                       └─ AcpAgent        (上流エージェントのプロセス)
+//! ```
+//!
+//! プロキシは上流エージェントへ直結できない。プロキシが agent 方向へ送るメッセージは
+//! `SuccessorMessage` エンベロープに包まれ、素のエージェントはそれを解釈できないため。
+//! 包み・解きは conductor の役目なので、`ConductorImpl` をライブラリとして
+//! このプロセスに埋め込んでいる(Zed から見れば `agent_servers` エントリは1つのまま)。
 //!
 //! # Zed 側の設定
 //!
 //! Zed の拡張 API には ACP エージェントを登録する口が無い(language server /
-//! MCP context server / DAP のみ)。したがってユーザの `settings.json` に
-//! 手で書いてもらう必要がある。詳細は `docs/acp-agent.md` を参照。
-//!
-//! # 実装上の制約
-//!
-//! [`LlmInterface`] はマルチターン会話を持たない([`crate::llm::LlmClient::with_model`]
-//! が毎回 `ChatRequest` を組み直す)。そのため会話履歴はテンプレートへ文字列として
-//! レンダリングして渡している。また `chat()` は完成した文字列を返すだけで
-//! ストリーミングを公開していないため、1ターンにつき1チャンクを送る。
+//! MCP context server / DAP のみ)。ユーザの `settings.json` に手で書く必要がある。
+//! 詳細は `docs/acp-agent.md` を参照。
 
-use crate::llm::{Content, LlmError, LlmInterface};
+use crate::llm::{Content, LlmInterface};
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
-    SessionNotification, SessionUpdate, StopReason,
+    ContentBlock, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
+    SessionNotification, SessionUpdate,
 };
-use agent_client_protocol::{Agent, Stdio};
+use agent_client_protocol::{
+    AcpAgent, Agent, Client, ConnectTo, Conductor, Handled, Proxy, Stdio,
+};
+use agent_client_protocol_conductor::{ConductorImpl, ProxiesAndAgent};
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// 応答生成のプロンプトへ載せる過去ターン数の上限。
-///
-/// `LlmInterface` に会話履歴が無く毎回テンプレートへ焼き込む方式なので、
-/// 際限なく伸ばすとリクエストが肥大する。
-const MAX_HISTORY_TURNS: usize = 12;
-
 /// 要約に渡す過去ターン数の上限。
 ///
-/// 要約が拾うべきなのは「いま書こうとしている場面」なので、応答生成より狭くてよい。
+/// 拾うべきなのは「いま書こうとしている場面」なので、会話全体を渡す必要はない。
 const MAX_DIGEST_TURNS: usize = 8;
 
 /// LLM クライアントの置き場所。`Backend` と同じ形にして
@@ -54,12 +60,12 @@ type LlmSlot = Arc<tokio::sync::Mutex<Option<Box<dyn LlmInterface>>>>;
 pub(crate) enum Speaker {
     /// 作者(Zed の Agent Panel で入力した人)
     Author,
-    /// このエージェント
+    /// 上流の ACP エージェント
     Agent,
 }
 
 impl Speaker {
-    /// プロンプトへ書き出すときのラベル。
+    /// 要約プロンプトへ書き出すときのラベル。
     fn label(self) -> &'static str {
         match self {
             Speaker::Author => "作者",
@@ -75,188 +81,206 @@ pub(crate) struct ChatTurn {
     pub(crate) text: String,
 }
 
-/// セッションごとの状態。
-#[derive(Debug)]
+/// セッションごとの観測結果。
+#[derive(Debug, Default)]
 struct Session {
     /// `session/new` で渡されたワークスペースルート。要約の書き出し先の決定に使う。
     root: PathBuf,
     turns: Vec<ChatTurn>,
+    /// 進行中のターンで上流から流れてきた `AgentMessageChunk` の連結。
+    /// `session/prompt` の応答が返った時点で1ターンとして確定する。
+    pending_reply: String,
 }
 
 /// ハンドラ間で共有する状態。
-struct AgentState {
-    sessions: tokio::sync::Mutex<HashMap<SessionId, Session>>,
-    /// チャット応答の生成用(`llm.ondemand`)
-    llm: LlmSlot,
-    /// 要約の生成用(`llm.deferred`)。応答生成と別スロットにして、
-    /// 要約が次のターンの応答をブロックしないようにする。
+#[derive(Debug)]
+struct ProxyState {
+    sessions: parking_lot::Mutex<HashMap<SessionId, Session>>,
+    /// 要約の生成用(`llm.deferred`)。チャット応答は上流が作るので、
+    /// このプロセスが LLM を呼ぶのは要約のときだけ。
     digest_llm: LlmSlot,
-    next_session_no: std::sync::atomic::AtomicU64,
 }
 
-impl AgentState {
-    /// 新しいセッションIDを採番する。
+impl ProxyState {
+    /// 作者の発話を記録する。セッションが未登録なら何もしない。
+    fn push_author(&self, id: &SessionId, text: String) {
+        if let Some(s) = self.sessions.lock().get_mut(id) {
+            s.turns.push(ChatTurn {
+                speaker: Speaker::Author,
+                text,
+            });
+        }
+    }
+
+    /// 上流の応答チャンクを進行中ターンへ積む。
+    fn push_reply_chunk(&self, id: &SessionId, text: &str) {
+        if let Some(s) = self.sessions.lock().get_mut(id) {
+            s.pending_reply.push_str(text);
+        }
+    }
+
+    /// 進行中のターンを確定し、要約に渡す材料を返す。
     ///
-    /// 複数の ACP プロセスが同時に動いてもぶつからないよう PID を含める。
-    fn new_session_id(&self) -> SessionId {
-        let n = self
-            .next_session_no
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        SessionId::new(format!("ff-{}-{}", std::process::id(), n))
+    /// 応答が空(ツール実行だけで終わったターン等)の場合も、作者の発話は
+    /// 既に積まれているので要約は行う。
+    fn finish_turn(&self, id: &SessionId) -> Option<(PathBuf, Vec<ChatTurn>)> {
+        let mut sessions = self.sessions.lock();
+        let s = sessions.get_mut(id)?;
+        let reply = std::mem::take(&mut s.pending_reply);
+        let reply = reply.trim();
+        if !reply.is_empty() {
+            s.turns.push(ChatTurn {
+                speaker: Speaker::Agent,
+                text: reply.to_string(),
+            });
+        }
+        Some((s.root.clone(), s.turns.clone()))
     }
 }
 
-/// ACP エージェントとして stdio で待ち受ける。
+/// conductor へ差し込むプロキシ部品。
+struct FiftyFourProxy {
+    state: Arc<ProxyState>,
+}
+
+impl ConnectTo<Conductor> for FiftyFourProxy {
+    async fn connect_to(
+        self,
+        peer: impl ConnectTo<Proxy>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let new_session = self.state.clone();
+        let prompt = self.state.clone();
+        let notify = self.state.clone();
+
+        Proxy
+            .builder()
+            .name("fifty-four")
+            // `session/new`: cwd を控えて素通しし、上流が採番した SessionId と結び付ける。
+            .on_receive_request_from(
+                Client,
+                async move |req: NewSessionRequest, responder, cx| {
+                    let root = req.cwd.clone();
+                    let state = new_session.clone();
+                    let cancellation = responder.cancellation();
+
+                    cx.send_request_to(Agent, req)
+                        .forward_cancellation_from(cancellation)
+                        .on_receiving_result(move |result: Result<NewSessionResponse, _>| async move {
+                            if let Ok(res) = &result {
+                                debug!("acp session/new: id={} cwd={:?}", res.session_id, root);
+                                state.sessions.lock().insert(
+                                    res.session_id.clone(),
+                                    Session {
+                                        root,
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                            responder.respond_with_result(result)
+                        })
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            // `session/prompt`: 作者の発話を控えて素通しし、応答が返った時点で
+            // 1ターン確定 → 要約を投げる。
+            .on_receive_request_from(
+                Client,
+                async move |req: PromptRequest, responder, cx| {
+                    let session_id = req.session_id.clone();
+                    let message = prompt_text(&req);
+                    debug!(
+                        "acp session/prompt: id={} {} chars",
+                        session_id,
+                        message.len()
+                    );
+                    prompt.push_author(&session_id, message);
+
+                    let state = prompt.clone();
+                    let cancellation = responder.cancellation();
+
+                    cx.send_request_to(Agent, req)
+                        .forward_cancellation_from(cancellation)
+                        .on_receiving_result(move |result: Result<PromptResponse, _>| async move {
+                            // 応答をクライアントへ返すのが先。要約はそのあと
+                            // バックグラウンドで行い、作者を待たせない。
+                            let turn = state.finish_turn(&session_id);
+                            let responded = responder.respond_with_result(result);
+
+                            if let Some((root, turns)) = turn {
+                                debug!(
+                                    "acp turn finished: id={} turns={} root={:?}",
+                                    session_id,
+                                    turns.len(),
+                                    root
+                                );
+                                let digest_llm = state.digest_llm.clone();
+                                tokio::spawn(async move {
+                                    update_digest(&digest_llm, &root, &turns).await;
+                                });
+                            }
+                            responded
+                        })
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            // `session/update`: 応答チャンクを覗くだけ。`Handled::No` を返して
+            // 既定の転送処理へそのまま流す(書き換えない)。
+            .on_receive_notification_from(
+                Agent,
+                async move |notif: SessionNotification, cx| {
+                    if let SessionUpdate::AgentMessageChunk(chunk) = &notif.update
+                        && let ContentBlock::Text(t) = &chunk.content
+                    {
+                        notify.push_reply_chunk(&notif.session_id, &t.text);
+                    }
+                    Ok(Handled::No {
+                        message: (notif, cx),
+                        retry: false,
+                    })
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            // 上記以外は既定の転送に任せる(プロキシは未処理メッセージを素通しする)。
+            .connect_to(peer)
+            .await
+    }
+}
+
+/// ACP プロキシとして stdio で待ち受ける。
 ///
-/// LLM 設定が読めない場合はここで `Err` を返す(呼び出し元が終了コードを決める)。
+/// 上流エージェントや LLM 設定が読めない場合はここで `Err` を返す
+/// (呼び出し元が終了コードを決める)。
 pub(crate) async fn run() -> Result<(), String> {
+    let upstream = load_upstream_agent()?;
+
     let cfg = load_llm_config()?;
+    let digest_cfg = select_digest_config(&cfg)
+        .ok_or_else(|| "LLM 設定に deferred も ondemand も provider もありません".to_string())?;
+    validate_provider(digest_cfg)?;
 
-    let ondemand = select_role(&cfg, "ondemand")
-        .ok_or_else(|| "LLM 設定に ondemand も provider もありません".to_string())?;
-    validate_provider(ondemand)?;
-
-    // deferred が無ければ ondemand へフォールバックする(Backend::initialize と同じ挙動)。
-    let deferred = match select_role(&cfg, "deferred") {
-        Some(v) => {
-            validate_provider(v)?;
-            v
-        }
-        None => {
-            warn!("llm.deferred is not configured; chat digest falls back to the ondemand config");
-            ondemand
-        }
-    };
-
-    let state = Arc::new(AgentState {
-        sessions: tokio::sync::Mutex::new(HashMap::new()),
-        llm: Arc::new(tokio::sync::Mutex::new(Some(crate::llm::build_client(
-            ondemand,
-            "system_chat.md",
-        )))),
+    let state = Arc::new(ProxyState {
+        sessions: parking_lot::Mutex::new(HashMap::new()),
         digest_llm: Arc::new(tokio::sync::Mutex::new(Some(crate::llm::build_client(
-            deferred,
-            "system_chat.md",
+            digest_cfg,
+            "system.md",
         )))),
-        next_session_no: std::sync::atomic::AtomicU64::new(0),
     });
 
-    info!("start acp agent");
+    info!("start acp proxy");
 
-    let init_state = state.clone();
-    let session_state = state.clone();
-    let prompt_state = state.clone();
-
-    Agent
-        .builder()
-        .name("fifty-four")
-        .on_receive_request(
-            async move |req: InitializeRequest, responder, _connection| {
-                let _ = &init_state;
-                debug!("acp initialize: protocol_version={:?}", req.protocol_version);
-                // テキストの送受信は baseline なので追加の capability 宣言は要らない。
-                responder.respond(
-                    InitializeResponse::new(req.protocol_version)
-                        .agent_capabilities(AgentCapabilities::new()),
-                )
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            async move |req: NewSessionRequest, responder, _connection| {
-                let id = session_state.new_session_id();
-                debug!("acp session/new: id={} cwd={:?}", id, req.cwd);
-                session_state.sessions.lock().await.insert(
-                    id.clone(),
-                    Session {
-                        root: req.cwd.clone(),
-                        turns: Vec::new(),
-                    },
-                );
-                responder.respond(NewSessionResponse::new(id))
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            async move |req: PromptRequest, responder, connection| {
-                let session_id = req.session_id.clone();
-                let message = prompt_text(&req);
-                debug!("acp session/prompt: id={} {} chars", session_id, message.len());
-
-                // 履歴へ積み、応答生成に必要な情報だけ取り出してロックを手放す。
-                let context = {
-                    let mut sessions = prompt_state.sessions.lock().await;
-                    match sessions.get_mut(&session_id) {
-                        Some(s) => {
-                            s.turns.push(ChatTurn {
-                                speaker: Speaker::Author,
-                                text: message.clone(),
-                            });
-                            Some((s.root.clone(), render_history(&s.turns, MAX_HISTORY_TURNS)))
-                        }
-                        None => None,
-                    }
-                };
-
-                let Some((root, history)) = context else {
-                    warn!("acp session/prompt: unknown session {}", session_id);
-                    return responder
-                        .respond_with_internal_error(format!("unknown session: {}", session_id));
-                };
-
-                let reply = match generate_reply(&prompt_state.llm, &history, &message).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        error!("acp chat failed: {}", e);
-                        return responder
-                            .respond_with_internal_error(format!("LLM 応答の生成に失敗: {}", e));
-                    }
-                };
-
-                // `chat()` がストリーミングを公開していないため、1ターン1チャンクで送る。
-                connection.send_notification(SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::AgentMessageChunk(ContentChunk::new(reply.clone().into())),
-                ))?;
-
-                // 応答を履歴へ積み、要約の材料を取り出す。
-                let digest_turns = {
-                    let mut sessions = prompt_state.sessions.lock().await;
-                    match sessions.get_mut(&session_id) {
-                        Some(s) => {
-                            s.turns.push(ChatTurn {
-                                speaker: Speaker::Agent,
-                                text: reply,
-                            });
-                            Some(s.turns.clone())
-                        }
-                        None => None,
-                    }
-                };
-
-                // 要約はチャットの応答をブロックしない。失敗しても会話は続けられる。
-                if let Some(turns) = digest_turns {
-                    let digest_llm = prompt_state.digest_llm.clone();
-                    tokio::spawn(async move {
-                        update_digest(&digest_llm, &root, &turns).await;
-                    });
-                }
-
-                responder.respond(PromptResponse::new(StopReason::EndTurn))
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        // 未処理のリクエストは Method not found、未処理の通知(session/cancel 等)は
-        // 無視、がライブラリ側の既定動作なので追加のハンドラは要らない。
-        .connect_to(Stdio::new())
-        .await
-        .map_err(|e| format!("ACP connection failed: {}", e))
+    ConductorImpl::new_agent(
+        "fifty-four",
+        ProxiesAndAgent::new(upstream).proxy(FiftyFourProxy { state }),
+    )
+    .run(Stdio::new())
+    .await
+    .map_err(|e| format!("ACP proxy failed: {}", e))
 }
 
 /// `PromptRequest` からテキストだけを取り出して連結する。
 ///
-/// 画像・音声・リソースは capability を宣言していないので届かない想定だが、
-/// 届いても落とさずに無視する。
+/// 画像・音声・リソースリンクは上流エージェントへは素通しするが、要約の材料には
+/// しない(テキストだけで「何を書こうとしているか」は足りる)。
 pub(crate) fn prompt_text(req: &PromptRequest) -> String {
     req.prompt
         .iter()
@@ -268,7 +292,7 @@ pub(crate) fn prompt_text(req: &PromptRequest) -> String {
         .join("\n")
 }
 
-/// 会話履歴を新しい方から `max_turns` 件だけプロンプト用に整形する。
+/// 会話履歴を新しい方から `max_turns` 件だけ要約プロンプト用に整形する。
 pub(crate) fn render_history(turns: &[ChatTurn], max_turns: usize) -> String {
     let start = turns.len().saturating_sub(max_turns);
     turns[start..]
@@ -276,24 +300,6 @@ pub(crate) fn render_history(turns: &[ChatTurn], max_turns: usize) -> String {
         .map(|t| format!("{}: {}", t.speaker.label(), t.text))
         .collect::<Vec<_>>()
         .join("\n\n")
-}
-
-/// チャットの応答を生成する。
-async fn generate_reply(llm: &LlmSlot, history: &str, message: &str) -> Result<String, LlmError> {
-    let (template, options) = crate::frontmatter::load_prompt("prompt_chat.md").ok_or_else(|| {
-        LlmError::GenericError {
-            message: "prompt_chat.md not found".to_string(),
-        }
-    })?;
-
-    let vars = HashMap::from([("HISTORY", history), ("MESSAGE", message)]);
-    let prompt = crate::frontmatter::expand(&template, &vars);
-
-    crate::llm::use_llm_with_option(llm, options, async |l| {
-        l.add(Content::Text(prompt));
-        l.chat().await
-    })
-    .await
 }
 
 /// 会話を要約して受け渡しファイルへ書き出す。
@@ -332,13 +338,33 @@ async fn update_digest(llm: &LlmSlot, root: &std::path::Path, turns: &[ChatTurn]
     }
 }
 
-/// LLM 設定を読む。
+/// 中継先の ACP エージェントを決める。
+///
+/// `AcpAgent::from_str` はコマンド文字列(`"npx -y @agentclientprotocol/claude-agent-acp@latest"`)
+/// と JSON 設定(`{"type":"stdio","command":...}`)のどちらも受け付ける。
+fn load_upstream_agent() -> Result<AcpAgent, String> {
+    const ENV_KEY: &str = "FIFTY_FOUR_ACP_AGENT";
+
+    let spec = std::env::var(ENV_KEY)
+        .ok()
+        .or_else(|| arg_value("--agent"))
+        .ok_or_else(|| {
+            format!(
+                "中継先の ACP エージェントが指定されていません。環境変数 {} か --agent <command> を指定してください",
+                ENV_KEY
+            )
+        })?;
+
+    spec.parse::<AcpAgent>()
+        .map_err(|e| format!("ACP エージェントの指定が不正です ({}): {}", spec, e))
+}
+
+/// 要約用の LLM 設定を読む。
 ///
 /// `agent_servers` のエントリには `command`/`args`/`env` しか無く、LSP のように
 /// `initialization_options` を受け取れない。そのため環境変数か CLI 引数で渡す。
-/// 形式は LSP の `initialization_options.llm` と同じ
-/// (`{"ondemand": {...}, "deferred": {...}}`、旧形式の `{"provider": ...}` も可)。
-/// API キーは従来どおり `genai` がプロセス環境変数から読むので、ここには含めない。
+/// 形式は LSP の `initialization_options.llm` と同じ。API キーは従来どおり
+/// `genai` がプロセス環境変数から読むので、ここには含めない。
 fn load_llm_config() -> Result<serde_json::Value, String> {
     const ENV_KEY: &str = "FIFTY_FOUR_LLM_CONFIG";
 
@@ -355,14 +381,14 @@ fn load_llm_config() -> Result<serde_json::Value, String> {
     }
 
     Err(format!(
-        "LLM 設定がありません。環境変数 {} か --llm-config <path> を指定してください",
+        "要約用の LLM 設定がありません。環境変数 {} か --llm-config <path> を指定してください",
         ENV_KEY
     ))
 }
 
 /// `--name value` / `--name=value` の形でコマンドライン引数を1つ取り出す。
 ///
-/// 引数は `--acp` とこれだけなので、依存を増やしてまで clap は入れない。
+/// 引数の数が少ないので、依存を増やしてまで clap は入れない。
 fn arg_value(name: &str) -> Option<String> {
     let mut args = std::env::args().skip(1);
     let prefix = format!("{}=", name);
@@ -377,18 +403,20 @@ fn arg_value(name: &str) -> Option<String> {
     None
 }
 
-/// 設定ルートから用途別(`ondemand`/`deferred`)の設定を取り出す。
+/// 要約に使う設定を選ぶ。
 ///
-/// 旧形式(ルート直下に `provider`)は `ondemand` として扱う。
-/// `Backend::initialize` の互換処理と同じ規則。
-fn select_role<'a>(root: &'a serde_json::Value, role: &str) -> Option<&'a serde_json::Value> {
-    root.get(role).or_else(|| {
-        if role == "ondemand" && root.get("provider").is_some() {
-            Some(root)
-        } else {
-            None
-        }
-    })
+/// このプロセスが LLM を呼ぶのは要約だけなので `deferred` を優先する。
+/// 無ければ `ondemand`、それも無ければ旧形式(ルート直下に `provider`)を使う。
+fn select_digest_config(root: &serde_json::Value) -> Option<&serde_json::Value> {
+    root.get("deferred")
+        .or_else(|| root.get("ondemand"))
+        .or_else(|| {
+            if root.get("provider").is_some() {
+                Some(root)
+            } else {
+                None
+            }
+        })
 }
 
 /// `LlmClientBuilder::from_value` は `provider` 欠落・未対応値で panic するため、
@@ -413,6 +441,26 @@ mod tests {
         }
     }
 
+    fn state() -> ProxyState {
+        ProxyState {
+            sessions: parking_lot::Mutex::new(HashMap::new()),
+            digest_llm: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    fn registered(root: &str) -> (ProxyState, SessionId) {
+        let s = state();
+        let id = SessionId::new("s1");
+        s.sessions.lock().insert(
+            id.clone(),
+            Session {
+                root: PathBuf::from(root),
+                ..Default::default()
+            },
+        );
+        (s, id)
+    }
+
     #[test]
     fn test_prompt_text_joins_text_blocks() {
         let req = PromptRequest::new(
@@ -426,15 +474,6 @@ mod tests {
             prompt_text(&req),
             "第3章の別れの場面を書きたい\n雨の描写を入れたい"
         );
-    }
-
-    #[test]
-    fn test_prompt_text_ignores_non_text_blocks() {
-        let req = PromptRequest::new(
-            SessionId::new("s1"),
-            vec![ContentBlock::Text(TextContent::new("テキストだけ残る"))],
-        );
-        assert_eq!(prompt_text(&req), "テキストだけ残る");
     }
 
     #[test]
@@ -456,7 +495,6 @@ mod tests {
             turn(Speaker::Agent, "2"),
             turn(Speaker::Author, "3"),
         ];
-        // 直近2件だけ残ること(古い方から捨てる)
         assert_eq!(render_history(&turns, 2), "アシスタント: 2\n\n作者: 3");
     }
 
@@ -465,28 +503,86 @@ mod tests {
         assert_eq!(render_history(&[], 5), "");
     }
 
+    /// 1ターン: 作者の発話 → チャンク2つ → 確定、で2発話になること。
     #[test]
-    fn test_select_role_new_format() {
+    fn test_observed_turn_becomes_two_turns() {
+        let (s, id) = registered("/ws");
+        s.push_author(&id, "雨の場面にしたい".to_string());
+        s.push_reply_chunk(&id, "傘を差さない");
+        s.push_reply_chunk(&id, "描写はどうでしょう");
+
+        let (root, turns) = s.finish_turn(&id).unwrap();
+        assert_eq!(root, PathBuf::from("/ws"));
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].speaker, Speaker::Author);
+        assert_eq!(turns[1].speaker, Speaker::Agent);
+        // チャンクが連結されていること
+        assert_eq!(turns[1].text, "傘を差さない描写はどうでしょう");
+    }
+
+    /// 確定後にバッファが空になり、次のターンへ持ち越されないこと。
+    #[test]
+    fn test_finish_turn_clears_pending_reply() {
+        let (s, id) = registered("/ws");
+        s.push_author(&id, "一回目".to_string());
+        s.push_reply_chunk(&id, "応答1");
+        s.finish_turn(&id).unwrap();
+
+        s.push_author(&id, "二回目".to_string());
+        s.push_reply_chunk(&id, "応答2");
+        let (_, turns) = s.finish_turn(&id).unwrap();
+
+        assert_eq!(turns.len(), 4);
+        assert_eq!(turns[3].text, "応答2", "前ターンの応答が混ざっている");
+    }
+
+    /// 応答が無いターン(ツール実行だけで終わった等)でも作者の発話は残ること。
+    #[test]
+    fn test_turn_without_reply_keeps_author_turn() {
+        let (s, id) = registered("/ws");
+        s.push_author(&id, "ファイルを見て".to_string());
+
+        let (_, turns) = s.finish_turn(&id).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].speaker, Speaker::Author);
+    }
+
+    /// 未登録セッションは無視し、panic しないこと。
+    #[test]
+    fn test_unknown_session_is_ignored() {
+        let s = state();
+        let unknown = SessionId::new("nope");
+        s.push_author(&unknown, "やあ".to_string());
+        s.push_reply_chunk(&unknown, "やあ");
+        assert!(s.finish_turn(&unknown).is_none());
+    }
+
+    #[test]
+    fn test_select_digest_config_prefers_deferred() {
         let cfg = serde_json::json!({
             "ondemand": {"provider": "google"},
             "deferred": {"provider": "openai"},
         });
         assert_eq!(
-            select_role(&cfg, "ondemand").unwrap()["provider"],
-            serde_json::json!("google")
-        );
-        assert_eq!(
-            select_role(&cfg, "deferred").unwrap()["provider"],
+            select_digest_config(&cfg).unwrap()["provider"],
             serde_json::json!("openai")
         );
     }
 
     #[test]
-    fn test_select_role_legacy_flat_format_is_ondemand() {
+    fn test_select_digest_config_falls_back_to_ondemand() {
+        let cfg = serde_json::json!({"ondemand": {"provider": "google"}});
+        assert_eq!(
+            select_digest_config(&cfg).unwrap()["provider"],
+            serde_json::json!("google")
+        );
+    }
+
+    #[test]
+    fn test_select_digest_config_legacy_flat_format() {
         let cfg = serde_json::json!({"provider": "google", "model": "gemini-x"});
-        assert!(select_role(&cfg, "ondemand").is_some());
-        // 旧形式には deferred が無い → 呼び出し側が ondemand へフォールバックする
-        assert!(select_role(&cfg, "deferred").is_none());
+        assert!(select_digest_config(&cfg).is_some());
+        assert!(select_digest_config(&serde_json::json!({"model": "x"})).is_none());
     }
 
     #[test]

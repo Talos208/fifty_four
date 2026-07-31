@@ -35,18 +35,26 @@ cargo run
 
 サーバは標準入出力を使用してLSPクライアントと通信します。
 
-== ACPエージェントとして起動する
+== ACPプロキシとして起動する
 
 同じバイナリに `--acp` を付けると、LSPサーバではなく
-ACP (Agent Client Protocol) エージェントとして起動します。
-Zedの Agent Panel から作者とチャットし、その会話の要約を
+ACP (Agent Client Protocol) プロキシとして起動します。
+Zedと、普段使っているACPエージェント（Claude Code、Gemini CLIなど）の
+あいだに挟まり、会話を素通しさせながら覗き見て、その要約を
 LSP側の短文生成のコンテキストとして渡します。
+
+チャットの応答自体は上流のエージェントが作るので、
+ツール実行やファイル閲覧のできるエージェントと普段どおり話しながら、
+その内容が自動的に補完へ効くようになります。
 
 [source,bash]
 ----
-FIFTY_FOUR_LLM_CONFIG='{"ondemand":{"provider":"google"}}' fifty_four_lsp --acp
+FIFTY_FOUR_ACP_AGENT='npx -y @agentclientprotocol/claude-agent-acp@latest' \
+FIFTY_FOUR_LLM_CONFIG='{"deferred":{"provider":"google"}}' \
+fifty_four_lsp --acp
 ----
 
+`FIFTY_FOUR_LLM_CONFIG` は会話の要約にのみ使います。
 Zedへの登録方法（`settings.json` の `agent_servers`）と設定項目は
 link:docs/acp-agent.md[docs/acp-agent.md] を参照してください。
 
