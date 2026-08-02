@@ -44,13 +44,21 @@ Zedの Agent Panel から作者の相談相手として応答し、
 
 中身は Claude Agent SDK 経由の `claude` CLI なので、
 プロット・キャラクター設定・メモの読み書きやWeb検索がそのまま使えます。
-`ANTHROPIC_API_KEY` を設定しなければ、ログイン済みCLIの
-サブスクリプション枠で動きます（APIキーは不要です）。
+LLMアクセスはログイン済みCLIの**サブスクリプション枠**で行います。
+APIキーは不要どころか、`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` が
+設定されていても起動時にプロセス環境から取り除いて無視します
+（残しておくとAPIクレジット課金になってしまうため）。
 
 [source,bash]
 ----
-fifty_four_lsp --acp
+cargo build
+./target/debug/fifty_four_lsp --acp
 ----
+
+IMPORTANT: ACPエージェントは**debugビルド限定**です。
+自分のサブスクリプション枠を使う機能を配布物に載せることは
+Anthropicの規約上できないため、releaseビルドではモジュールごと除いてあり、
+`--acp` を渡すとメッセージを1行出して終了します。
 
 コーディング向けの `CLAUDE.md` が混ざらないよう、
 プロジェクトのものも `~/.claude/CLAUDE.md` も含めて読み込みを無効化しています。

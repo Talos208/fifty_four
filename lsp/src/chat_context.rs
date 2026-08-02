@@ -8,6 +8,9 @@
 //!
 //! - 書き手は ACP エージェント(1ターンごとに要約を上書き)
 //! - 読み手は LSP サーバ(補完・code action のプロンプト組み立て時)
+//!
+//! 書き手の ACP エージェントは debug ビルド限定だが、読み手は release でも動く。
+//! release バイナリでは「要約を書く者が居ないので常に要約なし」として素通りする。
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -39,6 +42,11 @@ pub(crate) fn digest_path(root: &Path) -> PathBuf {
 /// 一時ファイルへ書いてから `rename` する。読み手(LSP)は補完のたびに
 /// 無条件でこのファイルを読むため、書きかけの内容を読ませないことが重要。
 /// 同一ディレクトリ内の `rename` は同一ファイルシステム上なので原子的に行われる。
+///
+/// 呼び手の ACP エージェントが debug 限定なので、この関数も同じ範囲に合わせてある
+/// (release で未使用の dead code にしないため)。`test` を含めるのは
+/// `cargo test --release` でもテストが通るようにするため。
+#[cfg(any(debug_assertions, test))]
 pub(crate) fn write_digest(root: &Path, digest: &str) -> std::io::Result<()> {
     let dir = root.join(DIR_NAME);
     std::fs::create_dir_all(&dir)?;

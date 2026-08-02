@@ -28,4 +28,5 @@
 同じバイナリを `--acp` 付きで起動すると **ACP エージェント**として動き、Zed の Agent Panel
 から作者の相談相手になる。中身は Claude Agent SDK 経由の `claude` CLI で、原稿ディレクトリの
 ファイルを読み書きしながら話す。その会話の要約は補完のコンテキストとして LSP 側へ渡る
-（[acp-agent.md](acp-agent.md)）。
+（[acp-agent.md](acp-agent.md)）。作者自身のサブスクリプション枠を使うため
+**debug ビルド限定**で、release ビルドでは無効。

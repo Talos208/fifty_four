@@ -4,6 +4,11 @@
 Agent Panel から作者の相談相手として応答し、その会話の要約を **LSP の短文生成の
 コンテキストとして渡す**。
 
+> **debug ビルド限定の機能である。** LLM アクセスに作者自身の `claude` CLI のログイン
+> （＝サブスクリプション枠）をそのまま使うため、配布物に載せて第三者へ提供することは
+> Anthropic の規約上できない。release ビルドではモジュールごと落としてあり、`--acp` を
+> 渡すとメッセージを1行出して終了コード 1 で終わる（後述「認証」）。
+
 ## なぜ必要か
 
 LSP の補完が見ているのは、カーソル直前の 10 文（`cursor_context::before_sentences_upto`）と、
@@ -32,7 +37,14 @@ MCP context server / DAP のみ）ため、この分離は避けられない。�
 > そちらの `.gitignore` に `.fifty_four/` を足しておくとよい。
 
 バイナリは 1 つで、`--acp` の有無でモードが変わる。配布物の構成は変わらないため
-`cargo prepare package` に変更は要らない。
+`cargo prepare package` に変更は要らない。ただし ACP エージェントが入るのは debug
+ビルドだけなので、`cargo prepare package`（`--release` 無し）で作った `dist/` では動き、
+`cargo prepare package --release` で作ったものでは動かない。
+
+コード上は `lsp/src/main.rs` で `acp` と `writing_agent` の 2 モジュールを
+`#[cfg(debug_assertions)]` で囲っている。`chat_context` は囲っていない — 書き手
+（ACP）は debug 限定だが、読み手（補完）は release でも動く必要があるためで、
+release バイナリは「要約を書く者が居ないので常に要約なし」として素通りする。
 
 ## 依存している SDK について
 
@@ -47,20 +59,54 @@ Claude Agent SDK は Python と TypeScript のみで、他言語には「`claude
 
 ## 認証 — サブスクリプション枠
 
-LLM アクセスは `claude` CLI の認証をそのまま使う。`ANTHROPIC_API_KEY` を設定しなければ、
-**ログイン済み CLI のサブスクリプション枠**で動く。このエージェントは API キーを要求しないし、
-自前で保持もしない。
+LLM アクセスは `claude` CLI のログイン認証をそのまま使う。**API キーは使わないし、
+設定されていても無視する。**
 
-> ⚠️ Anthropic の Agent SDK ドキュメントには次の注意書きがある。
->
-> > Unless previously approved, Anthropic does not allow third party developers to offer
-> > claude.ai login or rate limits for **their products**, including agents built on the
-> > Claude Agent SDK.
->
-> これは「claude.ai ログインやレート枠を**自分の製品の機能として第三者に提供する**」ことへの
-> 制限で、自分の執筆環境で自分のサブスクリプションを使う分には当てはまらない（Claude Code
-> 自身がそう動いている）。ただし `dist/` を他人に配布して使わせる段階になると該当するので、
-> そのときは API キー方式へ切り替えること。
+### なぜ debug 限定なのか
+
+Anthropic の Agent SDK ドキュメントには次の注意書きがある。
+
+> Unless previously approved, Anthropic does not allow third party developers to offer
+> claude.ai login or rate limits for **their products**, including agents built on the
+> Claude Agent SDK.
+
+「claude.ai ログインやレート枠を**自分の製品の機能として第三者に提供する**」ことへの制限で、
+自分の執筆環境で自分のサブスクリプションを使う分には当てはまらない（Claude Code 自身が
+そう動いている）。一方 `dist/` を他人に配って使わせる段階では該当してしまう。
+
+そこで**この機能を debug ビルド限定にした**。「配布時は API キーへ切り替える」という運用の
+約束ではなく、release バイナリに機能が存在しないという形で担保する。
+
+### API 資格情報をプロセス環境から取り除く
+
+以前は「`ANTHROPIC_API_KEY` を設定しなければサブスク枠で動く」とだけ書いていたが、
+**それだけでは API クレジット課金になってしまう経路が 2 つあった**（実際に
+"Credit balance is too low" が出た）。
+
+| 経路 | 内容 |
+|---|---|
+| `.env` の自動読み込み | debug ビルドはリポジトリ直下の `.env` を `dotenvx` で読む。そこには `llm.rs` 用の provider キー（`ANTHROPIC_API_KEY` ほか）が入っている |
+| 親プロセスの環境の継承 | `anthropic-agent-sdk` は `env::vars()` を丸ごと集めて `Command::envs` に渡すため、シェルや Zed が export したキーが `claude` CLI まで届く |
+
+いまはコード側（`lsp/src/main.rs`）で両方を塞いでいる。
+
+1. **`--acp` では `.env` を読まない。** ACP 経路は provider の API キーを 1 つも必要としない
+   （LLM アクセスは `claude` CLI 経由）。`RUST_LOG` を `.env` に書いている場合は
+   `--acp` では効かないので、実環境変数で渡すこと。
+2. **`ANTHROPIC_API_KEY` と `ANTHROPIC_AUTH_TOKEN` をプロセス環境から削除する**
+   （`scrub_anthropic_credentials`）。削除したことは stderr に 1 行出るので、
+   「なぜ自分のキーが効かないのか」を追える。
+
+`ClaudeAgentOptions::env` では代用できない。insert しかできず、空文字を入れても
+「空のキーで認証」になるだけである。Anthropic の認証解決は
+`ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → ログイン済みプロファイルの順で、
+**キーが在る限り先に勝つ**ため、実際に消すしかない。
+
+削除するのは認証に使われるこの 2 つだけで、`ANTHROPIC_BASE_URL` 等には触らない。
+
+> `std::env::remove_var` は edition 2024 で `unsafe`（他スレッドが環境を読んでいると UB）。
+> そのため `main` は素の `fn` にして、Tokio ランタイムを起こす前のシングルスレッドな時点で
+> 環境を整えてから `async_main` へ入る構造にしてある。
 
 ## CLAUDE.md を一切読ませない
 
@@ -116,13 +162,15 @@ Read, Write, Edit, Glob, Grep, WebSearch, WebFetch
 
 ### エージェントの登録
 
-`settings.json` の `agent_servers` に手で書く。**API キーの環境変数は要らない。**
+`settings.json` の `agent_servers` に手で書く。**API キーの環境変数は要らない**
+（設定してあっても無視される）。**debug ビルドのパスを指すこと** — release バイナリを
+指すと起動直後に終了する。
 
 ```json
 {
   "agent_servers": {
     "fifty-four": {
-      "command": "/path/to/fifty_four_lsp",
+      "command": "/path/to/fifty_four/target/debug/fifty_four_lsp",
       "args": ["--acp"]
     }
   }
@@ -164,16 +212,19 @@ Read, Write, Edit, Glob, Grep, WebSearch, WebFetch
 
 ## 動作確認
 
-### API 消費なしで argv とフローを確認する
+### API 消費なしで argv・認証情報・フローを確認する
 
 `claude` の代役スクリプトを `PATH` の先頭に置けば、トークンを使わずに
-「実際にどのフラグが渡っているか」と ACP の一連の流れを確認できる。
+「実際にどのフラグと環境変数が渡っているか」と ACP の一連の流れを確認できる。
 
 ```bash
 mkdir -p /tmp/stubbin
 cat > /tmp/stubbin/claude <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > /tmp/claude-argv.txt
+# 親から受け継いだ Anthropic 認証情報を記録する
+printf '%s\n' "${ANTHROPIC_API_KEY-<unset>}" > /tmp/claude-env.txt
+printf '%s\n' "${ANTHROPIC_AUTH_TOKEN-<unset>}" >> /tmp/claude-env.txt
 emit() {
   printf '{"type":"assistant","message":{"model":"stub","content":[{"type":"text","text":"%s"}]},"session_id":"s"}\n' "$1"
   printf '{"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":false,"num_turns":1,"session_id":"s"}\n'
@@ -189,11 +240,27 @@ else
 fi
 SH
 chmod +x /tmp/stubbin/claude
-PATH=/tmp/stubbin:$PATH fifty_four_lsp --acp   # 別端末から ACP を喋る
-cat /tmp/claude-argv.txt                        # --setting-sources が空で渡っているか
+
+# わざとキーを設定して起動する(別端末から ACP を喋る)
+ANTHROPIC_API_KEY=dummy-key ANTHROPIC_AUTH_TOKEN=dummy-token \
+  PATH=/tmp/stubbin:$PATH fifty_four_lsp --acp
+
+cat /tmp/claude-argv.txt   # --setting-sources が空で渡っているか
+cat /tmp/claude-env.txt    # 2行とも <unset> になっているか
 ```
 
-`--setting-sources` の次の行が**空行**になっていれば、CLAUDE.md 類が締め出されている。
+- `--setting-sources` の次の行が**空行**になっていれば、CLAUDE.md 類が締め出されている。
+- `/tmp/claude-env.txt` が `<unset>` 2 行なら、API 資格情報が子プロセスへ漏れていない。
+  親側の stderr にも `--acp: ANTHROPIC_API_KEY を無視します(...)` が出る。
+
+### release ビルドで無効化されていることの確認
+
+```bash
+cargo build --release
+./target/release/fifty_four_lsp --acp; echo "exit=$?"
+# fifty_four_lsp: --acp は debug ビルド限定です(...)
+# exit=1
+```
 
 ### Zed 上での確認
 

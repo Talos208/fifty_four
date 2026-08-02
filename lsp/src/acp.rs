@@ -23,11 +23,17 @@
 //! 受け渡しは `.fifty_four/chat_context.md` の1ファイルで、`plot.md` を毎回読み直す
 //! [`crate::tools`] と同じ方式にしている。
 //!
-//! # 認証
+//! # 認証と debug ビルド限定であること
 //!
 //! LLM アクセスは Claude Agent SDK 経由、つまり `claude` CLI の認証をそのまま使う。
-//! `ANTHROPIC_API_KEY` を設定しなければ、ログイン済み CLI のサブスクリプション枠で動く。
-//! このモジュールは API キーを要求しないし、自前で持つこともしない。
+//! このモジュールは API キーを要求しないし、自前で持つこともしない。それどころか
+//! `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` が環境にあっても `main` が起動前に
+//! 取り除く(`scrub_anthropic_credentials`)。残しておくとサブスクリプション枠ではなく
+//! API クレジット課金になってしまうため。
+//!
+//! 作者自身のサブスクリプション枠を第三者へ提供することは Anthropic の規約上できないので、
+//! このモジュールごと `#[cfg(debug_assertions)]` で release ビルドから落としてある
+//! (`main.rs` を参照)。
 
 use crate::writing_agent::{AgentError, ClaudeAgent, WritingAgent};
 use agent_client_protocol::schema::v1::{
