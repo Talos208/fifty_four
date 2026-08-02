@@ -35,26 +35,26 @@ cargo run
 
 サーバは標準入出力を使用してLSPクライアントと通信します。
 
-== ACPプロキシとして起動する
+== ACPエージェントとして起動する
 
 同じバイナリに `--acp` を付けると、LSPサーバではなく
-ACP (Agent Client Protocol) プロキシとして起動します。
-Zedと、普段使っているACPエージェント（Claude Code、Gemini CLIなど）の
-あいだに挟まり、会話を素通しさせながら覗き見て、その要約を
-LSP側の短文生成のコンテキストとして渡します。
+ACP (Agent Client Protocol) エージェントとして起動します。
+Zedの Agent Panel から作者の相談相手として応答し、
+その会話の要約をLSP側の短文生成のコンテキストとして渡します。
 
-チャットの応答自体は上流のエージェントが作るので、
-ツール実行やファイル閲覧のできるエージェントと普段どおり話しながら、
-その内容が自動的に補完へ効くようになります。
+中身は Claude Agent SDK 経由の `claude` CLI なので、
+プロット・キャラクター設定・メモの読み書きやWeb検索がそのまま使えます。
+`ANTHROPIC_API_KEY` を設定しなければ、ログイン済みCLIの
+サブスクリプション枠で動きます（APIキーは不要です）。
 
 [source,bash]
 ----
-FIFTY_FOUR_ACP_AGENT='npx -y @agentclientprotocol/claude-agent-acp@latest' \
-FIFTY_FOUR_LLM_CONFIG='{"deferred":{"provider":"google"}}' \
 fifty_four_lsp --acp
 ----
 
-`FIFTY_FOUR_LLM_CONFIG` は会話の要約にのみ使います。
+コーディング向けの `CLAUDE.md` が混ざらないよう、
+プロジェクトのものも `~/.claude/CLAUDE.md` も含めて読み込みを無効化しています。
+
 Zedへの登録方法（`settings.json` の `agent_servers`）と設定項目は
 link:docs/acp-agent.md[docs/acp-agent.md] を参照してください。
 

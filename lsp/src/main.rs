@@ -17,6 +17,7 @@ mod progress;
 mod text;
 mod tools;
 mod types;
+mod writing_agent;
 
 use crate::backend::Backend;
 use log::{error, info};
