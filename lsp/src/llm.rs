@@ -827,6 +827,160 @@ impl LlmInterface for LlmClient {
     }
 }
 
+/// 設定 JSON から LLM クライアントを組み立て、`data/<sys_prompt_name>` を
+/// システムプロンプトとして与える。
+///
+/// システムプロンプトの差し替えだけが違う複数の用途(LSP の執筆支援=`system.md`、
+/// ACP のチャット=`system_chat.md`)があるため、アセット名を引数に取る。
+/// アセットが見つからない場合はシステムプロンプト無しで動かし、警告だけ出す。
+pub(crate) fn build_client(
+    cfg: &serde_json::Value,
+    sys_prompt_name: &str,
+) -> Box<dyn LlmInterface> {
+    let sys_prompt = crate::assets::load(sys_prompt_name);
+    if sys_prompt.is_none() {
+        warn!(
+            "{} not found on disk nor in embedded assets; LLM runs without system prompt",
+            sys_prompt_name
+        );
+    }
+    LlmClientBuilder::from_value(cfg)
+        .sys_prompt(sys_prompt)
+        .build()
+}
+
+/// プロンプトの frontmatter で指定されたオプションを適用してから LLM を使う。
+///
+/// `slot` をロックし、`reset_options()` で前回の設定を捨ててから `option` を適用し、
+/// `proc` に `&mut Box<dyn LlmInterface>` を渡す。`schema` が指定されていれば
+/// capability に応じて構造化出力かプロンプト埋め込みへ振り分け、応答が JSON で
+/// あることの検証(とコードフェンス剥がし)まで面倒を見る。
+///
+/// LSP ハンドラ(`Backend::use_llm_with_option`)と ACP エージェント(`crate::acp`)の
+/// 双方から使うため、`Backend` に依存しない自由関数としてここに置いている。
+pub(crate) async fn use_llm_with_option<F>(
+    slot: &tokio::sync::Mutex<Option<Box<dyn LlmInterface>>>,
+    option: HashMap<String, String>,
+    proc: F,
+) -> Result<String, LlmError>
+where
+    F: for<'b, 'a> AsyncFnOnce(&'b mut Box<dyn LlmInterface + 'a>) -> Result<String, LlmError>,
+{
+    use genai::chat::JsonSpec;
+
+    debug!("Options {:?}", option);
+    let mut ref_llm = slot.lock().await;
+
+    let Some(llm) = ref_llm.as_mut() else {
+        return Err(LlmError::NotInitialized);
+    };
+
+    // 前回リクエストの max_tokens/temperature/reasoning_level 等が
+    // 失敗・キャンセル時に持ち越されないよう、適用前に既定値へ戻す。
+    llm.reset_options();
+    if let Some(v) = option.get("max_tokens")
+        && let Ok(n) = v.parse::<u32>()
+    {
+        llm.max_tokens(n);
+    }
+    if let Some(v) = option.get("temperature")
+        && let Ok(n) = v.parse::<f64>()
+    {
+        llm.temperature(n);
+    }
+    if let Some(v) = option.get("top_p")
+        && let Ok(n) = v.parse::<f64>()
+    {
+        llm.top_p(n);
+    }
+    if let Some(v) = option.get("stop_sequences") {
+        llm.stop_sequences(v.split(',').map(|s| s.to_string()).collect());
+    }
+    if let Some(v) = option.get("seed")
+        && let Ok(n) = v.parse::<u64>()
+    {
+        llm.seed(n);
+    }
+    if let Some(v) = option.get("reasoning_effort") {
+        if let Ok(level) = v.parse::<f64>() {
+            llm.reasoning_level(level);
+        } else if let Ok(eff) = v.parse::<ReasoningEffort>() {
+            llm.reasoning_effort(eff);
+        }
+    }
+    if let Some(v) = option.get("service_tier")
+        && let Ok(n) = v.parse::<ServiceTier>()
+    {
+        llm.service_tier(n);
+    }
+    if let Some(v) = option.get("verbosity")
+        && let Ok(n) = v.parse::<Verbosity>()
+    {
+        llm.verbosity(n);
+    }
+
+    // スキーマが frontmatter に指定されている場合、capability に応じて切り替える
+    let has_schema = option.contains_key("schema");
+    if let Some(schema_str) = option.get("schema") {
+        match serde_json::from_str::<serde_json::Value>(schema_str) {
+            Ok(schema_value) => {
+                let name = option
+                    .get("schema_name")
+                    .map(|s| s.as_str())
+                    .unwrap_or("output");
+                if llm
+                    .capabilities()
+                    .contains(ModelCapability::STRUCTURED_OUTPUT)
+                {
+                    debug!("schema: using JsonSpec (structured output)");
+                    llm.response_format(ChatResponseFormat::JsonSpec(JsonSpec::new(
+                        name,
+                        schema_value,
+                    )));
+                } else {
+                    debug!("schema: falling back to prompt embedding");
+                    llm.add(Content::Text(format!(
+                        "回答は次のJSON schemaに厳密にしたがって生成せよ。\n\nJSON Schema:\n{}\n\n最終応答は、スキーマに適合するJSONのみを出力し、JSON以外の文字は一切含めないこと。",
+                        schema_str
+                    )));
+                }
+            }
+            Err(e) => {
+                return Err(LlmError::JsonParseError {
+                    message: format!("Invalid schema in frontmatter: {}", e),
+                });
+            }
+        }
+    }
+
+    let result = proc(llm).await;
+
+    // schema が指定されていた場合、レスポンスが valid JSON であることを検証する。
+    // そのままパースできない場合は、コードフェンスや前置きを剥がした `{...}` を
+    // 切り出して再試行する(構造化出力非対応のモデルは、プロンプトで JSON を
+    // 要求しても ```json フェンスを付けてくることがある)。
+    if has_schema {
+        return result.and_then(|s| {
+            if serde_json::from_str::<serde_json::Value>(&s).is_ok() {
+                return Ok(s);
+            }
+            match crate::text::extract_json(&s) {
+                Some(json) if serde_json::from_str::<serde_json::Value>(json).is_ok() => {
+                    debug!("schema: salvaged JSON from fenced/prefixed response");
+                    Ok(json.to_string())
+                }
+                _ => Err(LlmError::JsonParseError {
+                    message: format!(
+                        "LLM response is not valid JSON: {}",
+                        crate::text::shorten(&s, 200)
+                    ),
+                }),
+            }
+        });
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests_reasoning {
     use super::*;

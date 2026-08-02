@@ -9,14 +9,13 @@ use crate::character::CharacterStore;
 use crate::character_updater::UpdateState;
 use crate::flight_recorder::{FlightRecorder, PendingCandidate};
 use crate::highlight::Highlighter;
-use crate::llm::{Content, LlmClientBuilder, LlmError, LlmInterface, ModelCapability};
+use crate::llm::{Content, LlmError, LlmInterface};
 use crate::progress::CompletionProgress;
 use crate::text::{apply_changes, precursor_word, shorten};
 use crate::types::{CursorContext, LineData};
 use dashmap::DashMap;
 use dashmap::mapref::one::RefMut;
 use dashmap::try_result::TryResult;
-use genai::chat::{ChatResponseFormat, JsonSpec, ReasoningEffort, ServiceTier, Verbosity};
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
@@ -47,6 +46,10 @@ pub(crate) struct Backend {
     character_updater_min_chars: std::sync::atomic::AtomicUsize,
     character_updater_max_chars: std::sync::atomic::AtomicUsize,
     character_updater_idle_secs: std::sync::atomic::AtomicU64,
+    // false にすると ACP エージェントのチャット要約を補完プロンプトへ埋め込まない
+    chat_context_enabled: std::sync::atomic::AtomicBool,
+    chat_context_max_chars: std::sync::atomic::AtomicUsize,
+    chat_context_ttl_secs: std::sync::atomic::AtomicU64,
 
     highlighter: Highlighter,
     // デバッグビルド専用のDB操作
@@ -82,16 +85,6 @@ pub(crate) struct Backend {
 /// (250msデバウンス)ため、連打が起きるのは短時間に選択をいじり続けた場合に限られ、
 /// その場合は最後の調整を取りこぼしても選び直せば済む、という前提で許容している。
 const CODE_ACTION_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(800);
-
-fn build_llm_client(cfg: &serde_json::Value) -> Box<dyn LlmInterface> {
-    let sys_prompt = crate::assets::load("system.md");
-    if sys_prompt.is_none() {
-        warn!("system.md not found on disk nor in embedded assets; LLM runs without system prompt");
-    }
-    LlmClientBuilder::from_value(cfg)
-        .sys_prompt(sys_prompt)
-        .build()
-}
 
 /// `LanguageServer` トレイトの実装。
 ///
@@ -165,6 +158,33 @@ impl LanguageServer for Backend {
                     .load(std::sync::atomic::Ordering::Relaxed),
             );
 
+            if let Some(cc) = opt.get("chat_context") {
+                debug!("chat_context config found: {:?}", cc);
+                if cc.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+                    self.chat_context_enabled
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(v) = cc.get("max_chars").and_then(|v| v.as_u64()) {
+                    self.chat_context_max_chars
+                        .store(v as usize, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(v) = cc.get("ttl_secs").and_then(|v| v.as_u64()) {
+                    self.chat_context_ttl_secs
+                        .store(v, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else {
+                debug!("no chat_context config; using defaults");
+            }
+            debug!(
+                "chat_context effective: enabled={} max_chars={} ttl_secs={}",
+                self.chat_context_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.chat_context_max_chars
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.chat_context_ttl_secs
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+
             if let Some(llm_root) = opt.get("llm") {
                 // 旧形式互換: llm:{provider,...} → ondemand として扱う。
                 // 新形式は llm:{ondemand:{...}, deferred:{...}}。
@@ -177,7 +197,7 @@ impl LanguageServer for Backend {
                 });
 
                 if let Some(cfg) = ondemand_cfg {
-                    let cl = build_llm_client(cfg);
+                    let cl = crate::llm::build_client(cfg, "system.md");
                     debug!(
                         "llm.ondemand built.\tmodel: {:?}\n\tservice_target: {}",
                         cl,
@@ -207,7 +227,7 @@ impl LanguageServer for Backend {
                         }
                     })
                 {
-                    let cl = build_llm_client(cfg);
+                    let cl = crate::llm::build_client(cfg, "system.md");
                     debug!(
                         "llm.deferred built.\tmodel: {:?}\n\tservice_target: {}",
                         cl,
@@ -796,7 +816,12 @@ impl LanguageServer for Backend {
         // 参照)。テンプレートが {{TEXT}} を持たない(未更新の md)場合のみ、従来どおり
         // 本文を別メッセージとして追加するフォールバックを使う。
         let text_body = before.join("");
-        let mut vars = HashMap::from([("CHAPTER", chapter), ("TEXT", text_body.as_str())]);
+        let chat = self.chat_digest(workspace);
+        let vars = HashMap::from([
+            ("CHAPTER", chapter),
+            ("TEXT", text_body.as_str()),
+            ("CHAT", chat.as_str()),
+        ]);
         let prompt = crate::frontmatter::expand(&prompt, &vars);
 
         // 直前テキストの末尾文字。候補への句点前置要否の判定に使う
@@ -1062,10 +1087,12 @@ impl LanguageServer for Backend {
         let chapter = chapter.file_prefix().unwrap().to_str().unwrap_or("99");
 
         let before_text = before.join("");
+        let chat = self.chat_digest(workspace);
         let vars = HashMap::from([
             ("CHAPTER", chapter),
             ("TEXT", before_text.as_str()),
             ("TARGET", target_text.as_str()),
+            ("CHAT", chat.as_str()),
         ]);
         let prompt = crate::frontmatter::expand(&prompt, &vars);
 
@@ -1270,6 +1297,13 @@ impl Backend {
             character_updater_idle_secs: std::sync::atomic::AtomicU64::new(
                 crate::character_updater::DEFAULT_IDLE_SECS,
             ),
+            chat_context_enabled: std::sync::atomic::AtomicBool::new(true),
+            chat_context_max_chars: std::sync::atomic::AtomicUsize::new(
+                crate::chat_context::DEFAULT_MAX_CHARS,
+            ),
+            chat_context_ttl_secs: std::sync::atomic::AtomicU64::new(
+                crate::chat_context::DEFAULT_TTL_SECS,
+            ),
             highlighter: Highlighter::new(),
             db: Arc::new(FlightRecorder::open_default()),
             character_store: CharacterStore::new(),
@@ -1297,6 +1331,38 @@ impl Backend {
         core::result::Result::Err(LlmError::NotInitialized)
     }
 
+    /// ACP エージェントが書き出したチャット要約を、プロンプトの `{{CHAT}}` 用に取り出す。
+    ///
+    /// 「作者がいま何を書こうとしているか」は本文の直前 10 文からは読み取れないため、
+    /// Agent Panel での会話を短文生成の手掛かりとして渡す(詳細は [`crate::chat_context`])。
+    /// 要約が無い・古い・機能が無効のいずれでも空文字を返す。
+    ///
+    /// 見出しごと組み立てて返すのは、要約が無いときにテンプレート側へ
+    /// 空の見出しだけが残らないようにするため(テンプレートは `{{CHAT}}` を
+    /// 1行置くだけでよい)。
+    fn chat_digest(&self, workspace: &Path) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        if !self.chat_context_enabled.load(Relaxed) {
+            return String::new();
+        }
+        match crate::chat_context::read_digest(
+            workspace,
+            self.chat_context_max_chars.load(Relaxed),
+            std::time::Duration::from_secs(self.chat_context_ttl_secs.load(Relaxed)),
+        ) {
+            Some(digest) => format!(
+                "# 作者がいま書こうとしていること\n\n{}\n\nこれは作者との会話から要約したもので、本文ではない。続きを考える手掛かりとしてのみ使い、この文面をそのまま候補に含めてはならない。\n",
+                digest
+            ),
+            None => String::new(),
+        }
+    }
+
+    /// 補完用 LLM(`llm.ondemand`)を frontmatter のオプション付きで使う。
+    ///
+    /// 実体は [`crate::llm::use_llm_with_option`]。ACP エージェントも同じ処理を
+    /// 使うため、`Backend` に依存しない自由関数として `llm.rs` に置いてある。
     async fn use_llm_with_option<F>(
         &self,
         option: HashMap<String, String>,
@@ -1307,117 +1373,7 @@ impl Backend {
             &'b mut Box<dyn LlmInterface + 'a>,
         ) -> core::result::Result<String, LlmError>,
     {
-        debug!("Options {:?}", option);
-        let mut ref_llm = self.llm.lock().await;
-
-        if let Some(llm) = ref_llm.deref_mut() {
-            // 前回リクエストの max_tokens/temperature/reasoning_level 等が
-            // 失敗・キャンセル時に持ち越されないよう、適用前に既定値へ戻す。
-            llm.reset_options();
-            if let Some(v) = option.get("max_tokens")
-                && let Ok(n) = v.parse::<u32>()
-            {
-                llm.max_tokens(n);
-            }
-            if let Some(v) = option.get("temperature")
-                && let Ok(n) = v.parse::<f64>()
-            {
-                llm.temperature(n);
-            }
-            if let Some(v) = option.get("top_p")
-                && let Ok(n) = v.parse::<f64>()
-            {
-                llm.top_p(n);
-            }
-            if let Some(v) = option.get("stop_sequences") {
-                llm.stop_sequences(v.split(',').map(|s| s.to_string()).collect());
-            }
-            if let Some(v) = option.get("seed")
-                && let Ok(n) = v.parse::<u64>()
-            {
-                llm.seed(n);
-            }
-            if let Some(v) = option.get("reasoning_effort") {
-                if let Ok(level) = v.parse::<f64>() {
-                    llm.reasoning_level(level);
-                } else if let Ok(eff) = v.parse::<ReasoningEffort>() {
-                    llm.reasoning_effort(eff);
-                }
-            }
-            if let Some(v) = option.get("service_tier")
-                && let Ok(n) = v.parse::<ServiceTier>()
-            {
-                llm.service_tier(n);
-            }
-            if let Some(v) = option.get("verbosity")
-                && let Ok(n) = v.parse::<Verbosity>()
-            {
-                llm.verbosity(n);
-            }
-
-            // スキーマが frontmatter に指定されている場合、capability に応じて切り替える
-            let has_schema = option.contains_key("schema");
-            if let Some(schema_str) = option.get("schema") {
-                match serde_json::from_str::<serde_json::Value>(schema_str) {
-                    Ok(schema_value) => {
-                        let name = option
-                            .get("schema_name")
-                            .map(|s| s.as_str())
-                            .unwrap_or("output");
-                        if llm
-                            .capabilities()
-                            .contains(ModelCapability::STRUCTURED_OUTPUT)
-                        {
-                            debug!("schema: using JsonSpec (structured output)");
-                            llm.response_format(ChatResponseFormat::JsonSpec(JsonSpec::new(
-                                name,
-                                schema_value,
-                            )));
-                        } else {
-                            debug!("schema: falling back to prompt embedding");
-                            llm.add(Content::Text(format!(
-                                "回答は次のJSON schemaに厳密にしたがって生成せよ。\n\nJSON Schema:\n{}\n\n最終応答は、スキーマに適合するJSONのみを出力し、JSON以外の文字は一切含めないこと。",
-                                schema_str
-                            )));
-                        }
-                    }
-                    Err(e) => {
-                        return core::result::Result::Err(LlmError::JsonParseError {
-                            message: format!("Invalid schema in frontmatter: {}", e),
-                        });
-                    }
-                }
-            }
-
-            let result = proc(llm).await;
-
-            // schema が指定されていた場合、レスポンスが valid JSON であることを検証する。
-            // そのままパースできない場合は、コードフェンスや前置きを剥がした `{...}` を
-            // 切り出して再試行する(構造化出力非対応のモデルは、プロンプトで JSON を
-            // 要求しても ```json フェンスを付けてくることがある)。
-            if has_schema {
-                return result.and_then(|s| {
-                    if serde_json::from_str::<serde_json::Value>(&s).is_ok() {
-                        return Ok(s);
-                    }
-                    match crate::text::extract_json(&s) {
-                        Some(json) if serde_json::from_str::<serde_json::Value>(json).is_ok() => {
-                            debug!("schema: salvaged JSON from fenced/prefixed response");
-                            Ok(json.to_string())
-                        }
-                        _ => Err(LlmError::JsonParseError {
-                            message: format!(
-                                "LLM response is not valid JSON: {}",
-                                crate::text::shorten(&s, 200)
-                            ),
-                        }),
-                    }
-                });
-            }
-            return result;
-        }
-
-        core::result::Result::Err(LlmError::NotInitialized)
+        crate::llm::use_llm_with_option(&self.llm, option, proc).await
     }
 
     fn update_all(&self, uri: &str, _offset: u32, texts: Vec<String>) {

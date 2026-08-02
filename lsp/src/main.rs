@@ -1,7 +1,9 @@
 // シンプルな LSP サーバの実装例（tower-lsp を利用）
 // このファイルは最小限の動作をする "何もしない" サーバを提供します。
+mod acp;
 mod assets;
 mod backend;
+mod chat_context;
 mod character;
 mod character_ast;
 mod character_updater;
@@ -16,9 +18,10 @@ mod progress;
 mod text;
 mod tools;
 mod types;
+mod writing_agent;
 
 use crate::backend::Backend;
-use log::info;
+use log::{error, info};
 
 /// ローカル開発用に、ソースリポジトリのルートにある `.env` を読み込む(debug ビルドのみ)。
 ///
@@ -38,13 +41,12 @@ fn load_dev_env() {
 
 /// プログラムのエントリポイント。
 ///
-/// Tokio のランタイム上で動作し、標準入出力を通じて LSP クライアントと通信します。
+/// Tokio のランタイム上で動作し、標準入出力を通じてクライアントと通信します。
+/// 既定では LSP サーバとして動作し、`--acp` を付けると ACP エージェント
+/// (Zed の Agent Panel から `agent_servers` 経由で起動される)として動作します。
+/// どちらも stdio を JSON-RPC のチャネルとして使うため、ログは stderr へ出す。
 #[tokio::main]
 async fn main() {
-    // 標準入力／出力を LSP の通信チャネルとして利用
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-
     // 環境変数の初期化
     #[cfg(debug_assertions)]
     load_dev_env();
@@ -55,6 +57,20 @@ async fn main() {
         .format_source_path(true)
         .target(env_logger::Target::Stderr)
         .init();
+
+    if std::env::args().skip(1).any(|a| a == "--acp") {
+        if let Err(e) = acp::run().await {
+            // 設定不備などはここで落ちる。Zed のログに理由が残るよう stderr にも出す。
+            error!("{}", e);
+            eprintln!("fifty_four_lsp --acp: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // 標準入力／出力を LSP の通信チャネルとして利用
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
 
     // LspService を構築し、`Backend` をクライアントハンドルで初期化する
     info!("initialize lsp service");
