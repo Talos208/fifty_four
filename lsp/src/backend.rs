@@ -5,10 +5,7 @@
 //! 構築は `Backend::new` に集約し、フィールドは private のまま保つ
 //! (`main()` からは構造体リテラルではなくこのコンストラクタ経由で初期化する)。
 
-use crate::character::{
-    CharacterCache, FileCacheEntry, collect_allowed_names, lookup_character_markdown,
-    parse_all_content,
-};
+use crate::character::CharacterStore;
 use crate::character_updater::UpdateState;
 use crate::flight_recorder::{FlightRecorder, PendingCandidate};
 use crate::highlight::Highlighter;
@@ -24,7 +21,7 @@ use genai::chat::{ChatResponseFormat, JsonSpec, ReasoningEffort, ServiceTier, Ve
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::ops::DerefMut;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use tower_lsp_server::lsp_types::*;
@@ -54,8 +51,8 @@ pub(crate) struct Backend {
     highlighter: Highlighter,
     // デバッグビルド専用のDB操作
     db: Arc<FlightRecorder>,
-    // キャラクター設定ファイルのパース結果キャッシュ
-    character_cache: CharacterCache,
+    // キャラクター設定ファイルのメモリ上の正本(SSoT)。ディスクはload/dump先でしかない。
+    character_store: CharacterStore,
     // URI ごとのキャラクター更新トリガー状態
     update_states: DashMap<String, Arc<parking_lot::Mutex<UpdateState>>>,
     // URI ごとの直近で実際に LLM を呼んだ code_action 呼び出し時刻(デバウンス用)。
@@ -229,7 +226,7 @@ impl LanguageServer for Backend {
             // キャラ名にカーソルを合わせた際、そのキャラの設定をMarkdownで表示する。
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             // save 通知(did_save)を有効化するため Kind ではなく Options 形式にする。
-            // キャラクター設定ファイル保存時に character_cache を再構築するために使う。
+            // キャラクター設定ファイル保存時に character_store を調和(reconcile)するために使う。
             text_document_sync: Some(TextDocumentSyncCapability::Options(
                 TextDocumentSyncOptions {
                     open_close: Some(true),
@@ -335,13 +332,12 @@ impl LanguageServer for Backend {
         let res = self.client.configuration(req).await.unwrap();
         debug!("{:?}", res);
 
-        // (a) ワークスペース初期化時にキャラクターファイルを能動スキャンし character_cache を populate する。
-        // LLM補完のtool calling実行を待たずに、人名ハイライトの絞り込みをすぐ使えるようにするため。
+        // (a) ワークスペース初期化時にキャラクターファイルを能動スキャンし character_store へ
+        // ロードする。LLM補完のtool calling実行を待たずに、人名ハイライトの絞り込みをすぐ
+        // 使えるようにするため。
         let workspace_paths: Vec<PathBuf> = self.workspace.lock().await.clone();
         for ws in &workspace_paths {
-            for path in Self::list_character_files(ws) {
-                self.reparse_character_file(&path).await;
-            }
+            self.character_store.load_workspace(ws).await;
         }
 
         // (c) 外部エディタ/gitなどによるキャラクターファイルの変更も検知できるよう、
@@ -398,26 +394,42 @@ impl LanguageServer for Backend {
         let _ = self.client.semantic_tokens_refresh().await;
     }
 
-    /// (b) キャラクター設定ファイル保存時に character_cache を再構築する。
-    /// 保存直後の内容をディスクから読み直し、人名ハイライトの許可名集合へ即座に反映する。
+    /// (b) キャラクター設定ファイル保存時、character_store を調和(reconcile)する。
+    /// 保存直後の内容をディスクから読み直し、自己書き込みのエコーでなければ(＝内容が
+    /// character_updater による直前の書き込みと一致しなければ)取り込んで許可名集合へ反映する。
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri.as_str();
         if !self.is_character_file(uri) {
             return;
         }
-        debug!("did_save[{}]: character file, reparsing", uri);
         let Some(path) = params.text_document.uri.to_file_path() else {
             warn!("did_save[{}]: failed to convert uri to file path", uri);
             return;
         };
-        self.reparse_character_file(&path).await;
-        self.refresh_highlight_names().await;
+        let Some(ws) = self.resolve_workspace(&params.text_document.uri).await else {
+            warn!("did_save[{}]: 所属ワークスペースが特定できない", uri);
+            return;
+        };
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("did_save[{}]: failed to read {:?}: {}", uri, path, e);
+                return;
+            }
+        };
+        if self.character_store.reconcile(&ws, &path, content) {
+            debug!("did_save[{}]: 外部変更として取り込み", uri);
+            self.refresh_highlight_names().await;
+        } else {
+            debug!("did_save[{}]: 自己書き込みのエコーのため無視", uri);
+        }
     }
 
     /// (c) workspace/didChangeWatchedFiles: エディタ外(他プログラム・git等)での
-    /// キャラクター設定ファイル変更を検知し character_cache を再構築する。
+    /// キャラクター設定ファイル変更を検知し character_store を調和(reconcile)する。
     /// `initialized` で動的登録した watcher からの通知を受ける。
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let mut any_changed = false;
         for change in params.changes {
             let Some(path) = change.uri.to_file_path().map(|p| p.into_owned()) else {
                 warn!(
@@ -426,18 +438,45 @@ impl LanguageServer for Backend {
                 );
                 continue;
             };
+            let Some(ws) = self.resolve_workspace(&change.uri).await else {
+                warn!(
+                    "did_change_watched_files: 所属ワークスペースが特定できない: {:?}",
+                    path
+                );
+                continue;
+            };
             match change.typ {
                 FileChangeType::DELETED => {
-                    debug!("did_change_watched_files: removing {:?} from cache", path);
-                    self.character_cache.0.lock().remove(&path);
+                    debug!("did_change_watched_files: removing {:?} from store", path);
+                    self.character_store.remove(&ws, &path);
+                    any_changed = true;
                 }
                 _ => {
-                    debug!("did_change_watched_files: reparsing {:?}", path);
-                    self.reparse_character_file(&path).await;
+                    let content = match tokio::fs::read_to_string(&path).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!(
+                                "did_change_watched_files: failed to read {:?}: {}",
+                                path, e
+                            );
+                            continue;
+                        }
+                    };
+                    if self.character_store.reconcile(&ws, &path, content) {
+                        debug!("did_change_watched_files: 外部変更として取り込み: {:?}", path);
+                        any_changed = true;
+                    } else {
+                        debug!(
+                            "did_change_watched_files: 自己書き込みのエコーのため無視: {:?}",
+                            path
+                        );
+                    }
                 }
             }
         }
-        self.refresh_highlight_names().await;
+        if any_changed {
+            self.refresh_highlight_names().await;
+        }
     }
 
     // #[instrument]
@@ -485,10 +524,8 @@ impl LanguageServer for Backend {
                 .as_slice(),
         );
 
-        self.record_change(
-            param.text_document.uri.as_str(),
-            param.content_changes.as_slice(),
-        );
+        self.record_change(&param.text_document.uri, param.content_changes.as_slice())
+            .await;
 
         let _ = self.client.semantic_tokens_refresh().await;
     }
@@ -513,6 +550,10 @@ impl LanguageServer for Backend {
         debug!("semantic_token_full");
 
         let uri = params.text_document.uri.as_str();
+        let allowed = match self.resolve_workspace(&params.text_document.uri).await {
+            Some(ws) => self.character_store.allowed_names(&ws),
+            None => std::collections::HashSet::new(),
+        };
 
         let vec = {
             // 共有ストアの行を直接更新する(get_mut)。深さを 0 から畳み込みながら全行を
@@ -522,7 +563,7 @@ impl LanguageServer for Backend {
             let mut depth = 0u32;
             let mut per_line = Vec::with_capacity(lines.len());
             for line in lines.iter_mut() {
-                let (toks, d) = self.highlighter.tokenize_with_depth(line, depth);
+                let (toks, d) = self.highlighter.tokenize_with_depth(line, depth, &allowed);
                 depth = d;
                 per_line.push(toks);
             }
@@ -553,6 +594,12 @@ impl LanguageServer for Backend {
         let line_no = pos.position.line as usize;
         let utf16_offset = pos.position.character as usize;
 
+        // カーソル位置のドキュメントが属するワークスペースを特定する。マッチしなければ
+        // hoverを出さない(誤って別ワークスペースのキャラ情報を出さないための安全側の判断)。
+        let Some(ws) = self.resolve_workspace(&pos.text_document.uri).await else {
+            return Ok(None);
+        };
+
         let mut tmp: RefMut<_, _> = match self.text.try_get_mut(uri) {
             TryResult::Locked | TryResult::Absent => return Ok(None),
             TryResult::Present(t) => t,
@@ -576,7 +623,14 @@ impl LanguageServer for Backend {
         let surface = tmp[line_no].surface(&tkn).to_string();
         drop(tmp);
 
-        let markdown = lookup_character_markdown(&self.character_cache, &surface);
+        let allowed = self.character_store.allowed_names(&ws);
+        // ハイライトと同じ判定基準(品詞=固有名詞,人名 かつ 許可名一致)を通ったトークンのみ
+        // hoverを出す。これによりハイライトされないトークンでhoverだけ表示される食い違いを防ぐ。
+        if !Highlighter::is_recognized_name(&tkn.details, &surface, &allowed) {
+            return Ok(None);
+        }
+
+        let markdown = self.character_store.lookup_markdown(&ws, &surface);
 
         Ok(markdown.map(|value| Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -768,7 +822,7 @@ impl LanguageServer for Backend {
             .use_llm_with_option(options, async |l| {
                 l.add_tool(crate::tools::CharacterInfoTool::new(
                     workspace,
-                    self.character_cache.clone(),
+                    self.character_store.clone(),
                 ));
                 l.add_tool(crate::tools::PlotInfoTool::new(workspace));
                 l.add(Content::Text(prompt));
@@ -1029,7 +1083,7 @@ impl LanguageServer for Backend {
             .use_llm_with_option(options, async |l| {
                 l.add_tool(crate::tools::CharacterInfoTool::new(
                     workspace,
-                    self.character_cache.clone(),
+                    self.character_store.clone(),
                 ));
                 l.add_tool(crate::tools::PlotInfoTool::new(workspace));
                 l.add(Content::Text(prompt));
@@ -1218,7 +1272,7 @@ impl Backend {
             ),
             highlighter: Highlighter::new(),
             db: Arc::new(FlightRecorder::open_default()),
-            character_cache: CharacterCache::new(),
+            character_store: CharacterStore::new(),
             update_states: DashMap::new(),
             code_action_last_call: DashMap::new(),
             work_done_progress_supported: std::sync::atomic::AtomicBool::new(false),
@@ -1463,71 +1517,30 @@ impl Backend {
         uri.contains("/characters/") || uri.ends_with("/characters.md")
     }
 
-    /// workspace 配下の全キャラクターファイルパスを列挙する。
-    /// `characters.md`（単一ファイル）と `characters/*.md`（ディレクトリ）の両方に対応する
-    /// （`find_character_file_path` のファイル探索ロジックを「全件列挙」向けに一般化したもの）。
-    fn list_character_files(workspace: &Path) -> Vec<PathBuf> {
-        let mut files = Vec::new();
-
-        let single = workspace.join("characters").with_extension("md");
-        if single.is_file() {
-            files.push(single);
-        }
-
-        let dir = workspace.join("characters");
-        if dir.is_dir()
-            && let Ok(entries) = dir.read_dir()
-        {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
-                    files.push(path);
-                }
-            }
-        }
-
-        files
+    /// URIから、それを含む最長一致のワークスペースrootを解決する。
+    /// マッチしない場合は最初のワークスペース(あれば)へフォールバックする。
+    async fn resolve_workspace(&self, uri: &Uri) -> Option<PathBuf> {
+        let doc_path = uri.to_file_path()?.into_owned();
+        let roots = self.workspace.lock().await;
+        CharacterStore::resolve_workspace_for(&doc_path, &roots)
+            .cloned()
+            .or_else(|| roots.first().cloned())
     }
 
-    /// 1ファイルを読み込み parse して character_cache に反映する。
-    /// 読み込みに失敗した場合はログのみで static に無視する(呼び出し元は複数ファイルを回すため)。
-    async fn reparse_character_file(&self, path: &Path) {
-        let modified = std::fs::metadata(path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-
-        let content = match tokio::fs::read_to_string(path).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("reparse_character_file: failed to read {:?}: {}", path, e);
-                return;
-            }
-        };
-
-        let characters = parse_all_content(&content);
-        self.character_cache.0.lock().insert(
-            path.to_path_buf(),
-            FileCacheEntry {
-                modified,
-                characters,
-            },
-        );
-    }
-
-    /// character_cache 全体から人名ハイライトの許可名集合を再構築し Highlighter に反映、
-    /// クライアントへ semanticTokens の再取得を要求する。
-    /// 名前集合が変化した場合は、キャラ名を Lindera ユーザー辞書に固有名詞として登録し直し、
-    /// 旧辞書でトークナイズ済みのキャッシュを破棄する(誤分割されていた名前の再解析のため)。
+    /// character_store の全ワークスペース合計の許可名集合で Linderaユーザー辞書を再構築し、
+    /// クライアントへ semanticTokens の再取得を要求する。トークナイズ品質の担保だけが
+    /// 目的で、どのワークスペースの名前かはここでは区別しない
+    /// (ハイライト・hoverの最終判定はワークスペーススコープの許可名集合で別途行う)。
     async fn refresh_highlight_names(&self) {
-        let names = collect_allowed_names(&self.character_cache);
-        debug!("refresh_highlight_names: {} 件の許可名", names.len());
-        let changed = self.highlighter.set_allowed_names(names);
-        if changed {
-            if let Err(e) = self.highlighter.rebuild_user_dictionary() {
-                warn!("ユーザー辞書の再構築に失敗: {}", e);
-            }
-            self.invalidate_token_caches();
+        let names = self.character_store.all_allowed_names();
+        debug!(
+            "refresh_highlight_names: {} 件の許可名(全ワークスペース合計)",
+            names.len()
+        );
+        if let Err(e) = self.highlighter.rebuild_user_dictionary(&names) {
+            warn!("ユーザー辞書の再構築に失敗: {}", e);
         }
+        self.invalidate_token_caches();
         if let Err(e) = self.client.semantic_tokens_refresh().await {
             warn!("semantic_tokens_refresh failed: {:?}", e);
         }
@@ -1549,8 +1562,11 @@ impl Backend {
     ///   idle 確定なら `min_chars` 以上で発火・未満でクリア。
     /// - 現在の変更を取り込んだ後、`max_chars` 以上なら即時発火。
     /// 発火時に spawn する非同期タスクは `crate::character_updater::run` だけ。
-    fn record_change(&self, uri: &str, changes: &[TextDocumentContentChangeEvent]) {
+    /// ワークスペース解決(`resolve_workspace`)を伴うため async。
+    async fn record_change(&self, doc_uri: &Uri, changes: &[TextDocumentContentChangeEvent]) {
         use std::sync::atomic::Ordering::Relaxed;
+
+        let uri = doc_uri.as_str();
 
         if !self.character_updater_enabled.load(Relaxed) {
             debug!("record_change[{}]: disabled, skip", uri);
@@ -1560,6 +1576,13 @@ impl Backend {
             debug!("record_change[{}]: character file, skip", uri);
             return;
         }
+        let Some(workspace) = self.resolve_workspace(doc_uri).await else {
+            debug!(
+                "record_change[{}]: ワークスペースが特定できないためスキップ",
+                uri
+            );
+            return;
+        };
 
         let state_arc = self
             .update_states
@@ -1663,7 +1686,8 @@ impl Backend {
             );
             tokio::spawn(crate::character_updater::run(
                 uri.to_string(),
-                self.workspace.clone(),
+                workspace,
+                self.character_store.clone(),
                 text,
                 self.background_llm.clone(),
                 self.db.clone(),

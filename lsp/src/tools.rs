@@ -1,6 +1,4 @@
-use crate::character::{
-    CharacterAttribute, CharacterCache, FileCacheEntry, find_character_file_path, parse_all_content,
-};
+use crate::character::{CharacterAttribute, CharacterStore};
 use crate::llm::{LlmError, LlmTool};
 use crate::text::shorten_middle;
 use async_trait::async_trait;
@@ -45,7 +43,7 @@ pub(crate) fn parse_plot_md(content: &str) -> Vec<(String, String)> {
 #[derive(Debug)]
 pub(crate) struct CharacterInfoTool {
     workspace: PathBuf,
-    cache: CharacterCache,
+    store: CharacterStore,
 }
 
 #[async_trait]
@@ -86,101 +84,33 @@ impl LlmTool for CharacterInfoTool {
         _args: &serde_json::Map<String, Value>,
     ) -> std::result::Result<String, LlmError> {
         let name = _args["character_name"].as_str().unwrap_or("");
-        let tags: Vec<String> = _args
+        let tags: Vec<CharacterAttribute> = _args
             .get("tags")
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .filter_map(|v| v.as_str().and_then(|s| CharacterAttribute::try_from(s).ok()))
                     .collect()
             })
             .unwrap_or_default();
 
         debug!("CharacterInfoTool({}, {:?})", name, tags);
 
-        let path = self.find_character_file_path(name)?;
-
-        let modified = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-
-        // キャッシュ確認（ロックは HashMap lookup の間だけ保持）
-        // {
-        //     let cache = self.cache.0.lock();
-        //     if let Some(entry) = cache.get(&path)
-        //         && entry.modified == modified
-        //     {
-        //         let result = Self::search_cache(entry, name, &tags);
-        //         debug!("\t{:?}", result.map(|r| shorten_middle(&r, 40)))
-        //     }
-        // }
-
-        // キャッシュミス: ファイルを読んでパース
-        let content =
-            tokio::fs::read_to_string(&path)
-                .await
-                .map_err(|e| LlmError::GenericError {
-                    message: format!("Failed to read {:?}: {}", &path, e),
-                })?;
-        debug!("{}", shorten_middle(&content, 40));
-
-        let characters = parse_all_content(&content);
-        let file_entry = FileCacheEntry {
-            modified,
-            characters,
-        };
-
-        let result = Self::search_cache(&file_entry, name, &tags);
-        self.cache.0.lock().insert(path, file_entry);
+        // character_store はワークスペース全ファイルをメモリに保持しているため、
+        // 1ファイルへの決め打ちをせず全件横断で検索する
+        // (呼称が複数ありうる問題は store 側の全件検索で解消済み)。
+        let result = self.store.search(&self.workspace, name, &tags);
         debug!("\t{:?}", result.as_ref().map(|r| shorten_middle(r, 40)));
         result
     }
 }
 
 impl CharacterInfoTool {
-    pub(crate) fn new(workspace: &Path, cache: CharacterCache) -> Box<dyn LlmTool> {
+    pub(crate) fn new(workspace: &Path, store: CharacterStore) -> Box<dyn LlmTool> {
         Box::new(Self {
             workspace: workspace.to_path_buf(),
-            cache,
+            store,
         })
-    }
-
-    fn find_character_file_path(&self, name: &str) -> std::result::Result<PathBuf, LlmError> {
-        find_character_file_path(&self.workspace, name) // TODO: キャラクタの呼び方は複数ありうるので、キャラ設定全部をなめないといけない
-    }
-
-    pub(crate) fn search_cache(
-        entry: &FileCacheEntry,
-        name: &str,
-        tags: &[String],
-    ) -> std::result::Result<String, LlmError> {
-        // キャラクター名は部分一致で検索
-        let Some((_, char_entry)) = entry.characters.iter().find(|(k, _)| k.contains(name)) else {
-            return Err(LlmError::GenericError {
-                message: format!("Character '{}' not found", name),
-            });
-        };
-
-        let tag_attrs = tags
-            .iter()
-            .filter_map(|t| CharacterAttribute::try_from(t.as_str()).ok())
-            .collect::<Vec<_>>();
-
-        let matched = char_entry
-            .sections
-            .iter()
-            .filter(|s| tag_attrs.iter().any(|t| s.tags.contains(t)))
-            .map(|s| s.text.trim())
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>();
-
-        if matched.is_empty() {
-            Err(LlmError::GenericError {
-                message: format!("No sections matching tags {:?} for '{}'", tags, name),
-            })
-        } else {
-            Ok(matched.join("\n\n"))
-        }
     }
 }
 

@@ -3,6 +3,7 @@
 mod assets;
 mod backend;
 mod character;
+mod character_ast;
 mod character_updater;
 mod code_action;
 mod cursor_context;

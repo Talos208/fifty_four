@@ -318,7 +318,7 @@ mod tests {
         let hl = Highlighter::new();
         // 各行とも括弧は行内で閉じるので、深さ0起点の行単位 tokenize で足りる
         ls.iter_mut().for_each(|l| {
-            hl.tokenize(l);
+            hl.tokenize(l, &std::collections::HashSet::new());
         });
 
         assert_eq!(ls.len(), 2);

@@ -139,10 +139,10 @@ impl Provider {
         use ReasoningEffort::*;
         // 低→高 の順。空 = reasoning 非対応。
         let ladder: &[ReasoningEffort] = match self {
-            Provider::OpenAI(_)    => &[Low, Medium, High, XHigh],
+            Provider::OpenAI(_) => &[Low, Medium, High, XHigh],
             Provider::Anthropic(_) => &[Low, Medium, High, XHigh, Max],
-            Provider::Google(_)    => &[Low, Medium, High],
-            Provider::XAi(_)       => &[Low, High],
+            Provider::Google(_) => &[Low, Medium, High],
+            Provider::XAi(_) => &[Low, High],
             Provider::Cloudflare(_) | Provider::LMStudio(..) | Provider::Undefined => &[],
         };
         let n = norm.clamp(0.0, 1.0);
@@ -554,7 +554,7 @@ impl LlmInterface for LlmClient {
 
     fn add_tool(&mut self, tool: Box<dyn LlmTool>) {
         self.tools.insert(tool.as_ref().name().to_string(), tool);
-        debug!("Tool added to backend {:?}", self.tools);
+        debug!("Tool added to backend {:?}", self.tools.keys());
     }
 
     async fn with_model(&mut self, model: &str) -> Result<String, LlmError> {
@@ -831,24 +831,46 @@ impl LlmInterface for LlmClient {
 mod tests_reasoning {
     use super::*;
 
-    fn openai() -> Provider { Provider::OpenAI("gpt-5.3".to_string()) }
-    fn anthropic() -> Provider { Provider::Anthropic("claude-opus-4-8".to_string()) }
-    fn google() -> Provider { Provider::Google("gemini-3.1-pro-preview".to_string()) }
-    fn xai() -> Provider { Provider::XAi("grok-4.1".to_string()) }
-    fn lmstudio() -> Provider { Provider::LMStudio("model".to_string(), None) }
+    fn openai() -> Provider {
+        Provider::OpenAI("gpt-5.3".to_string())
+    }
+    fn anthropic() -> Provider {
+        Provider::Anthropic("claude-opus-4-8".to_string())
+    }
+    fn google() -> Provider {
+        Provider::Google("gemini-3.1-pro-preview".to_string())
+    }
+    fn xai() -> Provider {
+        Provider::XAi("grok-4.1".to_string())
+    }
+    fn lmstudio() -> Provider {
+        Provider::LMStudio("model".to_string(), None)
+    }
 
     #[test]
     fn test_zero_is_none() {
         assert!(matches!(openai().map_reasoning(0.0), ReasoningEffort::None));
-        assert!(matches!(anthropic().map_reasoning(0.0), ReasoningEffort::None));
+        assert!(matches!(
+            anthropic().map_reasoning(0.0),
+            ReasoningEffort::None
+        ));
         assert!(matches!(google().map_reasoning(0.0), ReasoningEffort::None));
-        assert!(matches!(lmstudio().map_reasoning(0.0), ReasoningEffort::None));
+        assert!(matches!(
+            lmstudio().map_reasoning(0.0),
+            ReasoningEffort::None
+        ));
     }
 
     #[test]
     fn test_one_is_max_per_provider() {
-        assert!(matches!(openai().map_reasoning(1.0), ReasoningEffort::XHigh));
-        assert!(matches!(anthropic().map_reasoning(1.0), ReasoningEffort::Max));
+        assert!(matches!(
+            openai().map_reasoning(1.0),
+            ReasoningEffort::XHigh
+        ));
+        assert!(matches!(
+            anthropic().map_reasoning(1.0),
+            ReasoningEffort::Max
+        ));
         assert!(matches!(google().map_reasoning(1.0), ReasoningEffort::High));
         assert!(matches!(xai().map_reasoning(1.0), ReasoningEffort::High));
     }
@@ -859,17 +881,29 @@ mod tests_reasoning {
         // 0.25 -> ceil(1.0)=1 -> idx=0 -> Low
         assert!(matches!(openai().map_reasoning(0.25), ReasoningEffort::Low));
         // 0.5  -> ceil(2.0)=2 -> idx=1 -> Medium
-        assert!(matches!(openai().map_reasoning(0.5), ReasoningEffort::Medium));
+        assert!(matches!(
+            openai().map_reasoning(0.5),
+            ReasoningEffort::Medium
+        ));
         // 0.75 -> ceil(3.0)=3 -> idx=2 -> High
-        assert!(matches!(openai().map_reasoning(0.75), ReasoningEffort::High));
+        assert!(matches!(
+            openai().map_reasoning(0.75),
+            ReasoningEffort::High
+        ));
     }
 
     #[test]
     fn test_clamp_out_of_range() {
         // 1.0超 -> clamp to 1.0 -> 最上位
-        assert!(matches!(openai().map_reasoning(1.5), ReasoningEffort::XHigh));
+        assert!(matches!(
+            openai().map_reasoning(1.5),
+            ReasoningEffort::XHigh
+        ));
         // 負数 -> None
-        assert!(matches!(anthropic().map_reasoning(-0.3), ReasoningEffort::None));
+        assert!(matches!(
+            anthropic().map_reasoning(-0.3),
+            ReasoningEffort::None
+        ));
     }
 
     #[test]
@@ -893,14 +927,23 @@ mod tests_capabilities {
         let anthropic = Provider::Anthropic("claude-4.6-sonnet".to_string());
         let expected = ModelCapability::STRUCTURED_OUTPUT | ModelCapability::TOOL_CALLING;
         assert_eq!(openai.default_capabilities("gpt-5.3"), expected);
-        assert_eq!(google.default_capabilities("gemini-3.1-pro-preview"), expected);
-        assert_eq!(anthropic.default_capabilities("claude-4.6-sonnet"), expected);
+        assert_eq!(
+            google.default_capabilities("gemini-3.1-pro-preview"),
+            expected
+        );
+        assert_eq!(
+            anthropic.default_capabilities("claude-4.6-sonnet"),
+            expected
+        );
     }
 
     #[test]
     fn test_xai_tool_calling_only() {
         let xai = Provider::XAi("grok-4.1".to_string());
-        assert_eq!(xai.default_capabilities("grok-4.1"), ModelCapability::TOOL_CALLING);
+        assert_eq!(
+            xai.default_capabilities("grok-4.1"),
+            ModelCapability::TOOL_CALLING
+        );
     }
 
     #[test]

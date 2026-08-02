@@ -8,11 +8,11 @@ use crate::llm::LlmError;
 use comrak::arena_tree::NodeEdge;
 use comrak::nodes::{AstNode, NodeValue};
 use comrak::{Arena, options};
+#[allow(unused_imports)]
+use log::{debug, trace};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[allow(unused_imports)]
-use log::{debug, trace};
 
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) enum CharacterAttribute {
@@ -92,58 +92,321 @@ pub(crate) struct CharacterEntry {
     pub(crate) aliases: Vec<String>,
 }
 
-/// 1ファイル分のキャッシュ
-#[derive(Debug)]
-pub(crate) struct FileCacheEntry {
-    pub(crate) modified: std::time::SystemTime,
-    /// key: heading 全文（部分一致検索用）
-    pub(crate) characters: HashMap<String, CharacterEntry>,
-}
-
-/// 全ファイルのキャッシュ (Arc で複数の CharacterInfoTool インスタンス間で共有)
+/// 1キャラクターファイルのメモリ上の正本。ディスクはこの値のload/dump先でしかない。
 #[derive(Debug, Clone)]
-pub(crate) struct CharacterCache(pub(crate) Arc<parking_lot::Mutex<HashMap<PathBuf, FileCacheEntry>>>);
+pub(crate) struct CharacterFile {
+    /// 現在のMarkdown全文。書き込み(character_updater)・外部変更取り込みの両方でここが更新される。
+    pub(crate) content: String,
+    /// `content` から派生した読み取り用インデックス(ハイライト許可名・hover検索用)。
+    /// `content` を更新するたびに再計算する。
+    pub(crate) characters: HashMap<String, CharacterEntry>,
+    /// 直前にこのプロセス自身が書き込んだ内容のハッシュ。watcherイベントの内容ハッシュと
+    /// 一致すれば自己書き込みのエコーとして無視する(`CharacterStore::reconcile` が使う)。
+    pub(crate) last_written_hash: Option<u64>,
+}
 
-impl CharacterCache {
-    pub(crate) fn new() -> Self {
-        Self(Arc::new(parking_lot::Mutex::new(HashMap::new())))
+impl CharacterFile {
+    fn from_content(content: String) -> Self {
+        let characters = parse_all_content(&content);
+        Self {
+            content,
+            characters,
+            last_written_hash: None,
+        }
     }
 }
 
-/// workspace 内でキャラクター名に対応するファイルパスを解決する自由関数。
-pub(crate) fn find_character_file_path(
-    workspace: &Path,
-    name: &str,
-) -> std::result::Result<PathBuf, LlmError> {
-    let single = workspace.join("characters").with_extension("md");
-    trace!("{:?}", &single);
-    if single.exists() && single.is_file() {
-        return Ok(single);
+fn hash_content(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+fn add_allowed_name(n: &str, names: &mut std::collections::HashSet<String>) {
+    let n = n.trim();
+    if !n.is_empty() {
+        names.insert(n.to_string());
+    }
+}
+
+/// 「・」による複合名分割は行わない(西欧式の名・姓区切りとは限らず、分割するなら
+/// 姓・名の区分を登録時に別途持つ必要があるため)。文字数による除外も行わない
+/// (1文字の姓等も対象)。誤マッチ抑止はユーザー辞書側のコスト調整
+/// (`Highlighter::user_dict_csv_row`)で担保する。
+fn collect_names_from(
+    characters: &HashMap<String, CharacterEntry>,
+    names: &mut std::collections::HashSet<String>,
+) {
+    for (heading_key, entry) in characters {
+        add_allowed_name(character_display_name(heading_key), names);
+        for alias in &entry.aliases {
+            add_allowed_name(alias, names);
+        }
+    }
+}
+
+fn matches_surface(heading_key: &str, entry: &CharacterEntry, surface: &str) -> bool {
+    character_display_name(heading_key) == surface || entry.aliases.iter().any(|a| a == surface)
+}
+
+#[derive(Debug)]
+struct CharacterStoreState {
+    /// ワークスペースroot -> そのワークスペース配下のキャラクターファイル群
+    workspaces: parking_lot::Mutex<HashMap<PathBuf, HashMap<PathBuf, CharacterFile>>>,
+    /// ワークスペースroot単位の書き込み直列化ロック。`character_updater::run` がどの
+    /// ドキュメントURIから発火しても、同一ワークスペースの plan→バッチマージ→apply は
+    /// このロックで直列化される(同一キャラクターファイルへの並行read-modify-writeを防ぐ)。
+    write_locks: dashmap::DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>,
+}
+
+/// 全ワークスペースのキャラクター設定ファイルをメモリ上に保持する正本(SSoT)。
+/// ディスクはload/dump先でしかない(`Backend`と`CharacterInfoTool`で共有する)。
+#[derive(Debug, Clone)]
+pub(crate) struct CharacterStore(Arc<CharacterStoreState>);
+
+impl CharacterStore {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(CharacterStoreState {
+            workspaces: parking_lot::Mutex::new(HashMap::new()),
+            write_locks: dashmap::DashMap::new(),
+        }))
     }
 
-    let dir = workspace.join("characters");
-    if !dir.exists() || !dir.is_dir() {
-        return Err(LlmError::GenericError {
-            message: format!("Found no directory {:?}", &dir),
-        });
+    /// `root`配下のキャラクターファイル一覧を検出する(`characters.md`単一ファイル形式・
+    /// `characters/*.md`フォルダ形式の両対応)。`Backend`/`character_updater`どちらからも
+    /// 使う唯一のファイル探索実装。
+    pub(crate) fn discover_character_files(root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+
+        let single = root.join("characters").with_extension("md");
+        if single.is_file() {
+            files.push(single);
+        }
+
+        let dir = root.join("characters");
+        if dir.is_dir()
+            && let Ok(entries) = dir.read_dir()
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    files.push(path);
+                }
+            }
+        }
+
+        files
     }
 
-    for entry in dir
-        .read_dir()
-        .map_err(|_| LlmError::GenericError {
-            message: format!("Failed to read directory {:?}", &dir),
-        })?
-        .flatten()
-    {
-        debug!("{:?}", entry.file_name());
-        if entry.file_name().to_string_lossy().starts_with(name) {
-            return Ok(entry.path());
+    /// `root`配下のキャラクターファイルを列挙・読込・パースしてメモリへロードする。
+    /// 1件も見つからない場合は空の`characters.md`を新規作成してロードする。
+    pub(crate) async fn load_workspace(&self, root: &Path) {
+        let mut files = Self::discover_character_files(root);
+        if files.is_empty() {
+            let new_path = root.join("characters.md");
+            match tokio::fs::write(&new_path, "").await {
+                Ok(_) => {
+                    debug!("CharacterStore::load_workspace: created {:?}", new_path);
+                    files.push(new_path);
+                }
+                Err(e) => {
+                    debug!(
+                        "CharacterStore::load_workspace: characters.md新規作成に失敗 {:?}: {}",
+                        new_path, e
+                    );
+                    return;
+                }
+            }
+        }
+
+        let mut loaded = HashMap::new();
+        for path in files {
+            match tokio::fs::read_to_string(&path).await {
+                Ok(content) => {
+                    loaded.insert(path, CharacterFile::from_content(content));
+                }
+                Err(e) => debug!(
+                    "CharacterStore::load_workspace: 読み込み失敗 {:?}: {}",
+                    path, e
+                ),
+            }
+        }
+        self.0.workspaces.lock().insert(root.to_path_buf(), loaded);
+    }
+
+    /// ドキュメントパスを含む最長一致のワークスペースrootを返す。
+    pub(crate) fn resolve_workspace_for<'a>(
+        doc_path: &Path,
+        roots: &'a [PathBuf],
+    ) -> Option<&'a PathBuf> {
+        roots
+            .iter()
+            .filter(|root| doc_path.starts_with(root))
+            .max_by_key(|root| root.as_os_str().len())
+    }
+
+    /// 指定ワークスペースの許可名集合を構築する(人名ハイライトの絞り込み用)。
+    pub(crate) fn allowed_names(&self, workspace_root: &Path) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        let guard = self.0.workspaces.lock();
+        if let Some(files) = guard.get(workspace_root) {
+            for file in files.values() {
+                collect_names_from(&file.characters, &mut names);
+            }
+        }
+        names
+    }
+
+    /// 全ワークスペースの許可名の和集合(Linderaユーザー辞書構築用。トークナイズ品質の
+    /// 担保だけが目的で、どのワークスペースの名前かを区別する必要はない)。
+    pub(crate) fn all_allowed_names(&self) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        let guard = self.0.workspaces.lock();
+        for files in guard.values() {
+            for file in files.values() {
+                collect_names_from(&file.characters, &mut names);
+            }
+        }
+        names
+    }
+
+    /// 指定ワークスペース内のみを対象にした、`surface`(表示名/alias)に一致する
+    /// キャラクターの Markdown 化した説明文を返す(hover表示用)。
+    /// 同名のキャラが複数ファイルに存在する場合は "---" 区切りで連結して返す。
+    pub(crate) fn lookup_markdown(&self, workspace_root: &Path, surface: &str) -> Option<String> {
+        if surface.is_empty() {
+            return None;
+        }
+        let guard = self.0.workspaces.lock();
+        let files = guard.get(workspace_root)?;
+        let hits: Vec<String> = files
+            .values()
+            .flat_map(|f| f.characters.iter())
+            .filter(|(heading_key, entry)| matches_surface(heading_key, entry, surface))
+            .map(|(heading_key, entry)| character_entry_to_markdown(heading_key, entry))
+            .collect();
+        if hits.is_empty() {
+            None
+        } else {
+            Some(hits.join("\n\n---\n\n"))
         }
     }
 
-    Err(LlmError::GenericError {
-        message: format!("Found no file for '{}' in {:?}", name, &dir),
-    })
+    /// `name`(部分一致)にマッチする最初のキャラクターについて、`tags`が示す属性の
+    /// セクション本文を返す(`CharacterInfoTool`用)。ワークスペース内の全ファイルを
+    /// 横断して検索する(1ファイルへの決め打ちをしない)。
+    pub(crate) fn search(
+        &self,
+        workspace_root: &Path,
+        name: &str,
+        tags: &[CharacterAttribute],
+    ) -> std::result::Result<String, LlmError> {
+        let guard = self.0.workspaces.lock();
+        let Some(files) = guard.get(workspace_root) else {
+            return Err(LlmError::GenericError {
+                message: format!("No character files loaded for workspace {:?}", workspace_root),
+            });
+        };
+        for file in files.values() {
+            let Some((_, entry)) = file.characters.iter().find(|(k, _)| k.contains(name)) else {
+                continue;
+            };
+            let matched: Vec<&str> = entry
+                .sections
+                .iter()
+                .filter(|s| tags.iter().any(|t| s.tags.contains(t)))
+                .map(|s| s.text.trim())
+                .filter(|t| !t.is_empty())
+                .collect();
+            if !matched.is_empty() {
+                return Ok(matched.join("\n\n"));
+            }
+        }
+        Err(LlmError::GenericError {
+            message: format!("Character '{}' not found (or no matching sections)", name),
+        })
+    }
+
+    /// メモリの`content`/`characters`/`last_written_hash`を即座に更新してからディスクへ
+    /// 書き出す。メモリ更新はディスク書き込みの成否と独立(メモリが正本、ディスクは
+    /// ベストエフォートな永続化という設計上の帰結)。
+    pub(crate) async fn write(
+        &self,
+        workspace_root: &Path,
+        path: &Path,
+        new_content: String,
+    ) -> std::io::Result<()> {
+        let hash = hash_content(&new_content);
+        {
+            let mut guard = self.0.workspaces.lock();
+            let files = guard.entry(workspace_root.to_path_buf()).or_default();
+            let mut file = CharacterFile::from_content(new_content.clone());
+            file.last_written_hash = Some(hash);
+            files.insert(path.to_path_buf(), file);
+        }
+        tokio::fs::write(path, new_content).await
+    }
+
+    /// `did_save`/`did_change_watched_files`から呼ぶ。`disk_content`のハッシュが
+    /// 直前の自己書き込みハッシュと一致すればエコーとして無視し`false`を返す。
+    /// 不一致なら真の外部変更としてメモリを全置換し`true`を返す
+    /// (呼び出し側は`true`のときだけ`refresh_highlight_names`等の後続処理をする)。
+    pub(crate) fn reconcile(&self, workspace_root: &Path, path: &Path, disk_content: String) -> bool {
+        let hash = hash_content(&disk_content);
+        let mut guard = self.0.workspaces.lock();
+        let files = guard.entry(workspace_root.to_path_buf()).or_default();
+        if let Some(existing) = files.get(path)
+            && existing.last_written_hash == Some(hash)
+        {
+            return false;
+        }
+        files.insert(path.to_path_buf(), CharacterFile::from_content(disk_content));
+        true
+    }
+
+    /// 指定ワークスペースの該当ファイルをメモリから除去する(削除イベント用)。
+    pub(crate) fn remove(&self, workspace_root: &Path, path: &Path) {
+        if let Some(files) = self.0.workspaces.lock().get_mut(workspace_root) {
+            files.remove(path);
+        }
+    }
+
+    /// 指定ワークスペースのキャラクターファイルパス一覧を返す。
+    pub(crate) fn files_in(&self, workspace_root: &Path) -> Vec<PathBuf> {
+        self.0
+            .workspaces
+            .lock()
+            .get(workspace_root)
+            .map(|f| f.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// 指定ワークスペースの、指定パスの現在のMarkdown全文を返す。
+    pub(crate) fn content_of(&self, workspace_root: &Path, path: &Path) -> Option<String> {
+        self.0
+            .workspaces
+            .lock()
+            .get(workspace_root)?
+            .get(path)
+            .map(|f| f.content.clone())
+    }
+
+    /// ワークスペースroot単位の書き込みロックを取得する。`character_updater::run`が
+    /// どのドキュメントURIから発火しても、同一ワークスペースの plan→バッチマージ→apply
+    /// はこのガードが生きている間、直列化される。
+    pub(crate) async fn acquire_write_lock(
+        &self,
+        workspace_root: &Path,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self
+            .0
+            .write_locks
+            .entry(workspace_root.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        lock.lock_owned().await
+    }
 }
 
 /// ファイル内の heading 構造からキャラクターを表す heading レベルを推定する。
@@ -152,7 +415,7 @@ pub(crate) fn find_character_file_path(
 /// 最も出現回数が多い「子持ちレベル」を返す。タイ時は深レベル(より多くの # を持つ)優先。
 /// 例: `# Story / ## キャラ / ### 属性` のように各レベルが 1 件ずつの場合、
 /// タイトル(1)よりキャラクター(2)を選ぶ方が意味的に正しい。
-fn detect_char_level<'a>(root: &'a AstNode<'a>) -> u8 {
+pub(crate) fn detect_char_level<'a>(root: &'a AstNode<'a>) -> u8 {
     let mut counts: HashMap<u8, usize> = HashMap::new();
     let mut has_sub: Vec<u8> = Vec::new();
     let mut prev: u8 = 0;
@@ -212,7 +475,6 @@ pub(crate) fn detect_char_level_str(text: &str) -> u8 {
 /// Markdown 文字列をパースし、全キャラクターの全セクションを `HashMap` で返す。
 ///
 /// キーは heading 全文（例: "ジェフ・クライン（艦長）"）。
-/// 属性 heading のテキストを「・」で分割してタグ群を生成する。
 pub(crate) fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry> {
     let arena = Arena::new();
     let options = comrak_options();
@@ -259,7 +521,7 @@ pub(crate) fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry
                 current_section = None;
                 if h.level == char_level {
                     let t = heading_text(node);
-                    trace!("{}", t);
+                    debug!("{}", t);
                     current_char = Some(t);
                 } else {
                     // タイトルなどキャラクターレベルより上の heading はスキップ
@@ -269,7 +531,7 @@ pub(crate) fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry
             NodeValue::Heading(h) if h.level == char_level + 1 && current_char.is_some() => {
                 flush_section!();
                 let t = heading_text(node);
-                trace!("{}", t);
+                debug!("{}", t);
                 let tags = t
                     .split(['・', '、', ',', '/', ' '])
                     .filter_map(|s| CharacterAttribute::try_from(s).ok())
@@ -318,40 +580,6 @@ fn character_display_name(heading_key: &str) -> &str {
     heading_key[..end].trim()
 }
 
-/// `character_cache` 全体から、人名ハイライトの絞り込みに使う許可名集合を構築する。
-/// 各キャラの表示名・aliasesに加え、「・」区切りの複合名は各部分も対象に含める
-/// （例: "ジェフ・クライン" -> "ジェフ・クライン","ジェフ","クライン"）。
-/// 1文字の断片は助詞等との誤マッチが起きやすいため除外する。
-pub(crate) fn collect_allowed_names(cache: &CharacterCache) -> std::collections::HashSet<String> {
-    let mut names = std::collections::HashSet::new();
-
-    let mut add_name = |n: &str| {
-        let n = n.trim();
-        if n.chars().count() >= 2 {
-            names.insert(n.to_string());
-        }
-    };
-
-    let guard = cache.0.lock();
-    for file_entry in guard.values() {
-        for heading_key in file_entry.characters.keys() {
-            let display_name = character_display_name(heading_key);
-            add_name(display_name);
-            for part in display_name.split('・') {
-                add_name(part);
-            }
-            for alias in &file_entry.characters[heading_key].aliases {
-                add_name(alias);
-                for part in alias.split('・') {
-                    add_name(part);
-                }
-            }
-        }
-    }
-
-    names
-}
-
 /// キャラクターエントリを、キャラ情報ツール向けの完全な Markdown ドキュメントへ変換する。
 fn character_entry_to_markdown(heading_key: &str, entry: &CharacterEntry) -> String {
     let mut out = format!("# {}", heading_key);
@@ -361,62 +589,14 @@ fn character_entry_to_markdown(heading_key: &str, entry: &CharacterEntry) -> Str
         if text.is_empty() {
             continue;
         }
-        if section.tags.is_empty() {
-            // 見出しが CharacterAttribute に認識されなかったセクション。
-            // 元の生見出し文字列は保持していないため、誤ったラベルを付けるより本文のみ出す。
-            out.push_str(&format!("\n\n{}", text));
-        } else {
-            let heading = section
-                .tags
-                .iter()
-                .map(|t| t.canonical_heading())
-                .collect::<Vec<_>>()
-                .join("・");
-            out.push_str(&format!("\n\n## {}\n{}", heading, text));
-        }
+        out.push_str(&format!("\n\n{}", text));
     }
 
     out
 }
 
-/// `character_cache` 全体を横断し、`surface`(表示名/「・」分割部分名/alias)に一致する
-/// キャラクターを探して Markdown 化した説明文を返す(ホバー表示用)。
-/// 一致判定は `collect_allowed_names` と同じルールを逆向きに適用する。
-/// 同名のキャラが複数ファイルに存在する場合は "---" 区切りで連結して返す。
-pub(crate) fn lookup_character_markdown(cache: &CharacterCache, surface: &str) -> Option<String> {
-    if surface.chars().count() < 2 {
-        return None;
-    }
-
-    let matches_surface = |heading_key: &str, entry: &CharacterEntry| -> bool {
-        let display_name = character_display_name(heading_key);
-        if display_name == surface || display_name.split('・').any(|p| p == surface) {
-            return true;
-        }
-        entry
-            .aliases
-            .iter()
-            .any(|a| a == surface || a.split('・').any(|p| p == surface))
-    };
-
-    let guard = cache.0.lock();
-    let hits: Vec<String> = guard
-        .values()
-        .flat_map(|file_entry| file_entry.characters.iter())
-        .filter(|(heading_key, entry)| matches_surface(heading_key, entry))
-        .map(|(heading_key, entry)| character_entry_to_markdown(heading_key, entry))
-        .collect();
-    drop(guard);
-
-    if hits.is_empty() {
-        None
-    } else {
-        Some(hits.join("\n\n---\n\n"))
-    }
-}
-
 /// 見出しノードの直接子から `Text` ノードを結合してキャラクター名や属性名を返す。
-fn heading_text<'a>(node: &'a AstNode<'a>) -> String {
+pub(crate) fn heading_text<'a>(node: &'a AstNode<'a>) -> String {
     node.children()
         .filter_map(|c| {
             if let NodeValue::Text(ref cow) = c.data.borrow().value {
@@ -451,7 +631,6 @@ fn node_to_plain_text<'a>(node: &'a AstNode<'a>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::CharacterInfoTool;
     use indoc::indoc;
 
     const CHARACTERS_MD: &str = indoc!(
@@ -486,11 +665,15 @@ mod tests {
         "
     );
 
-    fn make_entry(md: &str) -> FileCacheEntry {
-        FileCacheEntry {
-            modified: std::time::SystemTime::UNIX_EPOCH,
-            characters: parse_all_content(md),
+    /// テスト用: 単一ワークスペース("/ws")に`files`(ファイル名, Markdown全文)を
+    /// 全て読み込んだ`CharacterStore`を作る。
+    fn make_store(files: &[(&str, &str)]) -> (CharacterStore, PathBuf) {
+        let store = CharacterStore::new();
+        let root = PathBuf::from("/ws");
+        for (name, md) in files {
+            store.reconcile(&root, &root.join(name), md.to_string());
         }
+        (store, root)
     }
 
     #[test]
@@ -507,24 +690,24 @@ mod tests {
 
     #[test]
     fn test_parse_characters_md_background() {
-        let entry = make_entry(CHARACTERS_MD);
-        let result = CharacterInfoTool::search_cache(&entry, "クライン", &["背景".to_string()]);
+        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
+        let result = store.search(&root, "クライン", &[CharacterAttribute::Background]);
         assert!(result.is_ok(), "{:?}", result);
         assert!(result.unwrap().contains("予備役"));
     }
 
     #[test]
     fn test_parse_characters_md_expression() {
-        let entry = make_entry(CHARACTERS_MD);
-        let result = CharacterInfoTool::search_cache(&entry, "シルビア", &["描写".to_string()]);
+        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
+        let result = store.search(&root, "シルビア", &[CharacterAttribute::Style]);
         assert!(result.is_ok(), "{:?}", result);
         assert!(result.unwrap().contains("成長の兆し"));
     }
 
     #[test]
     fn test_parse_characters_md_personality() {
-        let entry = make_entry(CHARACTERS_MD);
-        let result = CharacterInfoTool::search_cache(&entry, "ジェフ", &["性格".to_string()]);
+        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
+        let result = store.search(&root, "ジェフ", &[CharacterAttribute::Personality]);
         assert!(result.is_ok(), "{:?}", result);
         assert!(result.unwrap().starts_with("落ち着いていて"));
     }
@@ -532,14 +715,14 @@ mod tests {
     #[test]
     fn test_parse_characters_md_multi_tag_from_heading() {
         // "性格・口調" heading が ["性格", "口調"] に分割されること
-        let entry = make_entry(CHARACTERS_MD);
-        let by_kuchou = CharacterInfoTool::search_cache(&entry, "ジェフ", &["口調".to_string()]);
+        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
+        let by_kuchou = store.search(&root, "ジェフ", &[CharacterAttribute::Expression]);
         assert!(
             by_kuchou.is_ok(),
             "「口調」タグでヒットしない: {:?}",
             by_kuchou
         );
-        let by_seikaku = CharacterInfoTool::search_cache(&entry, "ジェフ", &["性格".to_string()]);
+        let by_seikaku = store.search(&root, "ジェフ", &[CharacterAttribute::Personality]);
         assert_eq!(
             by_kuchou.unwrap(),
             by_seikaku.unwrap(),
@@ -550,11 +733,11 @@ mod tests {
     #[test]
     fn test_parse_characters_md_or_search() {
         // 複数タグ OR 検索: 異なるセクションがまとめて返ること
-        let entry = make_entry(CHARACTERS_MD);
-        let result = CharacterInfoTool::search_cache(
-            &entry,
+        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
+        let result = store.search(
+            &root,
             "クライン",
-            &["背景".to_string(), "性格".to_string()],
+            &[CharacterAttribute::Background, CharacterAttribute::Personality],
         );
         assert!(result.is_ok(), "{:?}", result);
         let text = result.unwrap();
@@ -567,8 +750,8 @@ mod tests {
 
     #[test]
     fn test_parse_characters_md_failure() {
-        let entry = make_entry(CHARACTERS_MD);
-        let result = CharacterInfoTool::search_cache(&entry, "ユルゲン", &["性格".to_string()]);
+        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
+        let result = store.search(&root, "ユルゲン", &[CharacterAttribute::Personality]);
         assert!(result.is_err(), "存在しないキャラクターでエラーにならない");
     }
 
@@ -591,6 +774,41 @@ mod tests {
             CharacterAttribute::try_from("通称"),
             Ok(CharacterAttribute::Alias)
         );
+    }
+
+    #[test]
+    fn test_detect_char_level_str_with_story_heading() {
+        // # Story / ## キャラ / ### 属性 の構造
+        let md = "\
+# Story
+## ジェフ
+### 性格
+- 落ち着いている。
+## シルビア
+### 背景
+- 不明。
+";
+        assert_eq!(detect_char_level_str(md), 2);
+    }
+
+    #[test]
+    fn test_detect_char_level_str_top_level_chars() {
+        // # キャラ / ## 属性 の構造
+        let md = "\
+# ジェフ
+## 性格
+- 落ち着いている。
+# シルビア
+## 背景
+- 不明。
+";
+        assert_eq!(detect_char_level_str(md), 1);
+    }
+
+    #[test]
+    fn test_detect_char_level_str_empty() {
+        assert_eq!(detect_char_level_str(""), 0);
+        assert_eq!(detect_char_level_str("本文だけ、見出しなし。"), 0);
     }
 
     #[test]
@@ -644,17 +862,13 @@ mod tests {
 
     #[test]
     fn test_collect_allowed_names() {
-        let cache = CharacterCache::new();
-        cache
-            .0
-            .lock()
-            .insert(PathBuf::from("characters.md"), make_entry(CHARACTERS_MD));
-        let names = collect_allowed_names(&cache);
+        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
+        let names = store.allowed_names(&root);
 
-        // フルネーム・「・」分割された部分名が含まれること
+        // フルネーム(表示名)がそのまま含まれること。「・」による分割は行わない
         assert!(names.contains("ジェフ・クライン"), "{:?}", names);
-        assert!(names.contains("ジェフ"), "{:?}", names);
-        assert!(names.contains("クライン"), "{:?}", names);
+        assert!(!names.contains("ジェフ"), "{:?}", names);
+        assert!(!names.contains("クライン"), "{:?}", names);
         assert!(names.contains("シルビア"), "{:?}", names);
 
         // alias未登録の役職名は含まれないこと
@@ -670,13 +884,23 @@ mod tests {
             - 隊長
             "
         );
-        let cache = CharacterCache::new();
-        cache
-            .0
-            .lock()
-            .insert(PathBuf::from("characters.md"), make_entry(MD));
-        let names = collect_allowed_names(&cache);
+        let (store, root) = make_store(&[("characters.md", MD)]);
+        let names = store.allowed_names(&root);
         assert!(names.contains("隊長"), "{:?}", names);
+    }
+
+    #[test]
+    fn test_collect_allowed_names_includes_single_char_alias() {
+        const MD: &str = indoc!(
+            "## 原顕三郎（司令）
+            ### 呼称
+            - 原
+            "
+        );
+        let (store, root) = make_store(&[("characters.md", MD)]);
+        let names = store.allowed_names(&root);
+        // 1文字のaliasも文字数で除外されず許可名に含まれること
+        assert!(names.contains("原"), "{:?}", names);
     }
 
     #[test]
@@ -700,26 +924,18 @@ mod tests {
 
     #[test]
     fn test_lookup_character_markdown_display_name() {
-        let cache = CharacterCache::new();
-        cache
-            .0
-            .lock()
-            .insert(PathBuf::from("characters.md"), make_entry(CHARACTERS_MD));
-        let md =
-            lookup_character_markdown(&cache, "ジェフ・クライン").expect("表示名で見つかるはず");
+        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
+        let md = store
+            .lookup_markdown(&root, "ジェフ・クライン")
+            .expect("表示名で見つかるはず");
         assert!(md.contains("予備役"), "{}", md);
     }
 
     #[test]
-    fn test_lookup_character_markdown_split_part() {
-        let cache = CharacterCache::new();
-        cache
-            .0
-            .lock()
-            .insert(PathBuf::from("characters.md"), make_entry(CHARACTERS_MD));
-        let md =
-            lookup_character_markdown(&cache, "クライン").expect("「・」分割部分名で見つかるはず");
-        assert!(md.contains("予備役"), "{}", md);
+    fn test_lookup_character_markdown_does_not_match_partial_name() {
+        // 「・」による複合名分割は行わないため、部分名では見つからないこと
+        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
+        assert!(store.lookup_markdown(&root, "クライン").is_none());
     }
 
     #[test]
@@ -732,25 +948,34 @@ mod tests {
             - ムサイ艦の艦長。
             "
         );
-        let cache = CharacterCache::new();
-        cache
-            .0
-            .lock()
-            .insert(PathBuf::from("characters.md"), make_entry(MD));
-        let md = lookup_character_markdown(&cache, "隊長").expect("aliasで見つかるはず");
+        let (store, root) = make_store(&[("characters.md", MD)]);
+        let md = store.lookup_markdown(&root, "隊長").expect("aliasで見つかるはず");
         assert!(md.contains("艦長"), "{}", md);
     }
 
     #[test]
     fn test_lookup_character_markdown_miss() {
-        let cache = CharacterCache::new();
-        cache
-            .0
-            .lock()
-            .insert(PathBuf::from("characters.md"), make_entry(CHARACTERS_MD));
-        assert!(lookup_character_markdown(&cache, "存在しない人").is_none());
-        // 1文字はノイズ除外(collect_allowed_namesと同じ基準)で必ずNone
-        assert!(lookup_character_markdown(&cache, "ジ").is_none());
+        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
+        assert!(store.lookup_markdown(&root, "存在しない人").is_none());
+        // どの表示名/aliasとも完全一致しないため None
+        assert!(store.lookup_markdown(&root, "ジ").is_none());
+    }
+
+    #[test]
+    fn test_lookup_character_markdown_single_char_alias() {
+        const MD: &str = indoc!(
+            "## 原顕三郎（司令）
+            ### 呼称
+            - 原
+            ### 背景・立場
+            - 遣泰艦隊司令。
+            "
+        );
+        let (store, root) = make_store(&[("characters.md", MD)]);
+        let md = store
+            .lookup_markdown(&root, "原")
+            .expect("1文字aliasで見つかるはず");
+        assert!(md.contains("遣泰艦隊司令"), "{}", md);
     }
 
     #[test]
@@ -767,16 +992,15 @@ mod tests {
             - 通信班所属。
             "
         );
-        let cache = CharacterCache::new();
-        {
-            let mut guard = cache.0.lock();
-            guard.insert(PathBuf::from("a.md"), make_entry(MD_A));
-            guard.insert(PathBuf::from("b.md"), make_entry(MD_B));
-        }
+        let (store, root) = make_store(&[("a.md", MD_A), ("b.md", MD_B)]);
 
-        let md_a = lookup_character_markdown(&cache, "アリス").expect("a.mdのキャラが見つかるはず");
+        let md_a = store
+            .lookup_markdown(&root, "アリス")
+            .expect("a.mdのキャラが見つかるはず");
         assert!(md_a.contains("整備班"), "{}", md_a);
-        let md_b = lookup_character_markdown(&cache, "ボブ").expect("b.mdのキャラが見つかるはず");
+        let md_b = store
+            .lookup_markdown(&root, "ボブ")
+            .expect("b.mdのキャラが見つかるはず");
         assert!(md_b.contains("通信班"), "{}", md_b);
     }
 
@@ -794,17 +1018,60 @@ mod tests {
             - B船の通信士。
             "
         );
-        let cache = CharacterCache::new();
-        {
-            let mut guard = cache.0.lock();
-            guard.insert(PathBuf::from("a.md"), make_entry(MD_A));
-            guard.insert(PathBuf::from("b.md"), make_entry(MD_B));
-        }
+        let (store, root) = make_store(&[("a.md", MD_A), ("b.md", MD_B)]);
 
-        let md =
-            lookup_character_markdown(&cache, "タナカ").expect("両ファイルのタナカが見つかるはず");
+        let md = store
+            .lookup_markdown(&root, "タナカ")
+            .expect("両ファイルのタナカが見つかるはず");
         assert!(md.contains("A船の整備士"), "{}", md);
         assert!(md.contains("B船の通信士"), "{}", md);
         assert!(md.contains("---"), "{} に区切り線が含まれるはず", md);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_ignores_self_write_echo() {
+        // write() で書いた内容と同じ内容のreconcileは自己書き込みのエコーとしてfalseを返す
+        // (再パース不要・変更なし)。異なる内容なら真の外部変更としてtrueを返す。
+        let dir = std::env::temp_dir().join("ff_character_store_echo_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("characters.md");
+
+        let store = CharacterStore::new();
+        store
+            .write(&dir, &path, CHARACTERS_MD.to_string())
+            .await
+            .unwrap();
+
+        assert!(
+            !store.reconcile(&dir, &path, CHARACTERS_MD.to_string()),
+            "自己書き込みと同一内容はエコーとして無視されるはず"
+        );
+
+        let changed = format!("{}\n追記。", CHARACTERS_MD);
+        assert!(
+            store.reconcile(&dir, &path, changed.clone()),
+            "内容が異なれば真の外部変更として取り込まれるはず"
+        );
+        assert_eq!(store.content_of(&dir, &path), Some(changed));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_workspace_for_picks_longest_match() {
+        let roots = vec![PathBuf::from("/ws"), PathBuf::from("/ws/nested")];
+        let doc = PathBuf::from("/ws/nested/chapters/ch01.md");
+        assert_eq!(
+            CharacterStore::resolve_workspace_for(&doc, &roots),
+            Some(&roots[1])
+        );
+    }
+
+    #[test]
+    fn test_resolve_workspace_for_no_match_returns_none() {
+        let roots = vec![PathBuf::from("/ws")];
+        let doc = PathBuf::from("/other/chapters/ch01.md");
+        assert_eq!(CharacterStore::resolve_workspace_for(&doc, &roots), None);
     }
 }

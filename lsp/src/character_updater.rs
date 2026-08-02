@@ -1,4 +1,5 @@
-use crate::character::{CharacterAttribute, parse_all_content, split_aliases};
+use crate::character::{CharacterAttribute, CharacterStore, parse_all_content, split_aliases};
+use crate::character_ast::FileDoc;
 use crate::flight_recorder::FlightRecorder;
 use crate::llm::{Content, LlmInterface, ModelCapability};
 use crate::text::{extract_json, shorten_middle};
@@ -131,7 +132,11 @@ fn value_to_text(v: &Value) -> String {
 /// フラット形式 `{name, attribute, text}` の1項目を正規化する。
 /// `text` が文字列以外の場合はフラット化して救済する。
 fn update_from_flat(item: &Value) -> Option<UpdateItem> {
-    let name = item.get("name").and_then(|v| v.as_str())?.trim().to_string();
+    let name = item
+        .get("name")
+        .and_then(|v| v.as_str())?
+        .trim()
+        .to_string();
     let attribute = item
         .get("attribute")
         .and_then(|v| v.as_str())?
@@ -198,119 +203,13 @@ fn parse_updates(response: &str) -> Option<Vec<UpdateItem>> {
     None
 }
 
-/// Markdown ファイルのテキストを行走査して、指定キャラクター・属性のセクション本文を差し替える。
-/// 対象が見つかった場合は新しいファイル全体のテキストを返し、見つからなければ None を返す。
-pub fn replace_section(
-    file_text: &str,
-    char_name: &str,
-    attribute: &CharacterAttribute,
-    new_body: &str,
-) -> Option<String> {
-    let lines: Vec<&str> = file_text.lines().collect();
-    let total = lines.len();
-
-    // heading の "#" 数と見出しテキストを返す(owned String で返してライフタイム問題を回避)
-    let parse_heading = |line: &str, in_fence: bool| -> Option<(u8, String)> {
-        if in_fence {
-            return None;
-        }
-        let trimmed = line.trim_end();
-        if !trimmed.starts_with('#') {
-            return None;
-        }
-        let level = trimmed.bytes().take_while(|&b| b == b'#').count() as u8;
-        let text = trimmed[level as usize..].trim().to_string();
-        Some((level, text))
-    };
-
-    let mut in_fence = false;
-    let mut char_level: Option<u8> = None;
-    let mut char_start: Option<usize> = None;
-    let mut attr_body_start: Option<usize> = None;
-    let mut attr_body_end: Option<usize> = None;
-
-    for (i, &line) in lines.iter().enumerate() {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-        }
-
-        if let Some((level, text)) = parse_heading(line, in_fence) {
-            if let Some(cl) = char_level {
-                if level <= cl {
-                    // キャラクターレベルより上か同レベルの heading に来た → キャラクター終了
-                    if attr_body_start.is_some() && attr_body_end.is_none() {
-                        attr_body_end = Some(i);
-                        break;
-                    }
-                    char_level = None;
-                    char_start = None;
-                    attr_body_start = None;
-                }
-                if let Some(astart) = attr_body_start {
-                    if attr_body_end.is_none() && level <= cl + 1 {
-                        // 属性ヘッダより同レベル/上位の heading → セクション終了
-                        attr_body_end = Some(i);
-                        break;
-                    }
-                    let _ = astart;
-                }
-                if attr_body_start.is_none() && level == cl + 1 {
-                    // 属性ヘッダ候補
-                    let attr_tags: Vec<CharacterAttribute> = text
-                        .split(['・', '、', ',', '/', ' '])
-                        .filter_map(|s| CharacterAttribute::try_from(s).ok())
-                        .collect();
-                    if attr_tags.contains(attribute) {
-                        attr_body_start = Some(i + 1);
-                    }
-                }
-            } else {
-                // キャラクターヘッダを探す
-                if text.contains(char_name) {
-                    char_level = Some(level);
-                    char_start = Some(i);
-                }
-            }
-        }
-    }
-
-    // ファイル末尾でセクション終了した場合
-    if attr_body_start.is_some() && attr_body_end.is_none() {
-        attr_body_end = Some(total);
-    }
-
-    let (body_start, body_end) = match (attr_body_start, attr_body_end) {
-        (Some(s), Some(e)) => (s, e),
-        _ => return None,
-    };
-
-    let _ = char_start;
-
-    let mut out = String::new();
-    for (i, &line) in lines.iter().enumerate() {
-        if i < body_start || i >= body_end {
-            out.push_str(line);
-            out.push('\n');
-        } else if i == body_start {
-            if !new_body.is_empty() {
-                out.push_str(new_body);
-                if !new_body.ends_with('\n') {
-                    out.push('\n');
-                }
-            }
-        }
-    }
-
-    Some(out)
-}
-
 /// 書き込み直前に Markdown 全体を comrak で正規化する(パース→CommonMark 書き戻し)。
 /// パースと同じ `comrak_options` を使い、折返しなし(width=0)・箇条書き "-" で出力する。
-/// セクション差し替え・追記の繰り返しで生じる空行や記法の不揃いを、書き込みのたびに整える。
+/// `character_ast::FileDoc` は既にこの正規化を経た文字列を返すため、通常は冪等な
+/// 安全ネットとしてのみ働く。
 fn format_markdown(text: &str) -> String {
     let mut options = crate::character::comrak_options();
-    // インデント型ではなくフェンス型でコードブロックを保持する
-    // (replace_section 等の行走査が ``` フェンスを前提にしているため)。
+    // インデント型ではなくフェンス型でコードブロックを保持する。
     options.render.prefer_fenced = true;
     comrak::markdown_to_commonmark(text, &options)
 }
@@ -355,7 +254,8 @@ fn strip_attribute_label(text: &str, attr: &CharacterAttribute) -> String {
 
     let trimmed = text.trim_start();
     match trimmed.split_once('\n') {
-        Some((first_line, rest)) => match strip_label_from_line(first_line, canonical, english_key) {
+        Some((first_line, rest)) => match strip_label_from_line(first_line, canonical, english_key)
+        {
             Some(stripped) => {
                 let stripped = stripped.trim_start();
                 if stripped.is_empty() {
@@ -419,7 +319,11 @@ fn merge_alias_bodies(old_body: &str, new_text: &str, char_name: &str) -> Option
 /// 新規セクション/新規キャラクターの本文を組み立てる。
 /// Alias は箇条書きへ正規化し(`merge_alias_bodies` を空の旧本文で流用)、
 /// 追加すべき別名が無ければ `None`(呼び出し側で "no change" として記録・スキップする)。
-fn build_new_section_body(attr: &CharacterAttribute, new_text: &str, char_name: &str) -> Option<String> {
+fn build_new_section_body(
+    attr: &CharacterAttribute,
+    new_text: &str,
+    char_name: &str,
+) -> Option<String> {
     if *attr == CharacterAttribute::Alias {
         merge_alias_bodies("", new_text, char_name)
     } else {
@@ -514,6 +418,8 @@ fn build_batch_merge_prompt(groups: &[CharMergeGroup]) -> Option<String> {
 /// 各 `merged_text` にはコードフェンス除去・前置きラベル除去を適用する。
 /// パース不能・スキーマ不一致の要素は黙って読み飛ばす(欠落分は呼び出し側で old 維持)。
 fn extract_batch_merges(raw: &str) -> HashMap<(String, String), String> {
+    debug!("raw: {}", raw);
+
     let mut out = HashMap::new();
     let Some(json) = extract_json(raw) else {
         return out;
@@ -639,9 +545,14 @@ impl Drop for RunningGuard {
 /// `full_text` は発火時にスナップショットした編集ファイルの全文テキスト。
 /// 完了時は `running = false` に戻すだけで、カウンタはリセットしない
 /// (発火時に既にリセット済み・実行中に入った編集を保持するため)。
+/// `workspace` は呼び出し元(`Backend::record_change`)が発火元ドキュメントのURIから
+/// `CharacterStore::resolve_workspace_for` で解決済みのものを渡す(旧: `workspace_arc.first()`
+/// を常に使っていたため、複数ワークスペースを開いていると誤ったワークスペースに書き込む
+/// バグがあった)。
 pub async fn run(
     uri: String,
-    workspace_arc: Arc<TokioMutex<Vec<PathBuf>>>,
+    workspace: PathBuf,
+    character_store: CharacterStore,
     full_text: String,
     llm: Arc<TokioMutex<Option<Box<dyn LlmInterface>>>>,
     recorder: Arc<FlightRecorder>,
@@ -661,44 +572,27 @@ pub async fn run(
         return;
     }
 
-    let workspace = {
-        let ws = workspace_arc.lock().await;
-        ws.first().cloned().unwrap_or_default()
-    };
     debug!("character_updater::run: workspace={:?}", workspace);
 
-    // 1. characters/*.md を全て収集(1件も無ければ characters.md を新規作成して処理を続ける)
-    let mut char_files = collect_character_files(&workspace).await;
-    if char_files.is_empty() {
-        debug!(
-            "character_updater: no character files found under {:?}, creating characters.md",
-            workspace
-        );
-        let new_path = workspace.join("characters.md");
-        match tokio::fs::write(&new_path, "").await {
-            Ok(_) => {
-                info!("character_updater: created {:?}", new_path);
-                char_files.push(new_path);
-            }
-            Err(e) => {
-                error!("character_updater: failed to create characters.md: {}", e);
-                return;
-            }
-        }
+    // 1. character_store が当該ワークスペースを未ロードなら、ここでロードする
+    // (1件も無ければ CharacterStore::load_workspace が characters.md を新規作成する)。
+    if character_store.files_in(&workspace).is_empty() {
+        character_store.load_workspace(&workspace).await;
     }
     debug!(
         "character_updater::run: {} character file(s) found",
-        char_files.len()
+        character_store.files_in(&workspace).len()
     );
 
     // 2. プロンプトを読み込み、frontmatter を分離(補完側と共通のヘルパを使用)
-    let (prompt_body, frontmatter_data) = match crate::frontmatter::load_prompt("prompt_character_update.md") {
-        Some(v) => v,
-        None => {
-            error!("prompt_character_update.md not found");
-            return;
-        }
-    };
+    let (prompt_body, frontmatter_data) =
+        match crate::frontmatter::load_prompt("prompt_character_update.md") {
+            Some(v) => v,
+            None => {
+                error!("prompt_character_update.md not found");
+                return;
+            }
+        };
 
     let prompt = prompt_body.replace("{{TEXT}}", &full_text);
 
@@ -781,13 +675,17 @@ pub async fn run(
                     }
                 }
 
-                // 5. 差し替え・追記・新規作成を適用
+                // 5. 差し替え・追記・新規作成を適用。
+                // ワークスペース単位の書き込みロックで plan→バッチマージ→apply を直列化する
+                // (別ドキュメントから発火した並行runが同じキャラクターファイルを
+                // 同時に読み書きしてロストアップデートになるのを防ぐ)。
                 match updates {
                     Some(items) => {
+                        let _write_guard = character_store.acquire_write_lock(&workspace).await;
                         apply_updates(
                             &items,
                             update_id,
-                            char_files,
+                            &character_store,
                             &workspace,
                             &recorder,
                             llm_client.as_mut(),
@@ -809,33 +707,6 @@ pub async fn run(
 
     debug!("character_updater::run done for {}", uri);
     // _guard が Drop されて running = false に戻る
-}
-
-/// characters/ 配下の全 .md ファイルのパスを収集する。
-async fn collect_character_files(workspace: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-
-    let single = workspace.join("characters.md");
-    if single.is_file() {
-        files.push(single);
-        return files;
-    }
-
-    let dir = workspace.join("characters");
-    if !dir.is_dir() {
-        return files;
-    }
-
-    if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let p = entry.path();
-            if p.extension().map(|e| e == "md").unwrap_or(false) {
-                files.push(p);
-            }
-        }
-    }
-
-    files
 }
 
 /// 宛先の物理セクションを一意に識別するキー(解決後セクション同一性)。
@@ -967,8 +838,12 @@ fn merge_into_new(
     // 既出の新規キャラ op へ合流。同属性セクションが既にあれば本文へ連結する
     // (plan[op_idx] を可変借用中は plan.push できないため、Skip はフラグ経由で後から積む)。
     let mut skip_rec: Option<RecordInfo> = None;
-    if let ResolvedOp::AppendCharacter { sections, records, .. }
-    | ResolvedOp::CreateFile { sections, records, .. } = &mut plan[op_idx]
+    if let ResolvedOp::AppendCharacter {
+        sections, records, ..
+    }
+    | ResolvedOp::CreateFile {
+        sections, records, ..
+    } = &mut plan[op_idx]
     {
         match sections
             .iter_mut()
@@ -1017,7 +892,8 @@ fn plan_updates(
     let mut plan: Vec<ResolvedOp> = Vec::new();
     let mut groups: Vec<CharMergeGroup> = Vec::new();
 
-    let mut parsed: HashMap<PathBuf, HashMap<String, crate::character::CharacterEntry>> = HashMap::new();
+    let mut parsed: HashMap<PathBuf, HashMap<String, crate::character::CharacterEntry>> =
+        HashMap::new();
     // 合流用インデックス群。値は plan / groups 内の位置。
     let mut merge_by_section: HashMap<SectionKey, (usize, usize, usize)> = HashMap::new(); // (group, sec, op)
     let mut alias_by_section: HashMap<SectionKey, usize> = HashMap::new();
@@ -1182,8 +1058,9 @@ fn plan_updates(
                 };
                 match merge_alias_bodies(&current, &new_text, name) {
                     Some(m) => {
-                        if let ResolvedOp::ReplaceAlias { merged, records, .. } =
-                            &mut plan[op_idx]
+                        if let ResolvedOp::ReplaceAlias {
+                            merged, records, ..
+                        } = &mut plan[op_idx]
                         {
                             *merged = m;
                             records.push(rec);
@@ -1328,10 +1205,7 @@ async fn run_batch_merge(
     }
     llm_client.add(Content::Text(prompt));
     let resp = llm_client.chat().await?;
-    debug!(
-        "character_updater: batch merge response received :{}",
-        resp
-    );
+    debug!("character_updater: batch merge response received :{}", resp);
     let mut merged = extract_batch_merges(&resp);
 
     // 全滅判定: 期待キーが1件も引けない応答はスキーマ不適合とみなす
@@ -1385,43 +1259,354 @@ fn record_all(
     }
 }
 
-/// Markdown を整形して書き込み、records 全件の成否を記録する。
-async fn write_and_record(
-    file: &Path,
-    content: &str,
-    update_id: i64,
-    records: &[RecordInfo],
-    old: Option<&str>,
-    recorder: &FlightRecorder,
-) {
-    match tokio::fs::write(file, format_markdown(content)).await {
-        Ok(_) => {
-            for r in records {
-                info!("character_updater: updated {}/{}", r.name, r.attr_str);
+/// 1つの `ResolvedOp` を `FileDoc` に適用した結果。
+/// `wrote` は「このopがドキュメントに変更を加えたか」であり、実際にファイルへ
+/// 書き込まれるかどうか(グループ内に1つでも `wrote` な op があるか)とは独立している。
+struct OpOutcome {
+    records: Vec<RecordInfo>,
+    old: Option<String>,
+    wrote: bool,
+    note: Option<&'static str>,
+    /// 新規キャラクター作成(AppendCharacter/CreateFile)の場合に true。ログ文言の出し分けに使う。
+    is_new_character: bool,
+}
+
+/// `Skip`/`CreateFile` 以外の `ResolvedOp` が対象とする既存ファイルパスを返す。
+fn existing_op_file(op: &ResolvedOp) -> Option<&Path> {
+    match op {
+        ResolvedOp::Merge { file, .. }
+        | ResolvedOp::ReplaceAlias { file, .. }
+        | ResolvedOp::AppendSection { file, .. }
+        | ResolvedOp::AppendCharacter { file, .. } => Some(file.as_path()),
+        ResolvedOp::Skip { .. } | ResolvedOp::CreateFile { .. } => None,
+    }
+}
+
+/// `FileDoc` に対して1つの `ResolvedOp` を適用し、結果を `OpOutcome` として返す。
+/// `Skip` はグルーピング前に処理済みのためここには来ない。
+fn apply_one_op(
+    doc: &FileDoc,
+    op: ResolvedOp,
+    merged_map: Option<&HashMap<(String, String), String>>,
+) -> OpOutcome {
+    match op {
+        ResolvedOp::Skip { .. } => unreachable!("Skip はグルーピング前に処理済み"),
+        ResolvedOp::Merge {
+            section_name,
+            attr,
+            key,
+            old_body,
+            records,
+            ..
+        } => {
+            let looked = merged_map.and_then(|m| lookup_merged(m, &key.0, &key.1, &attr));
+            let Some(m) = looked else {
+                // マージ結果が不確定なら書かない(old 維持)。
+                let note = if merged_map.is_some() {
+                    "merge missing"
+                } else {
+                    "semantic merge failed"
+                };
+                warn!(
+                    "character_updater: no batch merge result for {}/{}, keep old",
+                    key.0, key.1
+                );
+                return OpOutcome {
+                    records,
+                    old: Some(old_body),
+                    wrote: false,
+                    note: Some(note),
+                    is_new_character: false,
+                };
+            };
+            // 意味マージ LLM がラベルを付けてきた場合の保険。
+            let m = strip_attribute_label(m, &attr);
+            if m.trim().is_empty() || m.trim() == old_body.trim() {
+                debug!(
+                    "character_updater: {}/{} no change to merge, skip",
+                    key.0, key.1
+                );
+                return OpOutcome {
+                    records,
+                    old: Some(old_body),
+                    wrote: false,
+                    note: Some("no change"),
+                    is_new_character: false,
+                };
             }
-            record_all(recorder, update_id, records, old, true, None);
+            if doc.replace_section(&section_name, &attr, &m) {
+                OpOutcome {
+                    records,
+                    old: Some(old_body),
+                    wrote: true,
+                    note: None,
+                    is_new_character: false,
+                }
+            } else {
+                warn!(
+                    "character_updater: replace_section failed for {}/{}",
+                    key.0, key.1
+                );
+                OpOutcome {
+                    records,
+                    old: Some(old_body),
+                    wrote: false,
+                    note: Some("replace_section failed"),
+                    is_new_character: false,
+                }
+            }
         }
-        Err(e) => {
-            error!("character_updater: failed to write {:?}: {}", file, e);
-            record_all(recorder, update_id, records, old, false, Some("write failed"));
+        ResolvedOp::ReplaceAlias {
+            section_name,
+            old,
+            merged,
+            records,
+            ..
+        } => {
+            if doc.replace_section(&section_name, &CharacterAttribute::Alias, &merged) {
+                OpOutcome {
+                    records,
+                    old: Some(old),
+                    wrote: true,
+                    note: None,
+                    is_new_character: false,
+                }
+            } else {
+                warn!(
+                    "character_updater: replace_section failed for {}/呼称",
+                    section_name
+                );
+                OpOutcome {
+                    records,
+                    old: Some(old),
+                    wrote: false,
+                    note: Some("replace_section failed"),
+                    is_new_character: false,
+                }
+            }
+        }
+        ResolvedOp::AppendSection {
+            section_name,
+            heading,
+            body,
+            records,
+            ..
+        } => {
+            if doc.append_attribute_section(&section_name, heading, &body) {
+                OpOutcome {
+                    records,
+                    old: None,
+                    wrote: true,
+                    note: None,
+                    is_new_character: false,
+                }
+            } else {
+                warn!(
+                    "character_updater: append_attribute_section failed for {}/{}",
+                    section_name, heading
+                );
+                OpOutcome {
+                    records,
+                    old: None,
+                    wrote: false,
+                    note: Some("append_attribute_section failed"),
+                    is_new_character: false,
+                }
+            }
+        }
+        ResolvedOp::AppendCharacter {
+            name,
+            sections,
+            records,
+            ..
+        } => {
+            doc.append_new_character(&name, &sections);
+            OpOutcome {
+                records,
+                old: None,
+                wrote: true,
+                note: None,
+                is_new_character: true,
+            }
+        }
+        ResolvedOp::CreateFile {
+            name,
+            sections,
+            records,
+        } => {
+            doc.append_new_character(&name, &sections);
+            OpOutcome {
+                records,
+                old: None,
+                wrote: true,
+                note: None,
+                is_new_character: true,
+            }
         }
     }
 }
 
-/// (C) 適用フェーズ: 解決済み操作を逐次適用する。
-/// 各操作は書き込み直前にファイルを読み直す(read-fresh)ため、同一ファイル内の
-/// 先行書き込みと合成される(replace_section は対象セクションの行区間のみ差し替えるので
-/// 他セクションへの書き込みとは干渉しない)。
+/// 1ファイル宛ての `ResolvedOp` 群を、1回の read/parse/write にまとめて適用する。
+/// `is_create` はグループ内の全 op が `CreateFile`(＝対象ファイルがまだ存在しない)であることを示す。
+async fn apply_ops_to_file(
+    file: PathBuf,
+    ops: Vec<ResolvedOp>,
+    is_create: bool,
+    merged_map: Option<&HashMap<(String, String), String>>,
+    update_id: i64,
+    workspace: &Path,
+    character_store: &CharacterStore,
+    recorder: &FlightRecorder,
+) {
+    // character_store のメモリ内容を読む(ディスクは読まない。メモリがSSoTのため)。
+    let content = if is_create {
+        String::new()
+    } else {
+        match character_store.content_of(workspace, &file) {
+            Some(c) => c,
+            None => {
+                warn!(
+                    "character_updater: {:?} が character_store に見つからない",
+                    file
+                );
+                for op in ops {
+                    let records = match op {
+                        ResolvedOp::Merge { records, .. }
+                        | ResolvedOp::ReplaceAlias { records, .. }
+                        | ResolvedOp::AppendSection { records, .. }
+                        | ResolvedOp::AppendCharacter { records, .. }
+                        | ResolvedOp::CreateFile { records, .. } => records,
+                        ResolvedOp::Skip { .. } => unreachable!("Skip はグルーピング前に処理済み"),
+                    };
+                    record_all(
+                        recorder,
+                        update_id,
+                        &records,
+                        None,
+                        false,
+                        Some("character file not loaded in store"),
+                    );
+                }
+                return;
+            }
+        }
+    };
+
+    // AST 変異は同期スコープに閉じ込める(Arena は Send ではないため .await をまたげない)。
+    let (rendered, outcomes) = {
+        let arena = comrak::Arena::new();
+        let doc = FileDoc::parse(&arena, &content);
+        let outcomes: Vec<OpOutcome> = ops
+            .into_iter()
+            .map(|op| apply_one_op(&doc, op, merged_map))
+            .collect();
+        (doc.render(), outcomes)
+    };
+
+    let any_write = outcomes.iter().any(|o| o.wrote);
+    if any_write {
+        if let Some(parent) = file.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                error!(
+                    "character_updater: failed to create characters directory {:?}: {}",
+                    parent, e
+                );
+                for o in &outcomes {
+                    record_all(
+                        recorder,
+                        update_id,
+                        &o.records,
+                        o.old.as_deref(),
+                        false,
+                        Some("failed to create characters directory"),
+                    );
+                }
+                return;
+            }
+        }
+        // character_store.write がメモリ更新(＋自己書き込みハッシュの記録)とディスクdumpを
+        // まとめて行う(メモリがSSoT、ディスクはload/dump先でしかないという設計の帰結)。
+        match character_store
+            .write(workspace, &file, format_markdown(&rendered))
+            .await
+        {
+            Ok(_) => {
+                for o in &outcomes {
+                    if !o.wrote {
+                        continue;
+                    }
+                    if o.is_new_character {
+                        info!("character_updater: created/updated {:?}", file);
+                    }
+                    for r in &o.records {
+                        info!(
+                            "character_updater: updated {}/{}: {}",
+                            r.name, r.attr_str, r.new_text
+                        );
+                    }
+                }
+                for o in &outcomes {
+                    record_all(
+                        recorder,
+                        update_id,
+                        &o.records,
+                        o.old.as_deref(),
+                        o.wrote,
+                        o.note,
+                    );
+                }
+                return;
+            }
+            Err(e) => {
+                error!("character_updater: failed to write {:?}: {}", file, e);
+                for o in &outcomes {
+                    let (success, note) = if o.wrote {
+                        (false, Some("write failed"))
+                    } else {
+                        (false, o.note)
+                    };
+                    record_all(recorder, update_id, &o.records, o.old.as_deref(), success, note);
+                }
+                return;
+            }
+        }
+    }
+
+    // 何も変更が無かった場合(全 op が no-change/not-found 等) → ファイルには触れない。
+    for o in &outcomes {
+        record_all(
+            recorder,
+            update_id,
+            &o.records,
+            o.old.as_deref(),
+            o.wrote,
+            o.note,
+        );
+    }
+}
+
+/// (C) 適用フェーズ: 解決済み操作をファイル単位にグルーピングし、
+/// ファイルごとに1回だけ read → AST 構築 → 全op適用 → render → write する
+/// (旧: opごとに read-fresh して行ベースで部分差し替え)。
 /// `merged_map` が `None` の場合はバッチマージ自体が失敗している(全 Merge を old 維持で記録)。
 async fn apply_plan(
     plan: Vec<ResolvedOp>,
     merged_map: Option<&HashMap<(String, String), String>>,
     update_id: i64,
     workspace: &Path,
+    character_store: &CharacterStore,
     recorder: &FlightRecorder,
 ) {
+    let chars_dir = workspace.join("characters");
+
+    // ファイルパス(既存ファイル、または CreateFile 用に新規算出したパス)ごとに op をまとめる。
+    // 出現順を保つため、初出順のキー列を別途持つ。
+    let mut order: Vec<PathBuf> = Vec::new();
+    let mut groups: HashMap<PathBuf, Vec<ResolvedOp>> = HashMap::new();
+    let mut create_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
     for op in plan {
-        match op {
+        let path = match &op {
             ResolvedOp::Skip { record, note, old } => {
                 debug!(
                     "character_updater: {}/{} skip: {}",
@@ -1436,233 +1621,56 @@ async fn apply_plan(
                     false,
                     Some(note),
                 );
+                continue;
             }
-            ResolvedOp::Merge {
-                file,
-                section_name,
-                attr,
-                key,
-                old_body,
-                records,
-            } => {
-                let looked = merged_map.and_then(|m| lookup_merged(m, &key.0, &key.1, &attr));
-                let Some(m) = looked else {
-                    // マージ結果が不確定なら書かない(old 維持)。
-                    let note = if merged_map.is_some() {
-                        "merge missing"
-                    } else {
-                        "semantic merge failed"
-                    };
-                    warn!(
-                        "character_updater: no batch merge result for {}/{}, keep old",
-                        key.0, key.1
-                    );
-                    record_all(recorder, update_id, &records, Some(&old_body), false, Some(note));
-                    continue;
-                };
-                // 意味マージ LLM がラベルを付けてきた場合の保険。
-                let m = strip_attribute_label(m, &attr);
-                if m.trim().is_empty() || m.trim() == old_body.trim() {
-                    debug!(
-                        "character_updater: {}/{} no change to merge, skip",
-                        key.0, key.1
+            ResolvedOp::CreateFile { name, records, .. } => {
+                let stem = sanitize_file_stem(name);
+                if stem.trim_matches('_').is_empty() {
+                    error!(
+                        "character_updater: cannot convert character name {:?} to a file name",
+                        name
                     );
                     record_all(
                         recorder,
                         update_id,
-                        &records,
-                        Some(&old_body),
+                        records,
+                        None,
                         false,
-                        Some("no change"),
+                        Some("failed to create character file"),
                     );
                     continue;
                 }
-                let content = match tokio::fs::read_to_string(&file).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!(
-                            "character_updater: failed to read character file {:?}: {}",
-                            file, e
-                        );
-                        record_all(
-                            recorder,
-                            update_id,
-                            &records,
-                            Some(&old_body),
-                            false,
-                            Some("failed to read character file"),
-                        );
-                        continue;
-                    }
-                };
-                match replace_section(&content, &section_name, &attr, &m) {
-                    Some(c) => {
-                        write_and_record(&file, &c, update_id, &records, Some(&old_body), recorder)
-                            .await
-                    }
-                    None => {
-                        warn!(
-                            "character_updater: replace_section failed for {}/{}",
-                            key.0, key.1
-                        );
-                        record_all(
-                            recorder,
-                            update_id,
-                            &records,
-                            Some(&old_body),
-                            false,
-                            Some("replace_section failed"),
-                        );
-                    }
-                }
+                let path = chars_dir.join(format!("{}.md", stem));
+                create_paths.insert(path.clone());
+                path
             }
-            ResolvedOp::ReplaceAlias {
-                file,
-                section_name,
-                old,
-                merged,
-                records,
-            } => {
-                let content = match tokio::fs::read_to_string(&file).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!(
-                            "character_updater: failed to read character file {:?}: {}",
-                            file, e
-                        );
-                        record_all(
-                            recorder,
-                            update_id,
-                            &records,
-                            Some(&old),
-                            false,
-                            Some("failed to read character file"),
-                        );
-                        continue;
-                    }
-                };
-                match replace_section(&content, &section_name, &CharacterAttribute::Alias, &merged)
-                {
-                    Some(c) => {
-                        write_and_record(&file, &c, update_id, &records, Some(&old), recorder)
-                            .await
-                    }
-                    None => {
-                        warn!(
-                            "character_updater: replace_section failed for {}/呼称",
-                            section_name
-                        );
-                        record_all(
-                            recorder,
-                            update_id,
-                            &records,
-                            Some(&old),
-                            false,
-                            Some("replace_section failed"),
-                        );
-                    }
-                }
-            }
-            ResolvedOp::AppendSection {
-                file,
-                section_name,
-                heading,
-                body,
-                records,
-            } => {
-                let content = match tokio::fs::read_to_string(&file).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!(
-                            "character_updater: failed to read character file {:?}: {}",
-                            file, e
-                        );
-                        record_all(
-                            recorder,
-                            update_id,
-                            &records,
-                            None,
-                            false,
-                            Some("failed to read character file"),
-                        );
-                        continue;
-                    }
-                };
-                match append_attribute_section(&content, &section_name, heading, &body) {
-                    Some(c) => {
-                        write_and_record(&file, &c, update_id, &records, None, recorder).await
-                    }
-                    None => {
-                        warn!(
-                            "character_updater: append_attribute_section failed for {}/{}",
-                            section_name, heading
-                        );
-                        record_all(
-                            recorder,
-                            update_id,
-                            &records,
-                            None,
-                            false,
-                            Some("append_attribute_section failed"),
-                        );
-                    }
-                }
-            }
-            ResolvedOp::AppendCharacter {
-                file,
-                name,
-                sections,
-                records,
-            } => {
-                let content = match tokio::fs::read_to_string(&file).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!(
-                            "character_updater: failed to read character file {:?}: {}",
-                            file, e
-                        );
-                        record_all(
-                            recorder,
-                            update_id,
-                            &records,
-                            None,
-                            false,
-                            Some("failed to read character file"),
-                        );
-                        continue;
-                    }
-                };
-                let c = append_new_character_block(&content, &name, &sections);
-                write_and_record(&file, &c, update_id, &records, None, recorder).await;
-            }
-            ResolvedOp::CreateFile {
-                name,
-                sections,
-                records,
-            } => {
-                let chars_dir = workspace.join("characters");
-                match create_character_file(&chars_dir, &name, &sections).await {
-                    Some(new_path) => {
-                        info!("character_updater: created {}", new_path.display());
-                        record_all(recorder, update_id, &records, None, true, None);
-                    }
-                    None => {
-                        warn!(
-                            "character_updater: failed to create character file for {:?}",
-                            name
-                        );
-                        record_all(
-                            recorder,
-                            update_id,
-                            &records,
-                            None,
-                            false,
-                            Some("failed to create character file"),
-                        );
-                    }
-                }
-            }
+            _ => existing_op_file(&op)
+                .expect("Skip/CreateFile 以外は必ず file を持つ")
+                .to_path_buf(),
+        };
+
+        if !groups.contains_key(&path) {
+            order.push(path.clone());
         }
+        groups.entry(path).or_default().push(op);
+    }
+
+    for path in order {
+        let Some(ops) = groups.remove(&path) else {
+            continue;
+        };
+        let is_create = create_paths.contains(&path);
+        apply_ops_to_file(
+            path,
+            ops,
+            is_create,
+            merged_map,
+            update_id,
+            workspace,
+            character_store,
+            recorder,
+        )
+        .await;
     }
 }
 
@@ -1673,26 +1681,24 @@ async fn apply_plan(
 async fn apply_updates(
     updates: &[UpdateItem],
     update_id: i64,
-    char_files: Vec<PathBuf>,
+    character_store: &CharacterStore,
     workspace: &Path,
     recorder: &FlightRecorder,
     llm_client: &mut dyn LlmInterface,
 ) {
     debug!("character_updater: {} update(s) received", updates.len());
 
-    // (A) 計画: 各ファイルを1回だけスナップショットして宛先を確定する
-    let mut snapshots: HashMap<PathBuf, String> = HashMap::new();
-    for f in &char_files {
-        match tokio::fs::read_to_string(f).await {
-            Ok(c) => {
-                snapshots.insert(f.clone(), c);
-            }
-            Err(e) => warn!(
-                "character_updater: failed to read character file {:?}: {}",
-                f, e
-            ),
-        }
-    }
+    // (A) 計画: character_store 上の現在のメモリ内容(＝正本)から宛先を確定する。
+    // ディスクを読み直さない(メモリがSSoTのため、ディスクは書き込み専用のdump先)。
+    let char_files = character_store.files_in(workspace);
+    let snapshots: HashMap<PathBuf, String> = char_files
+        .iter()
+        .filter_map(|f| {
+            character_store
+                .content_of(workspace, f)
+                .map(|c| (f.clone(), c))
+        })
+        .collect();
     let (plan, groups) = plan_updates(updates, &char_files, &snapshots);
 
     // (B) バッチマージ(対象が無ければ LLM を呼ばない)
@@ -1709,7 +1715,7 @@ async fn apply_updates(
     };
 
     // (C) 適用
-    apply_plan(plan, merged_map.as_ref(), update_id, workspace, recorder).await;
+    apply_plan(plan, merged_map.as_ref(), update_id, workspace, character_store, recorder).await;
 }
 
 /// ファイル一覧からキャラ名に対応するファイルを探す。
@@ -1726,130 +1732,6 @@ fn find_character_file<'a>(files: &'a [PathBuf], name: &str) -> Option<&'a PathB
     })
 }
 
-/// Markdown テキストの見出し構造を解析し、キャラクターレベルと属性レベルを返す。
-/// `main.rs` の `detect_char_level_str` (comrak AST ベース) に委譲する。
-/// 検出できない場合は `None`。
-fn detect_levels(file_text: &str) -> Option<(u8, u8)> {
-    let cl = crate::character::detect_char_level_str(file_text);
-    (cl != 0).then(|| (cl, cl + 1))
-}
-
-/// 指定キャラクターの見出しブロック内に、新しい属性セクションを追記する。
-/// キャラクター見出しが見つからない場合は `None`。
-fn append_attribute_section(
-    file_text: &str,
-    char_name: &str,
-    attr_heading: &str,
-    body: &str,
-) -> Option<String> {
-    let lines: Vec<&str> = file_text.lines().collect();
-    let mut in_fence = false;
-    let mut char_level: Option<u8> = None;
-    let mut found_char = false;
-    let mut insert_before = lines.len(); // デフォルト: ファイル末尾
-
-    for (i, &line) in lines.iter().enumerate() {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-        }
-        if in_fence {
-            continue;
-        }
-        let trimmed = line.trim_end();
-        if !trimmed.starts_with('#') {
-            continue;
-        }
-        let level = trimmed.bytes().take_while(|&b| b == b'#').count() as u8;
-        let heading_text = trimmed[level as usize..].trim();
-
-        if !found_char {
-            if heading_text.contains(char_name) {
-                found_char = true;
-                char_level = Some(level);
-            }
-        } else if level <= char_level.unwrap() {
-            // このキャラクターブロックの終端
-            insert_before = i;
-            break;
-        }
-    }
-
-    if !found_char {
-        return None;
-    }
-
-    let cl = char_level.unwrap();
-    let attr_prefix = "#".repeat((cl + 1) as usize);
-    let new_section = format!("\n{} {}\n{}\n", attr_prefix, attr_heading, body.trim_end());
-
-    let mut out = String::new();
-    for (i, &line) in lines.iter().enumerate() {
-        if i == insert_before {
-            out.push_str(&new_section);
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if insert_before >= lines.len() {
-        out.push_str(&new_section);
-    }
-
-    Some(out)
-}
-
-/// ファイル末尾に新規キャラクターのブロックを追記して返す。
-/// 見出しレベルは既存ファイルから推測し、不明な場合は `#`/`##` を使用する。
-fn append_new_character(
-    file_text: &str,
-    char_name: &str,
-    attr_heading: &str,
-    body: &str,
-) -> String {
-    let (cl, al) = detect_levels(file_text).unwrap_or((1, 2));
-    let char_prefix = "#".repeat(cl as usize);
-    let attr_prefix = "#".repeat(al as usize);
-    let new_block = format!(
-        "\n{} {}\n\n{} {}\n{}\n",
-        char_prefix,
-        char_name,
-        attr_prefix,
-        attr_heading,
-        body.trim_end()
-    );
-
-    let mut out = file_text.to_string();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(&new_block);
-    out
-}
-
-/// ファイル末尾へ新規キャラブロックを全属性まとめて追記する。
-/// 先頭セクションは `append_new_character`、以降は `append_attribute_section` を連鎖させる
-/// (逐次適用と同じ出力になる)。
-fn append_new_character_block(
-    file_text: &str,
-    char_name: &str,
-    sections: &[(&'static str, String)],
-) -> String {
-    let mut iter = sections.iter();
-    let Some((heading, body)) = iter.next() else {
-        return file_text.to_string();
-    };
-    let mut out = append_new_character(file_text, char_name, heading, body);
-    for (heading, body) in iter {
-        match append_attribute_section(&out, char_name, heading, body) {
-            Some(c) => out = c,
-            None => warn!(
-                "character_updater: failed to append section {} to new character {}",
-                heading, char_name
-            ),
-        }
-    }
-    out
-}
-
 /// ファイル stem として使えない文字(`/ \ : * ? " < > |` および制御文字)を `_` に置換する。
 /// キャラクター見出し(`# name`)には原名を使うため、このサニタイズはパス生成のみに適用する。
 fn sanitize_file_stem(name: &str) -> String {
@@ -1862,48 +1744,6 @@ fn sanitize_file_stem(name: &str) -> String {
             }
         })
         .collect()
-}
-
-/// `chars_dir/<name>.md` を新規作成してパスを返す。作成に失敗した場合は `None`。
-/// - ファイル名は `sanitize_file_stem` でサニタイズする(見出しは元の `name` を維持)。
-/// - `chars_dir` が存在しない場合は `create_dir_all` で生成する。
-/// - `sections` の全属性を1ファイルにまとめて書き出す(同一 run 内の順序依存を排除)。
-async fn create_character_file(
-    chars_dir: &Path,
-    name: &str,
-    sections: &[(&'static str, String)],
-) -> Option<PathBuf> {
-    let stem = sanitize_file_stem(name);
-    if stem.trim_matches('_').is_empty() {
-        error!(
-            "character_updater: cannot convert character name {:?} to a file name",
-            name
-        );
-        return None;
-    }
-    if let Err(e) = tokio::fs::create_dir_all(chars_dir).await {
-        error!(
-            "character_updater: failed to create characters directory {:?}: {}",
-            chars_dir, e
-        );
-        return None;
-    }
-    let path = chars_dir.join(format!("{}.md", stem));
-    // 見出しには原名を使う
-    let mut content = format!("# {}\n", name);
-    for (heading, body) in sections {
-        content.push_str(&format!("\n## {}\n\n{}\n", heading, body.trim_end()));
-    }
-    match tokio::fs::write(&path, format_markdown(&content)).await {
-        Ok(_) => {
-            debug!("character_updater: created {:?}", path);
-            Some(path)
-        }
-        Err(e) => {
-            error!("character_updater: failed to create {:?}: {}", path, e);
-            None
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1961,25 +1801,6 @@ mod tests {
 - 真面目。
 ";
 
-    #[test]
-    fn test_replace_section_found() {
-        let result = replace_section(
-            SAMPLE_MD,
-            "ジェフ",
-            &CharacterAttribute::Background,
-            "- 予備役上がりで、元警備隊員。\n- フォン・ブラウン出身。",
-        );
-        assert!(result.is_some());
-        let out = result.unwrap();
-        assert!(out.contains("予備役上がりで、元警備隊員"));
-        assert!(out.contains("元警備隊員"));
-        assert!(out.contains("フォン・ブラウン出身"));
-        assert!(
-            out.contains("落ち着いている"),
-            "他セクションが保持されること"
-        );
-        assert!(out.contains("シルビア"), "別キャラが保持されること");
-    }
 
     #[test]
     fn test_build_batch_merge_prompt_requests_meaningful_merge() {
@@ -2472,13 +2293,23 @@ mod tests {
             ("新キャラ", "背景", "- 謎の過去。"),
         ]);
         let (plan, groups) = plan_updates(&updates, &[], &HashMap::new());
-        assert!(groups.is_empty(), "新規キャラは LLM マージ対象にならないこと");
+        assert!(
+            groups.is_empty(),
+            "新規キャラは LLM マージ対象にならないこと"
+        );
         let creates: Vec<_> = plan
             .iter()
             .filter(|op| matches!(op, ResolvedOp::CreateFile { .. }))
             .collect();
-        assert_eq!(creates.len(), 1, "同一新規キャラは1つの CreateFile に集約されること");
-        if let ResolvedOp::CreateFile { sections, records, .. } = creates[0] {
+        assert_eq!(
+            creates.len(),
+            1,
+            "同一新規キャラは1つの CreateFile に集約されること"
+        );
+        if let ResolvedOp::CreateFile {
+            sections, records, ..
+        } = creates[0]
+        {
             assert_eq!(sections.len(), 2);
             assert_eq!(records.len(), 2);
         }
@@ -2501,9 +2332,20 @@ mod tests {
         let (plan, groups) = plan_updates(&updates, std::slice::from_ref(&file), &snapshots);
         assert_eq!(groups.len(), 1);
 
+        let store = CharacterStore::new();
+        store.reconcile(&dir, &file, PLAN_MD.to_string());
+
         let recorder = FlightRecorder::new(&dir.join("flight.db"));
         let update_id = recorder.record_character_update("test://uri", "test-model", "prompt");
-        apply_plan(plan, Some(&HashMap::new()), update_id, &dir, &recorder).await;
+        apply_plan(
+            plan,
+            Some(&HashMap::new()),
+            update_id,
+            &dir,
+            &store,
+            &recorder,
+        )
+        .await;
 
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
@@ -2539,10 +2381,8 @@ mod tests {
 
     #[test]
     fn test_strip_attribute_label_multiline_empty_after_colon() {
-        let out = strip_attribute_label(
-            "呼称：\n- 飛騨艦長\n- 高柳大佐",
-            &CharacterAttribute::Alias,
-        );
+        let out =
+            strip_attribute_label("呼称：\n- 飛騨艦長\n- 高柳大佐", &CharacterAttribute::Alias);
         assert_eq!(out, "- 飛騨艦長\n- 高柳大佐");
     }
 
@@ -2563,7 +2403,10 @@ mod tests {
     #[test]
     fn test_strip_attribute_label_wrong_attribute_label_untouched() {
         // 「背景：」は Personality のラベルとして一致しないので除去しない
-        let out = strip_attribute_label("背景：過去に事故に遭った。", &CharacterAttribute::Personality);
+        let out = strip_attribute_label(
+            "背景：過去に事故に遭った。",
+            &CharacterAttribute::Personality,
+        );
         assert_eq!(out, "背景：過去に事故に遭った。");
     }
 
@@ -2605,60 +2448,6 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_section_can_still_replace_body() {
-        let result = replace_section(
-            SAMPLE_MD,
-            "ジェフ",
-            &CharacterAttribute::Background,
-            "- 元警備隊員で予備役上がり。",
-        );
-        assert!(result.is_some());
-        let out = result.unwrap();
-        assert!(out.contains("元警備隊員で予備役上がり"));
-        assert!(
-            !out.contains("- 予備役上がり。\n"),
-            "replace_section 自体は指定本文へ差し替えること"
-        );
-        assert!(
-            out.contains("落ち着いている"),
-            "他セクションが保持されること"
-        );
-        assert!(out.contains("シルビア"), "別キャラが保持されること");
-    }
-
-    #[test]
-    fn test_replace_section_not_found() {
-        let result = replace_section(
-            SAMPLE_MD,
-            "ジェフ",
-            &CharacterAttribute::Appearance,
-            "特になし",
-        );
-        // appearance セクションはないので None
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_replace_section_other_char_untouched() {
-        let result = replace_section(
-            SAMPLE_MD,
-            "シルビア",
-            &CharacterAttribute::Personality,
-            "- 真面目だが、緊張しやすい面もある。",
-        );
-        assert!(result.is_some());
-        let out = result.unwrap();
-        assert!(
-            out.contains("落ち着いている"),
-            "ジェフのセクションが保持されること"
-        );
-        assert!(
-            out.contains("- 真面目だが、緊張しやすい面もある。"),
-            "意味的に統合されたテキストを書けること"
-        );
-    }
-
-    #[test]
     fn test_find_character_file_single() {
         // 単一ファイル形式: characters.md はどのキャラ名でもヒットする(集約ファイル)
         let files = vec![PathBuf::from("/ws/characters.md")];
@@ -2680,116 +2469,6 @@ mod tests {
         assert_eq!(find_character_file(&files, "ジェフ"), Some(&files[0]));
         assert_eq!(find_character_file(&files, "シルビア"), Some(&files[1]));
         assert_eq!(find_character_file(&files, "存在しない"), None);
-    }
-
-    #[test]
-    fn test_detect_levels_with_story_heading() {
-        // # Story / ## キャラ / ### 属性 の構造
-        let md = "\
-# Story
-## ジェフ
-### 性格
-- 落ち着いている。
-## シルビア
-### 背景
-- 不明。
-";
-        assert_eq!(detect_levels(md), Some((2, 3)));
-    }
-
-    #[test]
-    fn test_detect_levels_top_level_chars() {
-        // # キャラ / ## 属性 の構造
-        let md = "\
-# ジェフ
-## 性格
-- 落ち着いている。
-# シルビア
-## 背景
-- 不明。
-";
-        assert_eq!(detect_levels(md), Some((1, 2)));
-    }
-
-    #[test]
-    fn test_detect_levels_empty() {
-        assert_eq!(detect_levels(""), None);
-        assert_eq!(detect_levels("本文だけ、見出しなし。"), None);
-    }
-
-    #[test]
-    fn test_append_attribute_section_to_existing_char() {
-        let md = "\
-# Story
-## ジェフ（艦長）
-### 性格
-- 落ち着いている。
-## シルビア
-### 背景
-- 不明。
-";
-        let result = append_attribute_section(md, "ジェフ", "外見", "- 長身で白髪。");
-        assert!(result.is_some());
-        let out = result.unwrap();
-        // 新属性がジェフのブロック内（シルビアの前）に挿入される
-        let jeff_end = out.find("## シルビア").unwrap_or(out.len());
-        assert!(out.contains("### 外見"), "属性見出しがあること");
-        assert!(
-            out.find("### 外見").unwrap() < jeff_end,
-            "シルビアより前に挿入されること"
-        );
-        assert!(out.contains("落ち着いている"), "既存属性が保持されること");
-        assert!(out.contains("シルビア"), "他キャラが保持されること");
-    }
-
-    #[test]
-    fn test_append_attribute_section_at_eof() {
-        // キャラが最後のブロック(次の同レベル見出しがない)
-        let md = "\
-## ジェフ
-### 性格
-- 落ち着いている。
-";
-        let result = append_attribute_section(md, "ジェフ", "外見", "- 長身。");
-        assert!(result.is_some());
-        let out = result.unwrap();
-        assert!(out.contains("### 外見"), "属性見出しがあること");
-        assert!(out.contains("長身"), "属性本文があること");
-        assert!(out.contains("落ち着いている"), "既存属性が保持されること");
-    }
-
-    #[test]
-    fn test_append_attribute_section_char_not_found() {
-        let md = "## ジェフ\n### 性格\n- 落ち着いている。\n";
-        let result = append_attribute_section(md, "存在しない", "外見", "- 不明。");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_append_new_character() {
-        let md = "\
-# Story
-## ジェフ
-### 性格
-- 落ち着いている。
-";
-        let out = append_new_character(md, "新キャラ", "背景", "- 謎の人物。");
-        assert!(out.contains("## 新キャラ"), "新キャラ見出しがあること");
-        assert!(out.contains("### 背景"), "属性見出しがあること");
-        assert!(out.contains("謎の人物"), "属性本文があること");
-        assert!(out.contains("落ち着いている"), "既存キャラが保持されること");
-        let jeff_pos = out.find("## ジェフ").unwrap();
-        let new_pos = out.find("## 新キャラ").unwrap();
-        assert!(new_pos > jeff_pos, "新キャラが末尾に追加されること");
-    }
-
-    #[test]
-    fn test_append_new_character_empty_file() {
-        // 空ファイルはデフォルトレベル(1/2)を使用
-        let out = append_new_character("", "新キャラ", "性格", "- 明るい。");
-        assert!(out.contains("# 新キャラ"), "レベル1のキャラ見出し");
-        assert!(out.contains("## 性格"), "レベル2の属性見出し");
-        assert!(out.contains("明るい"), "属性本文");
     }
 
     #[test]
@@ -2925,5 +2604,4 @@ mod tests {
             "quotes:\na\nb"
         );
     }
-
 }

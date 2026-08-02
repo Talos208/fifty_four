@@ -544,7 +544,7 @@ mod tests {
         }
 
         fn tokenize(&self, line: &mut LineData) {
-            self.hl.tokenize(line);
+            self.hl.tokenize(line, &std::collections::HashSet::new());
         }
 
         /// 本番(completion)と同じ手順で分類する:
