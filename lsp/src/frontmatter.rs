@@ -249,4 +249,56 @@ mod tests {
         let vars = HashMap::new();
         assert_eq!(expand("前{{未閉じ", &vars), "前{{未閉じ");
     }
+
+    /// `expand` は未知のプレースホルダを `{{NAME}}` のまま残すため、テンプレートに
+    /// 変数を足したのに呼び出し側が渡し忘れると、リテラルがプロンプトへ漏れる。
+    /// 実テンプレートと、呼び出し側(`Backend::completion` / `Backend::code_action`)が
+    /// 実際に渡している変数名の組が食い違っていないことを確かめる。
+    fn assert_no_leftover_placeholder(name: &str, keys: &[&str]) {
+        let (template, _) = load_prompt(name).unwrap_or_else(|| panic!("{} not found", name));
+        let vars: HashMap<&str, &str> = keys.iter().map(|k| (*k, "x")).collect();
+        let expanded = expand(&template, &vars);
+        assert!(
+            !expanded.contains("{{"),
+            "{} に未展開のプレースホルダが残っている: {}",
+            name,
+            expanded
+                .split("{{")
+                .skip(1)
+                .filter_map(|s| s.split("}}").next())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    #[test]
+    fn test_completion_prompts_have_no_unsupplied_placeholder() {
+        // Backend::completion が渡す変数
+        const KEYS: &[&str] = &["CHAPTER", "TEXT", "CHAT"];
+        for name in [
+            "prompt_completion.md",
+            "prompt_completion_after_bracket.md",
+            "prompt_completion_after_sentence.md",
+            "prompt_completion_before_bracket.md",
+            "prompt_completion_empty_bracket.md",
+            "prompt_completion_in_bracket.md",
+        ] {
+            assert_no_leftover_placeholder(name, KEYS);
+        }
+    }
+
+    #[test]
+    fn test_code_action_prompts_have_no_unsupplied_placeholder() {
+        // Backend::code_action が渡す変数
+        const KEYS: &[&str] = &["CHAPTER", "TEXT", "TARGET", "CHAT"];
+        for name in ["prompt_fill_mark.md", "prompt_rephrase.md"] {
+            assert_no_leftover_placeholder(name, KEYS);
+        }
+    }
+
+    #[test]
+    fn test_chat_digest_prompt_has_no_unsupplied_placeholder() {
+        // crate::acp が渡す変数
+        assert_no_leftover_placeholder("prompt_chat_digest.md", &["HISTORY"]);
+    }
 }
