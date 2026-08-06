@@ -1,0 +1,1881 @@
+diff --git a/lsp/Cargo.toml b/lsp/Cargo.toml
+index 20c3d4e..7622910 100644
+--- a/lsp/Cargo.toml
++++ b/lsp/Cargo.toml
+@@ -32,6 +32,8 @@ http = "1.4.0"
+ derive_more = { version = "2.1.1", features = ["error", "display"] }
+ bitflags = "2"
+ comrak = { version = "0.51.0", features = ["bon","syntect","shortcodes"] }
++uuid = { version = "1", features = ["v4"] }
++flate2 = "1"
+ 
+ opentelemetry = "0.31.0"
+ opentelemetry_sdk = { version = "0.31.0", features = ["trace", "metrics", "logs"] }
+diff --git a/lsp/src/acp.rs b/lsp/src/acp.rs
+index 820b2b5..42eaa85 100644
+--- a/lsp/src/acp.rs
++++ b/lsp/src/acp.rs
+@@ -29,11 +29,14 @@
+ //! `ANTHROPIC_API_KEY` を設定しなければ、ログイン済み CLI のサブスクリプション枠で動く。
+ //! このモジュールは API キーを要求しないし、自前で持つこともしない。
+ 
++use crate::acp_config::{self, SessionConfig};
+ use crate::writing_agent::{AgentError, ClaudeAgent, WritingAgent};
+ use agent_client_protocol::schema::v1::{
+     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
+-    InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+-    SessionId, SessionNotification, SessionUpdate, StopReason,
++    InitializeResponse, LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest,
++    NewSessionResponse, PromptRequest, PromptResponse, SessionCapabilities, SessionId,
++    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
++    SetSessionConfigOptionResponse, StopReason, UsageUpdate,
+ };
+ use agent_client_protocol::{Agent, Stdio};
+ #[allow(unused_imports)]
+@@ -54,7 +57,8 @@ const MAX_DIGEST_TURNS: usize = 8;
+ const DIGEST_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+ 
+ /// 会話の話者。
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++#[serde(rename_all = "snake_case")]
+ pub(crate) enum Speaker {
+     /// 作者(Zed の Agent Panel で入力した人)
+     Author,
+@@ -73,7 +77,10 @@ impl Speaker {
+ }
+ 
+ /// 会話の1発話。
+-#[derive(Debug, Clone)]
++///
++/// [`crate::session_log`] がそのまま1行のJSONとして永続化する
++/// (`session/load` でのリプレイ用。プロセス再起動をまたいで残る唯一の会話記録)。
++#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+ pub(crate) struct ChatTurn {
+     pub(crate) speaker: Speaker,
+     pub(crate) text: String,
+@@ -85,6 +92,14 @@ struct Session {
+     root: PathBuf,
+     agent: Arc<dyn WritingAgent>,
+     turns: Vec<ChatTurn>,
++    /// 現在の設定(= いま動いている `claude` プロセスに渡した内容)。
++    config: SessionConfig,
++    /// GUI で変更されたが、まだプロセスへ反映していない設定。
++    /// 次の `session/prompt` の頭で適用する
++    /// (`anthropic-agent-sdk` はセッション途中の切替を非対応なので、
++    /// プロセスを起こし直すタイミングを会話の切れ目まで遅らせている。
++    /// [`crate::acp_config`] のモジュールdoc参照)。
++    pending: Option<SessionConfig>,
+ }
+ 
+ /// ハンドラ間で共有する状態。
+@@ -92,18 +107,16 @@ struct AgentState {
+     sessions: tokio::sync::Mutex<HashMap<SessionId, Session>>,
+     /// 実行中の要約タスク。切断時に待ち合わせるため保持する([`DIGEST_DRAIN_TIMEOUT`])。
+     digests: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
+-    next_session_no: std::sync::atomic::AtomicU64,
+ }
+ 
+ impl AgentState {
+-    /// 新しいセッションIDを採番する。
+-    ///
+-    /// 複数の ACP プロセスが同時に動いてもぶつからないよう PID を含める。
++    /// 新しいセッションIDを採番する。UUID v4形式にする必要がある
++    /// (`claude` CLI の `--session-id`/`--resume` がUUIDを要求するため)。
++    /// このIDをそのまま ACP の `SessionId` として使い回すので、`session/load` が
++    /// 来たときに別途IDのマッピングを持たなくても `claude` CLI 側の永続化済み
++    /// セッションへ直接 `--resume` できる。
+     fn new_session_id(&self) -> SessionId {
+-        let n = self
+-            .next_session_no
+-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+-        SessionId::new(format!("ff-{}-{}", std::process::id(), n))
++        SessionId::new(uuid::Uuid::new_v4().to_string())
+     }
+ }
+ 
+@@ -115,12 +128,13 @@ pub(crate) async fn run() -> Result<(), String> {
+     let state = Arc::new(AgentState {
+         sessions: tokio::sync::Mutex::new(HashMap::new()),
+         digests: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+-        next_session_no: std::sync::atomic::AtomicU64::new(0),
+     });
+ 
+     info!("start acp agent");
+ 
+     let new_session = state.clone();
++    let load_session = state.clone();
++    let config_state = state.clone();
+     let prompt_state = state.clone();
+     let cancel_state = state.clone();
+ 
+@@ -129,43 +143,221 @@ pub(crate) async fn run() -> Result<(), String> {
+         .name("fifty-four")
+         .on_receive_request(
+             async move |req: InitializeRequest, responder, _cx| {
+-                debug!("acp initialize: protocol_version={:?}", req.protocol_version);
+-                // テキストの送受信は baseline なので追加の capability 宣言は要らない。
++                debug!(
++                    "acp initialize: protocol_version={:?}",
++                    req.protocol_version
++                );
+                 responder.respond(
+-                    InitializeResponse::new(req.protocol_version)
+-                        .agent_capabilities(AgentCapabilities::new()),
++                    InitializeResponse::new(req.protocol_version).agent_capabilities(
++                        // `claude` CLI の `--session-id`/`--resume` がそのまま使えるため
++                        // `session/load` に対応できる(下のハンドラ参照)。
++                        AgentCapabilities::new().load_session(true),
++                    ),
+                 )
+             },
+             agent_client_protocol::on_receive_request!(),
+         )
++        // `session/set_config_option`: モデル/思考レベルの選択を受け付ける。
++        // その場では `claude` プロセスを再起動しない — `pending` に積むだけで、
++        // 実際の反映は次の `session/prompt` の頭で行う(会話の切れ目まで待つことで
++        // 進行中のターンを壊さない)。
++        .on_receive_request(
++            async move |req: SetSessionConfigOptionRequest, responder, _cx| {
++                debug!(
++                    "acp session/set_config_option: id={} config_id={:?} value={:?}",
++                    req.session_id, req.config_id, req.value
++                );
++                let mut sessions = config_state.sessions.lock().await;
++                let Some(session) = sessions.get_mut(&req.session_id) else {
++                    return responder.respond_with_internal_error(format!(
++                        "unknown session: {}",
++                        req.session_id
++                    ));
++                };
++                let mut next = session
++                    .pending
++                    .clone()
++                    .unwrap_or_else(|| session.config.clone());
++                if let Err(e) = acp_config::apply(&mut next, req.config_id.0.as_ref(), &req.value) {
++                    warn!("acp session/set_config_option: {}", e);
++                    return responder.respond_with_internal_error(e);
++                }
++                let options = acp_config::to_config_options(&next);
++                session.pending = Some(next);
++                responder.respond(SetSessionConfigOptionResponse::new(options))
++            },
++            agent_client_protocol::on_receive_request!(),
++        )
+         // `session/new`: ワークスペースに紐づくエージェント(= claude プロセス)を1つ起こす。
++        // ここで採番するIDは `claude` CLI 自身のセッションIDでもある(`--session-id`)ので、
++        // `session/load` が同じIDで来たとき素直に `--resume` できる。
+         .on_receive_request(
+             async move |req: NewSessionRequest, responder, _cx| {
+                 let id = new_session.new_session_id();
+                 debug!("acp session/new: id={} cwd={:?}", id, req.cwd);
+ 
++                // 新しい会話は前の会話の要約を引き継がない。TTLの代わりに
++                // ここで明示的に切り替える(lsp/src/chat_context.rs のモジュールdoc参照)。
++                if let Err(e) = crate::chat_context::clear(&req.cwd) {
++                    warn!("acp: failed to clear chat digest on session/new: {}", e);
++                }
++
+                 let prompt = match system_prompt() {
+                     Ok(p) => p,
+                     Err(e) => return responder.respond_with_internal_error(e),
+                 };
+-                let agent = match ClaudeAgent::start(&req.cwd, prompt).await {
++                let config = SessionConfig::default();
++                let agent = match ClaudeAgent::start(&req.cwd, prompt, &id.0, false, &config).await
++                {
+                     Ok(a) => Arc::new(a) as Arc<dyn WritingAgent>,
+                     Err(e) => {
+                         error!("failed to start writing agent: {}", e);
+-                        return responder
+-                            .respond_with_internal_error(format!("エージェントを起動できません: {}", e));
++                        return responder.respond_with_internal_error(format!(
++                            "エージェントを起動できません: {}",
++                            e
++                        ));
+                     }
+                 };
+ 
++                let config_options = acp_config::to_config_options(&config);
+                 new_session.sessions.lock().await.insert(
+                     id.clone(),
+                     Session {
+                         root: req.cwd.clone(),
+                         agent,
+                         turns: Vec::new(),
++                        config,
++                        pending: None,
+                     },
+                 );
+-                responder.respond(NewSessionResponse::new(id))
++                responder.respond(NewSessionResponse::new(id).config_options(config_options))
++            },
++            agent_client_protocol::on_receive_request!(),
++        )
++        // `session/load`: プロセス再起動等でメモリ上の状態が失われたセッションを、
++        // `claude` CLI 側の永続化された会話履歴から再開する。
++        // `Session::turns` はプロセスのメモリ上にしか無いため、[`crate::session_log`] へ
++        // 逐次追記してある過去ターンを読み戻し、ACP の仕様通り `session/update` 通知として
++        // 応答の前にリプレイする(仕様は "MUST replay" と明記している)。
++        .on_receive_request(
++            async move |req: LoadSessionRequest, responder, connection| {
++                debug!("acp session/load: id={} cwd={:?}", req.session_id, req.cwd);
++
++                // `claude` CLI の `--resume` はUUID形式のセッションIDしか受け付けない。
++                // 今回の実装より前に発行された旧形式(`ff-{pid}-{n}`)のIDがZed側の履歴に
++                // 残っていると、UUIDでないIDをそのまま `--resume` に渡すことになり、
++                // CLIプロセスが起動直後に引数エラーで自己終了する。その場合
++                // `ClaudeAgent::start` 自体は(spawn/connectまでは)成功として返ってしまい、
++                // 実際の失敗は次の `session/prompt` での書き込み時に「パイプが閉じている」
++                // という分かりにくいエラーとして先送りされる。ここで事前に弾くことで、
++                // `session/load` の時点で分かりやすく失敗させる。
++                if uuid::Uuid::parse_str(&req.session_id.0).is_err() {
++                    warn!(
++                        "acp session/load: 不正な形式のセッションID: {}",
++                        req.session_id
++                    );
++                    return responder.respond_with_internal_error(
++                        "不明な形式のセッションIDです。新しい会話を開始してください。".to_string(),
++                    );
++                }
++
++                let prompt = match system_prompt() {
++                    Ok(p) => p,
++                    Err(e) => return responder.respond_with_internal_error(e),
++                };
++                // 設定はプロセスのメモリ上にしか無いため、再開時は既定へ戻る
++                // (docs/acp-agent.md の「セッションの再開」参照)。
++                let config = SessionConfig::default();
++                let agent =
++                    match ClaudeAgent::start(&req.cwd, prompt, &req.session_id.0, true, &config)
++                        .await
++                    {
++                        Ok(a) => Arc::new(a) as Arc<dyn WritingAgent>,
++                        Err(e) => {
++                            error!("failed to resume writing agent: {}", e);
++                            return responder.respond_with_internal_error(format!(
++                                "セッションを再開できません: {}",
++                                e
++                            ));
++                        }
++                    };
++
++                // session_log へ逐次追記してきた過去ターンを読み戻す。無ければ
++                // (初回・旧セッション・削除済み)空のまま従来通りに始める。
++                let turns = crate::session_log::read_turns(&req.cwd, &req.session_id.0);
++                debug!(
++                    "acp session/load: id={} 過去ターンを{}件読み戻しました",
++                    req.session_id,
++                    turns.len()
++                );
++
++                // ACP の仕様は「応答を返す前に会話全体を session/update でリプレイする」
++                // ことを要求している。件数の上限は設けない(ローカルのテキスト再送で
++                // あり LLM 呼び出しコストが無いため)。
++                for turn in &turns {
++                    let update = match turn.speaker {
++                        Speaker::Author => SessionUpdate::UserMessageChunk(ContentChunk::new(
++                            turn.text.clone().into(),
++                        )),
++                        Speaker::Agent => SessionUpdate::AgentMessageChunk(ContentChunk::new(
++                            turn.text.clone().into(),
++                        )),
++                    };
++                    if let Err(e) = connection
++                        .send_notification(SessionNotification::new(req.session_id.clone(), update))
++                    {
++                        warn!("acp: failed to replay turn on session/load: {}", e);
++                        break;
++                    }
++                }
++
++                // 要約(chat_context.md)をこのセッションへ明示的に切り替える。
++                // TTLの代わりに「所有者セッションIDが一致するか」で判断する
++                // (lsp/src/chat_context.rs のモジュールdoc参照)。
++                match crate::chat_context::owner(&req.cwd) {
++                    Some(owner) if owner == req.session_id.0.as_ref() => {
++                        // 既にこのセッションの要約が乗っている。直前まで使っていた
++                        // スレッドを開き直すだけの最も多いケースなので、
++                        // 何もしない(再生成のLLM呼び出しコストをかけない)。
++                        debug!(
++                            "acp session/load: id={} 要約は既にこのセッションの所有です",
++                            req.session_id
++                        );
++                    }
++                    _ if turns.is_empty() => {
++                        // 復元する材料が無い(旧セッション・削除済みなど)。
++                        // 他セッションの要約を誤って残さないよう消しておく。
++                        if let Err(e) = crate::chat_context::clear(&req.cwd) {
++                            warn!("acp: failed to clear chat digest on session/load: {}", e);
++                        }
++                    }
++                    _ => {
++                        // 別セッションが最後に書いた要約が残っている。応答は
++                        // 先に返し、要約の再生成はバックグラウンドで追いつかせる
++                        // (session/prompt の応答後と同じ方針)。
++                        let root = req.cwd.clone();
++                        let session_id = req.session_id.0.to_string();
++                        let turns_for_digest = turns.clone();
++                        let mut digests = load_session.digests.lock().await;
++                        while digests.try_join_next().is_some() {}
++                        digests.spawn(async move {
++                            update_digest(&root, &turns_for_digest, &session_id).await;
++                        });
++                    }
++                }
++
++                let config_options = acp_config::to_config_options(&config);
++                load_session.sessions.lock().await.insert(
++                    req.session_id.clone(),
++                    Session {
++                        root: req.cwd.clone(),
++                        agent,
++                        turns,
++                        config,
++                        pending: None,
++                    },
++                );
++                responder.respond(LoadSessionResponse::new().config_options(config_options))
+             },
+             agent_client_protocol::on_receive_request!(),
+         )
+@@ -186,22 +378,57 @@ pub(crate) async fn run() -> Result<(), String> {
+                     let mut sessions = prompt_state.sessions.lock().await;
+                     match sessions.get_mut(&session_id) {
+                         Some(s) => {
+-                            s.turns.push(ChatTurn {
++                            let turn = ChatTurn {
+                                 speaker: Speaker::Author,
+                                 text: message.clone(),
+-                            });
+-                            Some((s.root.clone(), s.agent.clone()))
++                            };
++                            if let Err(e) =
++                                crate::session_log::append_turn(&s.root, &session_id.0, &turn)
++                            {
++                                warn!("acp: failed to persist turn: {}", e);
++                            }
++                            s.turns.push(turn);
++                            Some((s.root.clone(), s.agent.clone(), s.pending.clone()))
+                         }
+                         None => None,
+                     }
+                 };
+ 
+-                let Some((root, agent)) = session else {
++                let Some((root, mut agent, pending)) = session else {
+                     warn!("acp session/prompt: unknown session {}", session_id);
+                     return responder
+                         .respond_with_internal_error(format!("unknown session: {}", session_id));
+                 };
+ 
++                // GUI で選ばれた設定がまだ反映されていなければ、ここ(会話の切れ目)で
++                // `claude` プロセスを起こし直す。`anthropic-agent-sdk` はセッション途中の
++                // 切替を非対応なので、同じセッションIDで `--resume` することで
++                // 会話の文脈を保ったまま設定だけ変える(`session/load` と同じ経路)。
++                if let Some(new_config) = pending {
++                    let prompt = match system_prompt() {
++                        Ok(p) => p,
++                        Err(e) => return responder.respond_with_internal_error(e),
++                    };
++                    match ClaudeAgent::start(&root, prompt, &session_id.0, true, &new_config).await
++                    {
++                        Ok(new_agent) => {
++                            agent = Arc::new(new_agent);
++                            let mut sessions = prompt_state.sessions.lock().await;
++                            if let Some(s) = sessions.get_mut(&session_id) {
++                                s.agent = agent.clone();
++                                s.config = new_config;
++                                s.pending = None;
++                            }
++                        }
++                        Err(e) => {
++                            // 設定を変えられなかっただけで会話を落とす理由は無いので、
++                            // 古い agent のまま続行する。pending は残し、次のターンで
++                            // 再度試みる。
++                            warn!("acp: 設定変更のための再起動に失敗しました: {}", e);
++                        }
++                    }
++                }
++
+                 // 届いたそばからクライアントへ流す。送信に失敗したら以降は諦めて
+                 // 全文だけ組み立てる(応答自体は返せるため)。
+                 let mut send_error: Option<agent_client_protocol::Error> = None;
+@@ -233,17 +460,47 @@ pub(crate) async fn run() -> Result<(), String> {
+                     }
+                 };
+ 
++                // サブスク枠(5時間枠)の使用率が取れていれば、Zed のメーターへ流す。
++                //
++                // `UsageUpdate` は本来「コンテキストウィンドウの使用量」用のフィールドだが、
++                // ACP には枠の残量に対応するフィールドが無いため、意図的にラベルと中身を
++                // ずらして流用している(docs/acp-agent.md 参照)。
++                if let Some(rate_limit) = &reply.rate_limit {
++                    let used = rate_limit.utilization.round().clamp(0.0, 100.0) as u64;
++                    let mut usage = UsageUpdate::new(used, 100);
++                    if let Some(resets_at) = &rate_limit.resets_at {
++                        let mut meta = Meta::new();
++                        meta.insert(
++                            "resetsAt".to_string(),
++                            serde_json::Value::String(resets_at.clone()),
++                        );
++                        usage = usage.meta(meta);
++                    }
++                    if let Err(e) = connection.send_notification(SessionNotification::new(
++                        session_id.clone(),
++                        SessionUpdate::UsageUpdate(usage),
++                    )) {
++                        warn!("acp: failed to send usage update: {}", e);
++                    }
++                }
++
+                 // 応答を履歴へ積み、要約の材料を取り出す。
+                 let digest_input = {
+                     let mut sessions = prompt_state.sessions.lock().await;
+                     match sessions.get_mut(&session_id) {
+                         Some(s) => {
+-                            let reply = reply.trim();
+-                            if !reply.is_empty() {
+-                                s.turns.push(ChatTurn {
++                            let reply_text = reply.text.trim();
++                            if !reply_text.is_empty() {
++                                let turn = ChatTurn {
+                                     speaker: Speaker::Agent,
+-                                    text: reply.to_string(),
+-                                });
++                                    text: reply_text.to_string(),
++                                };
++                                if let Err(e) =
++                                    crate::session_log::append_turn(&s.root, &session_id.0, &turn)
++                                {
++                                    warn!("acp: failed to persist turn: {}", e);
++                                }
++                                s.turns.push(turn);
+                             }
+                             Some(s.turns.clone())
+                         }
+@@ -264,8 +521,9 @@ pub(crate) async fn run() -> Result<(), String> {
+                     let mut digests = prompt_state.digests.lock().await;
+                     // 完了済みを回収してから積む(放っておくと JoinSet が伸び続ける)。
+                     while digests.try_join_next().is_some() {}
++                    let owner_id = session_id.0.to_string();
+                     digests.spawn(async move {
+-                        update_digest(&root, &turns).await;
++                        update_digest(&root, &turns, &owner_id).await;
+                     });
+                 }
+                 responded
+@@ -312,7 +570,10 @@ async fn drain_digests(state: &AgentState) {
+     })
+     .await;
+     if drained.is_err() {
+-        warn!("gave up waiting for digest tasks after {:?}", DIGEST_DRAIN_TIMEOUT);
++        warn!(
++            "gave up waiting for digest tasks after {:?}",
++            DIGEST_DRAIN_TIMEOUT
++        );
+     }
+ }
+ 
+@@ -353,7 +614,7 @@ pub(crate) fn render_history(turns: &[ChatTurn], max_turns: usize) -> String {
+ /// 対話用とは別セッションの一発問い合わせで回す。会話側のクライアントを占有しないので、
+ /// 要約中でも次のターンを受けられる。失敗はログに落とすだけで握りつぶす —
+ /// 要約が無くても補完は `{{CHAT}}` が空になるだけで動く。
+-async fn update_digest(root: &std::path::Path, turns: &[ChatTurn]) {
++async fn update_digest(root: &std::path::Path, turns: &[ChatTurn], session_id: &str) {
+     let Some((template, _options)) = crate::frontmatter::load_prompt("prompt_chat_digest.md")
+     else {
+         warn!("prompt_chat_digest.md not found; chat context will not be updated");
+@@ -379,7 +640,7 @@ async fn update_digest(root: &std::path::Path, turns: &[ChatTurn]) {
+                 debug!("chat digest is empty; keeping the previous one");
+                 return;
+             }
+-            match crate::chat_context::write_digest(root, text) {
++            match crate::chat_context::write_digest(root, text, session_id) {
+                 Ok(()) => debug!("chat digest updated ({} chars)", text.chars().count()),
+                 Err(e) => warn!("failed to write chat digest: {}", e),
+             }
+diff --git a/lsp/src/acp_config.rs b/lsp/src/acp_config.rs
+new file mode 100644
+index 0000000..d6c0866
+--- /dev/null
++++ b/lsp/src/acp_config.rs
+@@ -0,0 +1,321 @@
++//! ACP セッション設定(モデル・思考レベル)のカタログ。
++//!
++//! [`crate::acp`] が Zed へ出すセレクタの選択肢と、選択値から
++//! `anthropic-agent-sdk` の [`anthropic_agent_sdk::ClaudeAgentOptions`] へ渡す値への
++//! 変換をここに集める。`acp.rs` は既に長いので、選択肢の定義とマッピングだけを
++//! 独立したモジュールに切り出した。
++//!
++//! # なぜ即座に切り替えられないか
++//!
++//! `anthropic-agent-sdk` はセッション途中のモデル/thinking切替を非対応で、
++//! `ClaudeSDKClient::set_model()` はローカルに保存するだけで `claude` CLI へは
++//! 届かない。このプロジェクトは ACP の `SessionId` を `claude` CLI の
++//! セッションID(UUID)としてそのまま使っているため、設定を変えるには
++//! 同じIDで `--resume` してプロセスを起こし直すしかない
++//! (`crate::acp` の `session/prompt` ハンドラがターンの頭でこれを行う)。
++
++use agent_client_protocol::schema::v1::{
++    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
++    SessionConfigOptionValue, SessionConfigSelect, SessionConfigSelectOption,
++    SessionConfigValueId,
++};
++use anthropic_agent_sdk::ClaudeSDKClient;
++
++/// モデル選択の `SessionConfigOption.id`。
++pub(crate) const CONFIG_ID_MODEL: &str = "model";
++/// 思考レベル(effort)選択の `SessionConfigOption.id`。
++pub(crate) const CONFIG_ID_EFFORT: &str = "effort";
++
++/// モデル/thinking の既定値を表す value id。選ぶと `claude` CLI にフラグを渡さず、
++/// CLI 自身の既定に任せる。
++const DEFAULT_VALUE_ID: &str = "default";
++
++/// モデルのエイリアス。`claude` CLI 側が常に最新のバージョンへ解決してくれるので、
++/// [`ClaudeSDKClient::supported_models`] の静的リスト(バージョン固定ID)が
++/// 古くなっても実用上困らない。
++const MODEL_ALIASES: &[(&str, &str)] = &[
++    (DEFAULT_VALUE_ID, "既定(CLI 任せ)"),
++    ("opus", "Opus"),
++    ("sonnet", "Sonnet"),
++    ("haiku", "Haiku"),
++    ("fable", "Fable"),
++];
++
++/// 思考レベル(effort)の選択肢。`max_thinking_tokens` へ写す。
++/// 値は Claude Code が使っている段階に合わせてある。
++const EFFORT_LEVELS: &[(&str, &str, Option<u32>)] = &[
++    (DEFAULT_VALUE_ID, "既定(CLI 任せ)", None),
++    ("off", "考えない", Some(0)),
++    ("low", "低", Some(4_000)),
++    ("medium", "中", Some(10_000)),
++    ("high", "高", Some(31_999)),
++    ("max", "最大", Some(63_999)),
++];
++
++/// セッションに現在適用されている(またはこれから適用する)モデル・思考レベル設定。
++///
++/// `None` は「`claude` CLI へフラグを渡さず、CLI 自身の既定に任せる」ことを意味する。
++/// GUI 上は [`DEFAULT_VALUE_ID`] として表現される。
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub(crate) struct SessionConfig {
++    pub(crate) model: Option<String>,
++    pub(crate) thinking_tokens: Option<u32>,
++}
++
++/// 現在の設定を Zed へ見せる `SessionConfigOption` の一覧に変換する。
++///
++/// `session/new` / `session/load` / `session/set_config_option` の3箇所で同じ関数を使う。
++/// `SetSessionConfigOptionResponse` は「全オプションの現在値」を返す規約なので、
++/// ここを共通化しないと片方だけ古い値を返しかねない。
++pub(crate) fn to_config_options(config: &SessionConfig) -> Vec<SessionConfigOption> {
++    let model_current = config.model.as_deref().unwrap_or(DEFAULT_VALUE_ID);
++    let model_options: Vec<SessionConfigSelectOption> = model_select_options();
++
++    let effort_current = effort_value_id_for(config.thinking_tokens);
++    let effort_options: Vec<SessionConfigSelectOption> = EFFORT_LEVELS
++        .iter()
++        .map(|(id, name, _)| SessionConfigSelectOption::new(SessionConfigValueId::new(*id), *name))
++        .collect();
++
++    vec![
++        SessionConfigOption::new(
++            SessionConfigId::new(CONFIG_ID_MODEL),
++            "モデル",
++            SessionConfigKind::Select(SessionConfigSelect::new(
++                SessionConfigValueId::new(model_current),
++                model_options,
++            )),
++        )
++        .category(SessionConfigOptionCategory::Model),
++        SessionConfigOption::new(
++            SessionConfigId::new(CONFIG_ID_EFFORT),
++            "思考レベル",
++            SessionConfigKind::Select(SessionConfigSelect::new(
++                SessionConfigValueId::new(effort_current),
++                effort_options,
++            )),
++        )
++        .category(SessionConfigOptionCategory::ThoughtLevel),
++    ]
++}
++
++/// モデルセレクタの選択肢。エイリアスを先頭に、`supported_models()` の
++/// バージョン固定IDを重複なく続ける。
++fn model_select_options() -> Vec<SessionConfigSelectOption> {
++    let mut seen: std::collections::HashSet<String> =
++        MODEL_ALIASES.iter().map(|(id, _)| (*id).to_string()).collect();
++    let mut options: Vec<SessionConfigSelectOption> = MODEL_ALIASES
++        .iter()
++        .map(|(id, name)| SessionConfigSelectOption::new(SessionConfigValueId::new(*id), *name))
++        .collect();
++
++    for model in ClaudeSDKClient::supported_models() {
++        if !seen.insert(model.id.clone()) {
++            continue;
++        }
++        let name = model.name.unwrap_or_else(|| model.id.clone());
++        options.push(SessionConfigSelectOption::new(
++            SessionConfigValueId::new(model.id),
++            name,
++        ));
++    }
++
++    options
++}
++
++/// `thinking_tokens` から対応する `EFFORT_LEVELS` の value id を逆引きする。
++/// 一覧に無い値(将来 GUI 外から設定された等)は "default" 扱いにはせず、
++/// 一番近いラベルを出すよりも「未知」を明示したいので `DEFAULT_VALUE_ID` にはしない。
++/// 現状は `apply()` 経由でしか `thinking_tokens` は変わらないため、常に一致するはず。
++fn effort_value_id_for(thinking_tokens: Option<u32>) -> &'static str {
++    EFFORT_LEVELS
++        .iter()
++        .find(|(_, _, tokens)| *tokens == thinking_tokens)
++        .map(|(id, _, _)| *id)
++        .unwrap_or(DEFAULT_VALUE_ID)
++}
++
++/// `session/set_config_option` で受け取った選択を `config` に適用する。
++///
++/// 未知の `config_id` / 未知の value id はエラー文字列を返す(呼び出し側でログに落とす)。
++pub(crate) fn apply(
++    config: &mut SessionConfig,
++    config_id: &str,
++    value: &SessionConfigOptionValue,
++) -> Result<(), String> {
++    let SessionConfigOptionValue::ValueId { value } = value else {
++        return Err(format!(
++            "config_id={} はブール値ではなく選択式です",
++            config_id
++        ));
++    };
++    let value_id = value.0.as_ref();
++
++    match config_id {
++        CONFIG_ID_MODEL => {
++            let known = MODEL_ALIASES.iter().any(|(id, _)| *id == value_id)
++                || ClaudeSDKClient::supported_models()
++                    .iter()
++                    .any(|m| m.id == value_id);
++            if !known {
++                return Err(format!("未知のモデルです: {}", value_id));
++            }
++            config.model = if value_id == DEFAULT_VALUE_ID {
++                None
++            } else {
++                Some(value_id.to_string())
++            };
++            Ok(())
++        }
++        CONFIG_ID_EFFORT => {
++            let Some((_, _, tokens)) = EFFORT_LEVELS.iter().find(|(id, _, _)| *id == value_id)
++            else {
++                return Err(format!("未知の思考レベルです: {}", value_id));
++            };
++            config.thinking_tokens = *tokens;
++            Ok(())
++        }
++        other => Err(format!("未知の config_id です: {}", other)),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn test_to_config_options_reflects_current_values() {
++        let config = SessionConfig {
++            model: Some("opus".to_string()),
++            thinking_tokens: Some(10_000),
++        };
++        let options = to_config_options(&config);
++        assert_eq!(options.len(), 2);
++
++        let SessionConfigKind::Select(select) = &options[0].kind else {
++            panic!("expected select");
++        };
++        assert_eq!(select.current_value, SessionConfigValueId::new("opus"));
++
++        let SessionConfigKind::Select(select) = &options[1].kind else {
++            panic!("expected select");
++        };
++        assert_eq!(select.current_value, SessionConfigValueId::new("medium"));
++    }
++
++    #[test]
++    fn test_to_config_options_default_is_default_id() {
++        let options = to_config_options(&SessionConfig::default());
++        let SessionConfigKind::Select(model) = &options[0].kind else {
++            panic!("expected select");
++        };
++        assert_eq!(model.current_value, SessionConfigValueId::new("default"));
++        let SessionConfigKind::Select(effort) = &options[1].kind else {
++            panic!("expected select");
++        };
++        assert_eq!(effort.current_value, SessionConfigValueId::new("default"));
++    }
++
++    #[test]
++    fn test_apply_model_alias() {
++        let mut config = SessionConfig::default();
++        apply(
++            &mut config,
++            CONFIG_ID_MODEL,
++            &SessionConfigOptionValue::value_id("sonnet"),
++        )
++        .unwrap();
++        assert_eq!(config.model, Some("sonnet".to_string()));
++    }
++
++    #[test]
++    fn test_apply_model_default_clears() {
++        let mut config = SessionConfig {
++            model: Some("opus".to_string()),
++            thinking_tokens: None,
++        };
++        apply(
++            &mut config,
++            CONFIG_ID_MODEL,
++            &SessionConfigOptionValue::value_id("default"),
++        )
++        .unwrap();
++        assert_eq!(config.model, None);
++    }
++
++    #[test]
++    fn test_apply_unknown_model_is_rejected() {
++        let mut config = SessionConfig::default();
++        let err = apply(
++            &mut config,
++            CONFIG_ID_MODEL,
++            &SessionConfigOptionValue::value_id("gpt-5"),
++        )
++        .unwrap_err();
++        assert!(err.contains("gpt-5"));
++    }
++
++    #[test]
++    fn test_apply_unknown_config_id_is_rejected() {
++        let mut config = SessionConfig::default();
++        let err = apply(
++            &mut config,
++            "not-a-real-option",
++            &SessionConfigOptionValue::value_id("default"),
++        )
++        .unwrap_err();
++        assert!(err.contains("not-a-real-option"));
++    }
++
++    #[test]
++    fn test_effort_levels_map_to_expected_thinking_tokens() {
++        let mut config = SessionConfig::default();
++        let expectations: &[(&str, Option<u32>)] = &[
++            ("default", None),
++            ("off", Some(0)),
++            ("low", Some(4_000)),
++            ("medium", Some(10_000)),
++            ("high", Some(31_999)),
++            ("max", Some(63_999)),
++        ];
++        for (id, expected) in expectations {
++            apply(
++                &mut config,
++                CONFIG_ID_EFFORT,
++                &SessionConfigOptionValue::value_id(*id),
++            )
++            .unwrap();
++            assert_eq!(config.thinking_tokens, *expected, "value id={}", id);
++        }
++    }
++
++    #[test]
++    fn test_apply_unknown_effort_is_rejected() {
++        let mut config = SessionConfig::default();
++        let err = apply(
++            &mut config,
++            CONFIG_ID_EFFORT,
++            &SessionConfigOptionValue::value_id("ultra"),
++        )
++        .unwrap_err();
++        assert!(err.contains("ultra"));
++    }
++
++    /// モデル候補にエイリアス5件が含まれ、`supported_models()` 由来のIDと重複しないこと。
++    #[test]
++    fn test_model_options_contain_aliases_without_duplicating_known_ids() {
++        let options = model_select_options();
++        for (id, _) in MODEL_ALIASES {
++            assert!(
++                options.iter().any(|o| o.value == SessionConfigValueId::new(*id)),
++                "missing alias {}",
++                id
++            );
++        }
++        let mut ids: Vec<&str> = options.iter().map(|o| o.value.0.as_ref()).collect();
++        let before = ids.len();
++        ids.sort_unstable();
++        ids.dedup();
++        assert_eq!(ids.len(), before, "duplicate ids in model options");
++    }
++}
+diff --git a/lsp/src/backend.rs b/lsp/src/backend.rs
+index e090f89..63a3482 100644
+--- a/lsp/src/backend.rs
++++ b/lsp/src/backend.rs
+@@ -20,7 +20,7 @@ use dashmap::try_result::TryResult;
+ use log::{debug, error, info, trace, warn};
+ use std::collections::HashMap;
+ use std::ops::DerefMut;
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ use std::str::FromStr;
+ use std::sync::Arc;
+ use tower_lsp_server::lsp_types::*;
+@@ -49,7 +49,6 @@ pub(crate) struct Backend {
+     // false にすると ACP エージェントのチャット要約を補完プロンプトへ埋め込まない
+     chat_context_enabled: std::sync::atomic::AtomicBool,
+     chat_context_max_chars: std::sync::atomic::AtomicUsize,
+-    chat_context_ttl_secs: std::sync::atomic::AtomicU64,
+ 
+     highlighter: Highlighter,
+     // デバッグビルド専用のDB操作
+@@ -168,21 +167,15 @@ impl LanguageServer for Backend {
+                     self.chat_context_max_chars
+                         .store(v as usize, std::sync::atomic::Ordering::Relaxed);
+                 }
+-                if let Some(v) = cc.get("ttl_secs").and_then(|v| v.as_u64()) {
+-                    self.chat_context_ttl_secs
+-                        .store(v, std::sync::atomic::Ordering::Relaxed);
+-                }
+             } else {
+                 debug!("no chat_context config; using defaults");
+             }
+             debug!(
+-                "chat_context effective: enabled={} max_chars={} ttl_secs={}",
++                "chat_context effective: enabled={} max_chars={}",
+                 self.chat_context_enabled
+                     .load(std::sync::atomic::Ordering::Relaxed),
+                 self.chat_context_max_chars
+                     .load(std::sync::atomic::Ordering::Relaxed),
+-                self.chat_context_ttl_secs
+-                    .load(std::sync::atomic::Ordering::Relaxed),
+             );
+ 
+             if let Some(llm_root) = opt.get("llm") {
+@@ -475,15 +468,15 @@ impl LanguageServer for Backend {
+                     let content = match tokio::fs::read_to_string(&path).await {
+                         Ok(c) => c,
+                         Err(e) => {
+-                            warn!(
+-                                "did_change_watched_files: failed to read {:?}: {}",
+-                                path, e
+-                            );
++                            warn!("did_change_watched_files: failed to read {:?}: {}", path, e);
+                             continue;
+                         }
+                     };
+                     if self.character_store.reconcile(&ws, &path, content) {
+-                        debug!("did_change_watched_files: 外部変更として取り込み: {:?}", path);
++                        debug!(
++                            "did_change_watched_files: 外部変更として取り込み: {:?}",
++                            path
++                        );
+                         any_changed = true;
+                     } else {
+                         debug!(
+@@ -1301,9 +1294,6 @@ impl Backend {
+             chat_context_max_chars: std::sync::atomic::AtomicUsize::new(
+                 crate::chat_context::DEFAULT_MAX_CHARS,
+             ),
+-            chat_context_ttl_secs: std::sync::atomic::AtomicU64::new(
+-                crate::chat_context::DEFAULT_TTL_SECS,
+-            ),
+             highlighter: Highlighter::new(),
+             db: Arc::new(FlightRecorder::open_default()),
+             character_store: CharacterStore::new(),
+@@ -1346,11 +1336,8 @@ impl Backend {
+         if !self.chat_context_enabled.load(Relaxed) {
+             return String::new();
+         }
+-        match crate::chat_context::read_digest(
+-            workspace,
+-            self.chat_context_max_chars.load(Relaxed),
+-            std::time::Duration::from_secs(self.chat_context_ttl_secs.load(Relaxed)),
+-        ) {
++        match crate::chat_context::read_digest(workspace, self.chat_context_max_chars.load(Relaxed))
++        {
+             Some(digest) => format!(
+                 "# 作者がいま書こうとしていること\n\n{}\n\nこれは作者との会話から要約したもので、本文ではない。続きを考える手掛かりとしてのみ使い、この文面をそのまま候補に含めてはならない。\n",
+                 digest
+diff --git a/lsp/src/character.rs b/lsp/src/character.rs
+index 07fac21..04c77bb 100644
+--- a/lsp/src/character.rs
++++ b/lsp/src/character.rs
+@@ -305,7 +305,10 @@ impl CharacterStore {
+         let guard = self.0.workspaces.lock();
+         let Some(files) = guard.get(workspace_root) else {
+             return Err(LlmError::GenericError {
+-                message: format!("No character files loaded for workspace {:?}", workspace_root),
++                message: format!(
++                    "No character files loaded for workspace {:?}",
++                    workspace_root
++                ),
+             });
+         };
+         for file in files.values() {
+@@ -352,7 +355,12 @@ impl CharacterStore {
+     /// 直前の自己書き込みハッシュと一致すればエコーとして無視し`false`を返す。
+     /// 不一致なら真の外部変更としてメモリを全置換し`true`を返す
+     /// (呼び出し側は`true`のときだけ`refresh_highlight_names`等の後続処理をする)。
+-    pub(crate) fn reconcile(&self, workspace_root: &Path, path: &Path, disk_content: String) -> bool {
++    pub(crate) fn reconcile(
++        &self,
++        workspace_root: &Path,
++        path: &Path,
++        disk_content: String,
++    ) -> bool {
+         let hash = hash_content(&disk_content);
+         let mut guard = self.0.workspaces.lock();
+         let files = guard.entry(workspace_root.to_path_buf()).or_default();
+@@ -361,7 +369,10 @@ impl CharacterStore {
+         {
+             return false;
+         }
+-        files.insert(path.to_path_buf(), CharacterFile::from_content(disk_content));
++        files.insert(
++            path.to_path_buf(),
++            CharacterFile::from_content(disk_content),
++        );
+         true
+     }
+ 
+@@ -461,17 +472,6 @@ pub(crate) fn comrak_options() -> comrak::Options<'static> {
+     options
+ }
+ 
+-/// Markdown 文字列からキャラクターレベルを推定する。
+-///
+-/// `detect_char_level` の文字列入力版。`character_updater` 等で共有する。
+-/// 検出できない場合は `0` を返す。
+-pub(crate) fn detect_char_level_str(text: &str) -> u8 {
+-    let arena = Arena::new();
+-    let options = comrak_options();
+-    let root = comrak::parse_document(&arena, text, &options);
+-    detect_char_level(root)
+-}
+-
+ /// Markdown 文字列をパースし、全キャラクターの全セクションを `HashMap` で返す。
+ ///
+ /// キーは heading 全文（例: "ジェフ・クライン（艦長）"）。
+@@ -737,7 +737,10 @@ mod tests {
+         let result = store.search(
+             &root,
+             "クライン",
+-            &[CharacterAttribute::Background, CharacterAttribute::Personality],
++            &[
++                CharacterAttribute::Background,
++                CharacterAttribute::Personality,
++            ],
+         );
+         assert!(result.is_ok(), "{:?}", result);
+         let text = result.unwrap();
+@@ -776,6 +779,14 @@ mod tests {
+         );
+     }
+ 
++    /// `detect_char_level` のテスト用ヘルパ: Markdown文字列をパースしてから渡す。
++    fn detect_char_level_str(text: &str) -> u8 {
++        let arena = Arena::new();
++        let options = comrak_options();
++        let root = comrak::parse_document(&arena, text, &options);
++        detect_char_level(root)
++    }
++
+     #[test]
+     fn test_detect_char_level_str_with_story_heading() {
+         // # Story / ## キャラ / ### 属性 の構造
+@@ -949,7 +960,9 @@ mod tests {
+             "
+         );
+         let (store, root) = make_store(&[("characters.md", MD)]);
+-        let md = store.lookup_markdown(&root, "隊長").expect("aliasで見つかるはず");
++        let md = store
++            .lookup_markdown(&root, "隊長")
++            .expect("aliasで見つかるはず");
+         assert!(md.contains("艦長"), "{}", md);
+     }
+ 
+diff --git a/lsp/src/chat_context.rs b/lsp/src/chat_context.rs
+index 981693c..15bfe9d 100644
+--- a/lsp/src/chat_context.rs
++++ b/lsp/src/chat_context.rs
+@@ -8,53 +8,68 @@
+ //!
+ //! - 書き手は ACP エージェント(1ターンごとに要約を上書き)
+ //! - 読み手は LSP サーバ(補完・code action のプロンプト組み立て時)
++//!
++//! # 所有者マーカー
++//!
++//! `chat_context.md` はワークスペースに1つしか無いため、複数の ACP セッションが
++//! 同じワークスペースで行き来すると「どのセッションの要約か」が分からなくなる。
++//! これをかつては時間(TTL)で誤魔化していたが、[`crate::session_log`] により
++//! セッションごとの会話履歴を正確に扱えるようになったので、代わりに
++//! `chat_context.owner`(中身はセッションID1行)へ所有者を記録し、
++//! [`crate::acp`] がセッションの境界(`session/new`/`session/load`)で
++//! 明示的に切り替える方式にした。
+ 
+ use std::path::{Path, PathBuf};
+-use std::time::{Duration, SystemTime};
+ 
+ /// ワークスペース直下に掘る作業ディレクトリ名。
+-const DIR_NAME: &str = ".fifty_four";
++///
++/// [`crate::session_log`] もセッションログの保存先(`<DIR_NAME>/sessions/`)として
++/// このディレクトリを共有する。
++pub(crate) const DIR_NAME: &str = ".fifty_four";
+ 
+ /// チャット要約の保存ファイル名。
+ const FILE_NAME: &str = "chat_context.md";
+ 
++/// 要約の所有者(セッションID)を記録するファイル名。
++const OWNER_FILE_NAME: &str = "chat_context.owner";
++
+ /// プロンプトへ埋め込む要約の既定上限(文字数)。
+ ///
+ /// 補完は速度優先のターンなので、会話が長くなっても本文(`{{TEXT}}`)を
+ /// 押しのけない程度に抑える。
+ pub(crate) const DEFAULT_MAX_CHARS: usize = 1200;
+ 
+-/// 要約を有効とみなす既定の鮮度(秒)。
+-///
+-/// 昨日の会話が今日の補完に混ざるのを防ぐ。既定は 12 時間。
+-pub(crate) const DEFAULT_TTL_SECS: u64 = 12 * 60 * 60;
+-
+ /// 受け渡しファイルのパスを返す。
+ pub(crate) fn digest_path(root: &Path) -> PathBuf {
+     root.join(DIR_NAME).join(FILE_NAME)
+ }
+ 
+-/// 要約を原子的に書き出す。
++/// 所有者マーカーのパスを返す。
++fn owner_path(root: &Path) -> PathBuf {
++    root.join(DIR_NAME).join(OWNER_FILE_NAME)
++}
++
++/// `.fifty_four/` 直下へ1ファイルを原子的に書き出す。
+ ///
+ /// 一時ファイルへ書いてから `rename` する。読み手(LSP)は補完のたびに
+ /// 無条件でこのファイルを読むため、書きかけの内容を読ませないことが重要。
+ /// 同一ディレクトリ内の `rename` は同一ファイルシステム上なので原子的に行われる。
+-pub(crate) fn write_digest(root: &Path, digest: &str) -> std::io::Result<()> {
+-    let dir = root.join(DIR_NAME);
+-    std::fs::create_dir_all(&dir)?;
++#[cfg_attr(not(debug_assertions), allow(dead_code))]
++fn write_atomic(dir: &Path, file_name: &str, content: &str) -> std::io::Result<()> {
++    std::fs::create_dir_all(dir)?;
+ 
+     // 並列書き込み・複数プロセスの衝突を避けるため一時ファイル名に PID+連番を含める
+     // (`Highlighter::rebuild_user_dictionary` と同じ方式)。
+     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+     let tmp = dir.join(format!(
+         ".{}.{}.{}.tmp",
+-        FILE_NAME,
++        file_name,
+         std::process::id(),
+         COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+     ));
+ 
+-    std::fs::write(&tmp, digest)?;
+-    if let Err(e) = std::fs::rename(&tmp, dir.join(FILE_NAME)) {
++    std::fs::write(&tmp, content)?;
++    if let Err(e) = std::fs::rename(&tmp, dir.join(file_name)) {
+         // rename に失敗したら一時ファイルを残さない(次回以降のゴミを作らない)。
+         let _ = std::fs::remove_file(&tmp);
+         return Err(e);
+@@ -62,28 +77,30 @@ pub(crate) fn write_digest(root: &Path, digest: &str) -> std::io::Result<()> {
+     Ok(())
+ }
+ 
++/// 要約とその所有者(セッションID)を原子的に書き出す。
++///
++/// 書き手は `writing_agent`(debugビルド限定)のみなので、releaseビルドでは未使用になる。
++#[cfg_attr(not(debug_assertions), allow(dead_code))]
++pub(crate) fn write_digest(root: &Path, digest: &str, session_id: &str) -> std::io::Result<()> {
++    let dir = root.join(DIR_NAME);
++    write_atomic(&dir, FILE_NAME, digest)?;
++    write_atomic(&dir, OWNER_FILE_NAME, session_id)
++}
++
+ /// 要約を読み出す。プロンプトへ埋め込めない状態なら `None`。
+ ///
+ /// `None` を返すのは次の場合:
+ /// - ファイルが無い(まだ一度もチャットしていない)
+-/// - 最終更新が `ttl` より古い(会話が古すぎて今書いている場面と関係ない)
+ /// - 中身が空白のみ
+ ///
+ /// `max_chars` を超える場合は**古い側(先頭)から**切り落とす。要約は
+ /// 新しい話題ほど後ろに来るため、末尾を残す方が「いま何を書こうとしているか」に近い。
+-pub(crate) fn read_digest(root: &Path, max_chars: usize, ttl: Duration) -> Option<String> {
++///
++/// 以前は「最終更新から一定時間(TTL)を過ぎたら無効」という鮮度チェックもあったが、
++/// [`owner`] によるセッション単位の明示的な切り替え([`crate::acp`] 参照)に
++/// 置き換えたため廃止した。
++pub(crate) fn read_digest(root: &Path, max_chars: usize) -> Option<String> {
+     let path = digest_path(root);
+-
+-    // 鮮度の判定。mtime が取れない環境では鮮度チェックを諦めて内容を採用する
+-    // (取れないことを理由に機能ごと無効化はしない)。
+-    if let Ok(meta) = std::fs::metadata(&path)
+-        && let Ok(modified) = meta.modified()
+-        && let Ok(age) = SystemTime::now().duration_since(modified)
+-        && age > ttl
+-    {
+-        return None;
+-    }
+-
+     let body = std::fs::read_to_string(&path).ok()?;
+     let body = body.trim();
+     if body.is_empty() {
+@@ -92,6 +109,35 @@ pub(crate) fn read_digest(root: &Path, max_chars: usize, ttl: Duration) -> Optio
+     Some(tail_chars(body, max_chars))
+ }
+ 
++/// 要約を現在所有しているセッションIDを読む。無ければ `None`。
++#[cfg_attr(not(debug_assertions), allow(dead_code))]
++pub(crate) fn owner(root: &Path) -> Option<String> {
++    let body = std::fs::read_to_string(owner_path(root)).ok()?;
++    let body = body.trim();
++    if body.is_empty() {
++        None
++    } else {
++        Some(body.to_string())
++    }
++}
++
++/// 要約と所有者マーカーの両方を消す。
++///
++/// 「新しい会話なので前の要約を引き継がない」(`session/new`)、
++/// 「復元先セッションに要約の材料が無いので古い所有者のものを残さない」
++/// (`session/load`)の両方で使う。ファイルが元から無い場合はエラーにしない。
++#[cfg_attr(not(debug_assertions), allow(dead_code))]
++pub(crate) fn clear(root: &Path) -> std::io::Result<()> {
++    for path in [digest_path(root), owner_path(root)] {
++        if let Err(e) = std::fs::remove_file(&path)
++            && e.kind() != std::io::ErrorKind::NotFound
++        {
++            return Err(e);
++        }
++    }
++    Ok(())
++}
++
+ /// 末尾から `max_chars` 文字を残して返す。`max_chars` 以下ならそのまま。
+ ///
+ /// バイト単位ではなく文字単位で切るため、日本語でも文字境界を壊さない。
+@@ -118,51 +164,44 @@ mod tests {
+     #[test]
+     fn test_write_then_read_roundtrip() {
+         let root = fresh_root("roundtrip");
+-        write_digest(&root, "いまは第3章の別れの場面を書いている。").unwrap();
++        write_digest(&root, "いまは第3章の別れの場面を書いている。", "s1").unwrap();
+ 
+-        let got = read_digest(&root, DEFAULT_MAX_CHARS, Duration::from_secs(3600)).unwrap();
++        let got = read_digest(&root, DEFAULT_MAX_CHARS).unwrap();
+         assert_eq!(got, "いまは第3章の別れの場面を書いている。");
+     }
+ 
+     #[test]
+     fn test_read_missing_file_returns_none() {
+         let root = fresh_root("missing");
+-        assert!(read_digest(&root, DEFAULT_MAX_CHARS, Duration::from_secs(3600)).is_none());
++        assert!(read_digest(&root, DEFAULT_MAX_CHARS).is_none());
+     }
+ 
+     #[test]
+     fn test_read_blank_content_returns_none() {
+         let root = fresh_root("blank");
+-        write_digest(&root, "   \n\n  ").unwrap();
+-        assert!(read_digest(&root, DEFAULT_MAX_CHARS, Duration::from_secs(3600)).is_none());
+-    }
+-
+-    #[test]
+-    fn test_read_expired_returns_none() {
+-        let root = fresh_root("expired");
+-        write_digest(&root, "古い会話").unwrap();
+-        // TTL 0 なら書いた直後でも「古い」と判定される
+-        assert!(read_digest(&root, DEFAULT_MAX_CHARS, Duration::from_secs(0)).is_none());
++        write_digest(&root, "   \n\n  ", "s1").unwrap();
++        assert!(read_digest(&root, DEFAULT_MAX_CHARS).is_none());
+     }
+ 
+     #[test]
+     fn test_read_trims_from_the_head() {
+         let root = fresh_root("trim");
+-        write_digest(&root, "あいうえおかきくけこ").unwrap();
++        write_digest(&root, "あいうえおかきくけこ", "s1").unwrap();
+ 
+         // 新しい話題(末尾)が残ること
+-        let got = read_digest(&root, 3, Duration::from_secs(3600)).unwrap();
++        let got = read_digest(&root, 3).unwrap();
+         assert_eq!(got, "くけこ");
+     }
+ 
+     #[test]
+     fn test_write_overwrites_previous_digest() {
+         let root = fresh_root("overwrite");
+-        write_digest(&root, "ふるい").unwrap();
+-        write_digest(&root, "あたらしい").unwrap();
++        write_digest(&root, "ふるい", "s1").unwrap();
++        write_digest(&root, "あたらしい", "s2").unwrap();
+ 
+-        let got = read_digest(&root, DEFAULT_MAX_CHARS, Duration::from_secs(3600)).unwrap();
++        let got = read_digest(&root, DEFAULT_MAX_CHARS).unwrap();
+         assert_eq!(got, "あたらしい");
++        assert_eq!(owner(&root).unwrap(), "s2");
+ 
+         // 一時ファイルが残っていないこと
+         let leftovers: Vec<_> = std::fs::read_dir(root.join(DIR_NAME))
+@@ -173,6 +212,33 @@ mod tests {
+         assert!(leftovers.is_empty(), "一時ファイルが残っている");
+     }
+ 
++    #[test]
++    fn test_owner_roundtrip() {
++        let root = fresh_root("owner_roundtrip");
++        assert!(owner(&root).is_none());
++        write_digest(&root, "会話の要約", "session-abc").unwrap();
++        assert_eq!(owner(&root).unwrap(), "session-abc");
++    }
++
++    #[test]
++    fn test_clear_removes_digest_and_owner() {
++        let root = fresh_root("clear");
++        write_digest(&root, "消えるはずの要約", "s1").unwrap();
++        assert!(read_digest(&root, DEFAULT_MAX_CHARS).is_some());
++        assert!(owner(&root).is_some());
++
++        clear(&root).unwrap();
++
++        assert!(read_digest(&root, DEFAULT_MAX_CHARS).is_none());
++        assert!(owner(&root).is_none());
++    }
++
++    #[test]
++    fn test_clear_on_missing_files_is_not_an_error() {
++        let root = fresh_root("clear_missing");
++        clear(&root).unwrap();
++    }
++
+     #[test]
+     fn test_tail_chars_keeps_multibyte_boundaries() {
+         assert_eq!(tail_chars("あいう", 10), "あいう");
+diff --git a/lsp/src/main.rs b/lsp/src/main.rs
+index 719afb7..e1452bc 100644
+--- a/lsp/src/main.rs
++++ b/lsp/src/main.rs
+@@ -1,6 +1,14 @@
+ // シンプルな LSP サーバの実装例（tower-lsp を利用）
+ // このファイルは最小限の動作をする "何もしない" サーバを提供します。
++/// ACP エージェントは debug ビルド限定。
++///
++/// LLM アクセスに作者自身の `claude` CLI のログイン(= サブスクリプション枠)を
++/// そのまま使うため、配布物に載せて第三者へ提供することは Anthropic の規約上できない。
++/// 注意書きではなくバイナリの性質として落としておく。
++#[cfg(debug_assertions)]
+ mod acp;
++#[cfg(debug_assertions)]
++mod acp_config;
+ mod assets;
+ mod backend;
+ mod chat_context;
+@@ -15,12 +23,17 @@ mod highlight;
+ mod llm;
+ mod logging;
+ mod progress;
++#[cfg(debug_assertions)]
++mod session_log;
+ mod text;
+ mod tools;
+ mod types;
++#[cfg(debug_assertions)]
+ mod writing_agent;
+ 
+ use crate::backend::Backend;
++// `error` はACP経路(debugビルド限定)のエラーハンドリングでのみ使う。
++#[cfg_attr(not(debug_assertions), allow(unused_imports))]
+ use log::{error, info};
+ 
+ /// ローカル開発用に、ソースリポジトリのルートにある `.env` を読み込む(debug ビルドのみ)。
+@@ -39,18 +52,69 @@ fn load_dev_env() {
+     }
+ }
+ 
++/// `claude` CLI にサブスクリプション枠を使わせるため、Anthropic の API 資格情報を
++/// プロセス環境から取り除く。
++///
++/// SDK は子プロセスへ親の環境を丸ごと渡すので(`env::vars()` → `Command::envs`)、
++/// `ClaudeAgentOptions::env` では打ち消せない。認証解決は
++/// `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → ログイン済みプロファイルの順で、
++/// キーが在る限り先に勝つため、実際に消すしかない。
++///
++/// # Safety
++/// `remove_var` は他スレッドが環境を読んでいると UB。tokio ランタイムを起こす前の
++/// シングルスレッドな時点でのみ呼ぶこと。
++#[cfg(debug_assertions)]
++fn scrub_anthropic_credentials() {
++    for key in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] {
++        if std::env::var_os(key).is_some() {
++            // ログ初期化前なので eprintln!。黙って消すと
++            // 「なぜ自分のキーが効かないのか」を追えない。
++            eprintln!(
++                "--acp: {} を無視します(claude CLI のサブスクリプション枠で動かすため)",
++                key
++            );
++            unsafe { std::env::remove_var(key) };
++        }
++    }
++}
++
+ /// プログラムのエントリポイント。
+ ///
++/// `--acp` の有無に応じた環境変数の準備を、Tokio ランタイム(マルチスレッド)を
++/// 起動する**前**に済ませるため、素の `fn` として `async_main` から分離している
++/// (`std::env::remove_var` は他スレッドが環境を読んでいると UB であり、
++/// ワーカースレッドが立った後では安全に呼べない)。
++fn main() {
++    let acp = std::env::args().skip(1).any(|a| a == "--acp");
++
++    // ここはまだシングルスレッド。環境変数の操作は他スレッドが立つ前に済ませる。
++    #[cfg(not(debug_assertions))]
++    if acp {
++        eprintln!(
++            "fifty_four_lsp: --acp は debug ビルド限定です \
++             (claude CLI のサブスクリプション枠を使うため、配布物には含めていません)"
++        );
++        std::process::exit(1);
++    }
++
++    #[cfg(debug_assertions)]
++    if acp {
++        // ACP 経路は provider の API キーを一切必要としない(LLM は claude CLI 経由)。
++        // .env を読む理由が無いので読まない。
++        scrub_anthropic_credentials();
++    } else {
++        load_dev_env();
++    }
++
++    async_main(acp)
++}
++
+ /// Tokio のランタイム上で動作し、標準入出力を通じてクライアントと通信します。
+-/// 既定では LSP サーバとして動作し、`--acp` を付けると ACP エージェント
++/// 既定では LSP サーバとして動作し、`acp=true` なら ACP エージェント
+ /// (Zed の Agent Panel から `agent_servers` 経由で起動される)として動作します。
+ /// どちらも stdio を JSON-RPC のチャネルとして使うため、ログは stderr へ出す。
+ #[tokio::main]
+-async fn main() {
+-    // 環境変数の初期化
+-    #[cfg(debug_assertions)]
+-    load_dev_env();
+-
++async fn async_main(acp: bool) {
+     env_logger::Builder::from_default_env()
+         .format_target(false)
+         .format_module_path(false)
+@@ -58,14 +122,19 @@ async fn main() {
+         .target(env_logger::Target::Stderr)
+         .init();
+ 
+-    if std::env::args().skip(1).any(|a| a == "--acp") {
+-        if let Err(e) = acp::run().await {
+-            // 設定不備などはここで落ちる。Zed のログに理由が残るよう stderr にも出す。
+-            error!("{}", e);
+-            eprintln!("fifty_four_lsp --acp: {}", e);
+-            std::process::exit(1);
++    if acp {
++        #[cfg(debug_assertions)]
++        {
++            if let Err(e) = acp::run().await {
++                // 設定不備などはここで落ちる。Zed のログに理由が残るよう stderr にも出す。
++                error!("{}", e);
++                eprintln!("fifty_four_lsp --acp: {}", e);
++                std::process::exit(1);
++            }
++            return;
+         }
+-        return;
++        #[cfg(not(debug_assertions))]
++        unreachable!("--acp は main で弾いている");
+     }
+ 
+     // 標準入力／出力を LSP の通信チャネルとして利用
+diff --git a/lsp/src/session_log.rs b/lsp/src/session_log.rs
+new file mode 100644
+index 0000000..01afecf
+--- /dev/null
++++ b/lsp/src/session_log.rs
+@@ -0,0 +1,197 @@
++//! ACP セッションの会話ログを、プロセス再起動をまたいで永続化する。
++//!
++//! [`crate::acp`] の `Session::turns` はプロセスのメモリ上にしか無く、
++//! `fifty_four_lsp --acp` が再起動すると失われる。ACP の仕様は `session/load` で
++//! 会話全体を `session/update` 通知としてリプレイすることを要求しているため
++//! (応答を返す前に MUST)、リプレイ元になるデータをどこかへ残しておく必要がある。
++//!
++//! `claude` CLI 自身もディスクへ会話を永続化しているが、保存先パス(cwdを
++//! ハッシュ化したディレクトリ名)は非公開仕様でバージョン間の互換性が保証されない。
++//! そこで `chat_context.rs` と同じ発想で、こちらの管理下にある
++//! `.fifty_four/sessions/<session_id>.jsonl.gz` へ自前で逐次追記する。
++//!
++//! # フォーマット
++//!
++//! 1ターン = 1行の JSON([`crate::acp::ChatTurn`] をそのままシリアライズしたもの)を、
++//! gzip の「独立したメンバーを単純に連結してよい」という性質を使って1メンバーずつ
++//! 追記する。これにより `chat_context::write_digest` と同じ append-only な書き方を、
++//! 圧縮ありのまま維持できる(読み直し・再圧縮が不要)。読み出し側は
++//! [`flate2::read::MultiGzDecoder`] を使うことで、連結された複数メンバーを
++//! 意識せず1本のストリームとして読める。
++//!
++//! 保持期間の制限(TTL)は設けていない。ログは増え続けるので、容量が気になる場合は
++//! [`crate::chat_context::DEFAULT_TTL_SECS`] と同様の仕組みをここへ足す余地がある。
++
++use crate::acp::ChatTurn;
++use flate2::Compression;
++use flate2::read::MultiGzDecoder;
++use flate2::write::GzEncoder;
++use std::fs::OpenOptions;
++use std::io::{Read, Write};
++use std::path::{Path, PathBuf};
++
++#[allow(unused_imports)]
++use log::warn;
++
++/// セッションログを置くサブディレクトリ名(`.fifty_four/` 直下)。
++const SESSIONS_DIR: &str = "sessions";
++
++/// セッションログのファイルパスを返す。
++fn log_path(root: &Path, session_id: &str) -> PathBuf {
++    root.join(crate::chat_context::DIR_NAME)
++        .join(SESSIONS_DIR)
++        .join(format!("{}.jsonl.gz", session_id))
++}
++
++/// 1ターンを末尾へ追記する。
++///
++/// セッションIDごとに `session/prompt` は直列に処理されるため
++/// (`crate::acp` の `sessions` ロック参照)、書き込みの競合は起きない。
++/// 失敗しても呼び出し側は `warn!` に落として会話自体は止めない
++/// (`chat_context::write_digest` の失敗時と同じ扱い)。
++#[cfg_attr(not(debug_assertions), allow(dead_code))]
++pub(crate) fn append_turn(root: &Path, session_id: &str, turn: &ChatTurn) -> std::io::Result<()> {
++    let dir = root.join(crate::chat_context::DIR_NAME).join(SESSIONS_DIR);
++    std::fs::create_dir_all(&dir)?;
++
++    let line = serde_json::to_string(turn)
++        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
++
++    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
++    encoder.write_all(line.as_bytes())?;
++    encoder.write_all(b"\n")?;
++    let member = encoder.finish()?;
++
++    let mut file = OpenOptions::new()
++        .create(true)
++        .append(true)
++        .open(log_path(root, session_id))?;
++    file.write_all(&member)
++}
++
++/// 過去の全ターンを読み出す。
++///
++/// ログが無い(初回・旧セッション・削除済み)場合は空の `Vec` を返す。
++/// 壊れた行が混ざっていても、その行だけ読み飛ばして残りは返す
++/// (`parse_rate_limit_event` と同じ「取れなければ諦めて続行する」方針)。
++#[cfg_attr(not(debug_assertions), allow(dead_code))]
++pub(crate) fn read_turns(root: &Path, session_id: &str) -> Vec<ChatTurn> {
++    let path = log_path(root, session_id);
++    let Ok(file) = std::fs::File::open(&path) else {
++        return Vec::new();
++    };
++
++    let mut decoder = MultiGzDecoder::new(file);
++    let mut content = String::new();
++    if let Err(e) = decoder.read_to_string(&mut content) {
++        warn!(
++            "acp: セッションログの展開に失敗しました({}): {}",
++            path.display(),
++            e
++        );
++        return Vec::new();
++    }
++
++    content
++        .lines()
++        .filter(|line| !line.trim().is_empty())
++        .filter_map(|line| match serde_json::from_str::<ChatTurn>(line) {
++            Ok(turn) => Some(turn),
++            Err(e) => {
++                warn!("acp: セッションログの1行を読み飛ばしました: {}", e);
++                None
++            }
++        })
++        .collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::acp::Speaker;
++
++    fn fresh_root(name: &str) -> PathBuf {
++        let dir = std::env::temp_dir().join(format!("ff_session_log_{}", name));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        dir
++    }
++
++    fn turn(speaker: Speaker, text: &str) -> ChatTurn {
++        ChatTurn {
++            speaker,
++            text: text.to_string(),
++        }
++    }
++
++    #[test]
++    fn test_append_then_read_roundtrip_preserves_order() {
++        let root = fresh_root("roundtrip");
++        append_turn(&root, "s1", &turn(Speaker::Author, "1ターン目")).unwrap();
++        append_turn(&root, "s1", &turn(Speaker::Agent, "応答1")).unwrap();
++        append_turn(&root, "s1", &turn(Speaker::Author, "2ターン目")).unwrap();
++
++        let got = read_turns(&root, "s1");
++        assert_eq!(got.len(), 3);
++        assert_eq!(got[0].speaker, Speaker::Author);
++        assert_eq!(got[0].text, "1ターン目");
++        assert_eq!(got[1].speaker, Speaker::Agent);
++        assert_eq!(got[1].text, "応答1");
++        assert_eq!(got[2].text, "2ターン目");
++    }
++
++    #[test]
++    fn test_read_missing_file_returns_empty() {
++        let root = fresh_root("missing");
++        assert!(read_turns(&root, "no-such-session").is_empty());
++    }
++
++    #[test]
++    fn test_read_skips_corrupted_line_but_keeps_others() {
++        let root = fresh_root("corrupted");
++        append_turn(&root, "s1", &turn(Speaker::Author, "壊れていない発話1")).unwrap();
++
++        // 壊れた1行(有効なgzipメンバーだが中身がJSONとして不正)を手動で追記する。
++        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
++        encoder.write_all(b"not valid json\n").unwrap();
++        let member = encoder.finish().unwrap();
++        let mut file = OpenOptions::new()
++            .append(true)
++            .open(log_path(&root, "s1"))
++            .unwrap();
++        file.write_all(&member).unwrap();
++
++        append_turn(&root, "s1", &turn(Speaker::Agent, "壊れていない発話2")).unwrap();
++
++        let got = read_turns(&root, "s1");
++        assert_eq!(got.len(), 2);
++        assert_eq!(got[0].text, "壊れていない発話1");
++        assert_eq!(got[1].text, "壊れていない発話2");
++    }
++
++    #[test]
++    fn test_speaker_serde_uses_snake_case() {
++        let json = serde_json::to_string(&Speaker::Author).unwrap();
++        assert_eq!(json, "\"author\"");
++        let json = serde_json::to_string(&Speaker::Agent).unwrap();
++        assert_eq!(json, "\"agent\"");
++    }
++
++    #[test]
++    fn test_log_uses_gzip_multi_member_and_is_smaller_than_plain_text_for_repetitive_text() {
++        let root = fresh_root("compressed");
++        let long_text = "同じ話題について長めに話す。".repeat(50);
++        for _ in 0..5 {
++            append_turn(&root, "s1", &turn(Speaker::Author, &long_text)).unwrap();
++        }
++        let compressed_len = std::fs::metadata(log_path(&root, "s1")).unwrap().len() as usize;
++        let plain_len = long_text.len() * 5;
++        assert!(
++            compressed_len < plain_len,
++            "compressed({}) should be smaller than plain({})",
++            compressed_len,
++            plain_len
++        );
++        assert_eq!(read_turns(&root, "s1").len(), 5);
++    }
++}
+diff --git a/lsp/src/writing_agent.rs b/lsp/src/writing_agent.rs
+index 6fe0083..7c766e3 100644
+--- a/lsp/src/writing_agent.rs
++++ b/lsp/src/writing_agent.rs
+@@ -29,6 +29,7 @@
+ //! --allowedTools Read,Write,Edit,Glob,Grep,WebSearch,WebFetch
+ //! ```
+ 
++use crate::acp_config::SessionConfig;
+ use anthropic_agent_sdk::{
+     ClaudeAgentOptions, ClaudeSDKClient, ContentBlock, Message, PermissionMode, StreamExt, query,
+ };
+@@ -64,6 +65,26 @@ pub(crate) struct AgentError {
+ 
+ impl std::error::Error for AgentError {}
+ 
++/// サブスクリプション枠(5時間枠)の状況。`claude` CLI が流す `rate_limit_event` から拾う。
++///
++/// SDK にも ACP にも対応する型が無いので、こちらで生JSONから最小限だけ読む
++/// (詳細は [`parse_rate_limit_event`] 参照)。
++#[derive(Debug, Clone, PartialEq)]
++pub(crate) struct RateLimit {
++    /// 枠の使用率 (0.0..=100.0)。
++    pub(crate) utilization: f64,
++    /// 枠がリセットされる時刻(表示用。取れなければ `None`)。
++    pub(crate) resets_at: Option<String>,
++}
++
++/// 1ターンの応答。
++pub(crate) struct TurnReply {
++    /// 応答テキストの全文(要約の材料)。
++    pub(crate) text: String,
++    /// このターン中に `rate_limit_event` が来ていれば、最後(=最新)の1件。
++    pub(crate) rate_limit: Option<RateLimit>,
++}
++
+ /// 作者と対話する執筆相談エージェント。
+ ///
+ /// 実装は [`ClaudeAgent`]。テストでは差し替えられるようトレイトにしてある。
+@@ -72,12 +93,11 @@ pub(crate) trait WritingAgent: Send + Sync + std::fmt::Debug {
+     /// 1ターン投げて応答を得る。
+     ///
+     /// 応答テキストは届いた順に `on_chunk` へ渡す(ACP の `AgentMessageChunk` へ流すため)。
+-    /// 返り値は同じテキストの全文で、要約の材料に使う。
+     async fn prompt(
+         &self,
+         text: &str,
+         on_chunk: &mut (dyn FnMut(String) + Send),
+-    ) -> Result<String, AgentError>;
++    ) -> Result<TurnReply, AgentError>;
+ 
+     /// 進行中のターンを中断する(ACP の `session/cancel` 用)。
+     async fn interrupt(&self) -> Result<(), AgentError>;
+@@ -104,15 +124,47 @@ impl ClaudeAgent {
+     /// ワークスペース `root` に紐づくエージェントを起動する。
+     ///
+     /// `system_prompt` は Claude Code の既定プロンプトを**置き換える**(追記ではない)。
+-    pub(crate) async fn start(root: &Path, system_prompt: String) -> Result<Self, AgentError> {
++    ///
++    /// `session_id` は `claude` CLI 自身のセッションID(UUID形式)。`resume=false` なら
++    /// `--session-id` でこのIDを新規セッションに割り当て、`resume=true` なら
++    /// `--resume` でこのIDの既存セッション(CLI側がディスクに永続化している)を再開する。
++    /// ACP の `session/new`/`session/load` それぞれに対応する
++    /// (`crate::acp` はこのIDをそのまま ACP の `SessionId` として使い回すため、
++    /// 呼び出し側で別途IDのマッピングを持つ必要がない)。
++    pub(crate) async fn start(
++        root: &Path,
++        system_prompt: String,
++        session_id: &str,
++        resume: bool,
++        config: &SessionConfig,
++    ) -> Result<Self, AgentError> {
+         // `setting_sources` をあえて設定しない — これがクレート側で
+         // `--setting-sources ""` になり CLAUDE.md 類を全て締め出す(モジュール冒頭参照)。
+-        let options = ClaudeAgentOptions::builder()
+-            .system_prompt(system_prompt)
+-            .cwd(root.to_path_buf())
+-            .permission_mode(PermissionMode::AcceptEdits)
+-            .allowed_tools(tool_names())
+-            .build();
++        let mut options = if resume {
++            ClaudeAgentOptions::builder()
++                .system_prompt(system_prompt)
++                .cwd(root.to_path_buf())
++                .permission_mode(PermissionMode::AcceptEdits)
++                .allowed_tools(tool_names())
++                .resume(session_id)
++                .build()
++        } else {
++            ClaudeAgentOptions::builder()
++                .system_prompt(system_prompt)
++                .cwd(root.to_path_buf())
++                .permission_mode(PermissionMode::AcceptEdits)
++                .allowed_tools(tool_names())
++                .session_id(session_id)
++                .build()
++        };
++        // `TypedBuilder` は条件付き呼び出しができないので、`None` なら CLI 任せの既定を
++        // 保つべく素通りさせ、`Some` のときだけ組み立て済みの options に直接代入する。
++        if let Some(model) = &config.model {
++            options.model = Some(model.clone());
++        }
++        if let Some(tokens) = config.thinking_tokens {
++            options.max_thinking_tokens = Some(tokens);
++        }
+ 
+         let client = ClaudeSDKClient::new(options, None)
+             .await
+@@ -149,9 +201,12 @@ impl ClaudeAgent {
+ 
+         let mut out = String::new();
+         while let Some(message) = stream.next().await {
+-            match message.map_err(|e| AgentError {
+-                message: e.to_string(),
+-            })? {
++            let message = match parse_line(message)? {
++                ParsedLine::Message(m) => m,
++                // 要約用の一発問い合わせでは枠の使用率を見せる先が無いので単に読み捨てる。
++                ParsedLine::RateLimit(_) | ParsedLine::Skip => continue,
++            };
++            match message {
+                 Message::Assistant { message, .. } => append_text(&mut out, &message.content),
+                 Message::Result { is_error, .. } => {
+                     if is_error {
+@@ -173,6 +228,91 @@ fn tool_names() -> Vec<anthropic_agent_sdk::ToolName> {
+     ALLOWED_TOOLS.iter().map(|t| (*t).into()).collect()
+ }
+ 
++/// 1行分のパース結果。
++enum ParsedLine {
++    /// SDKが正しく型付けできたメッセージ。
++    Message(Message),
++    /// SDKがまだ知らない `rate_limit_event`。中身を読めた場合。
++    RateLimit(RateLimit),
++    /// SDKがまだ知らない、かつ枠の情報でもないメッセージ種別。読み捨てる。
++    Skip,
++}
++
++/// `claude` CLI が送ってくる、SDK側がまだ知らないメッセージ種別による
++/// `ClaudeError::MessageParse` を無視して読み進める。
++///
++/// `rate_limit_event` だけは [`parse_rate_limit_event`] で中身を拾う
++/// (SDK にも ACP にも対応する型が無いため、`ClaudeError::MessageParse` が
++/// 保持する生JSONから直接読む)。それ以外の未知種別は今まで通り警告1行で捨てる。
++/// SDK が型付けに失敗した以外のエラーはそのまま `AgentError` として伝播させる。
++fn parse_line(message: anthropic_agent_sdk::Result<Message>) -> Result<ParsedLine, AgentError> {
++    match message {
++        Ok(m) => Ok(ParsedLine::Message(m)),
++        Err(anthropic_agent_sdk::ClaudeError::MessageParse { message, data }) => {
++            if let Some(rate_limit) = data.as_ref().and_then(parse_rate_limit_event) {
++                return Ok(ParsedLine::RateLimit(rate_limit));
++            }
++            debug!("unparseable message raw: {:?}", data);
++            warn!(
++                "acp: claude CLIからの未知のメッセージ種別を無視します: {}",
++                message
++            );
++            Ok(ParsedLine::Skip)
++        }
++        Err(e) => Err(friendly_agent_error(e)),
++    }
++}
++
++/// `rate_limit_event` の生JSONから枠の使用率を読む。
++///
++/// SDK にも ACP にもこの種別の型が無いため、`type` フィールドで判定したうえで
++/// `rateLimit`/直下のどちらにキーがあっても拾えるようにしてある。想定した形で
++/// なければ `None` を返して黙って何もしない(要約の欠落と同じく、取れなくても
++/// 会話自体は成立するため)。
++fn parse_rate_limit_event(data: &serde_json::Value) -> Option<RateLimit> {
++    if data.get("type").and_then(|t| t.as_str()) != Some("rate_limit_event") {
++        return None;
++    }
++    let payload = data.get("rateLimit").unwrap_or(data);
++
++    let utilization = payload
++        .get("utilization")
++        .or_else(|| payload.get("percentUsed"))
++        .and_then(serde_json::Value::as_f64)?;
++    let resets_at = payload
++        .get("resetsAt")
++        .or_else(|| payload.get("resets_at"))
++        .and_then(|v| v.as_str())
++        .map(str::to_string);
++
++    Some(RateLimit {
++        utilization,
++        resets_at,
++    })
++}
++
++/// SDKのエラーを、ユーザー向けに分かりやすい `AgentError` へ変換する。
++///
++/// `Transport` エラー(「パイプが閉じている」等の生のOSエラーを含む)は、
++/// `--resume` で指定したセッションが `claude` CLI 側に存在しない・起動直後に
++/// 引数エラーで終了した等の理由で接続が断たれたことを示す。生のOSエラー文言のままだと
++/// 原因が伝わらないため、分かりやすい文言に置き換える
++/// (自動フォールバックはせず、ユーザーに新しい会話の開始を促すだけに留める)。
++fn friendly_agent_error(e: anthropic_agent_sdk::ClaudeError) -> AgentError {
++    match e {
++        anthropic_agent_sdk::ClaudeError::Transport(detail) => {
++            warn!("acp: transport error (session不整合の可能性): {}", detail);
++            AgentError {
++                message: "セッションの再開に失敗しました。新しい会話を開始してください。"
++                    .to_string(),
++            }
++        }
++        other => AgentError {
++            message: other.to_string(),
++        },
++    }
++}
++
+ /// 応答ブロックからテキストだけを取り出して連結する。
+ fn append_text(out: &mut String, blocks: &[ContentBlock]) {
+     for block in blocks {
+@@ -188,21 +328,27 @@ impl WritingAgent for ClaudeAgent {
+         &self,
+         text: &str,
+         on_chunk: &mut (dyn FnMut(String) + Send),
+-    ) -> Result<String, AgentError> {
++    ) -> Result<TurnReply, AgentError> {
+         let mut client = self.client.lock().await;
+ 
+         client
+             .send_message(text.to_string())
+             .await
+-            .map_err(|e| AgentError {
+-                message: e.to_string(),
+-            })?;
++            .map_err(friendly_agent_error)?;
+ 
+         let mut full = String::new();
++        let mut rate_limit: Option<RateLimit> = None;
+         while let Some(message) = client.next_message().await {
+-            match message.map_err(|e| AgentError {
+-                message: e.to_string(),
+-            })? {
++            let message = match parse_line(message)? {
++                ParsedLine::Message(m) => m,
++                ParsedLine::RateLimit(r) => {
++                    // 複数回来たら最後(=最新)の1件を採る。
++                    rate_limit = Some(r);
++                    continue;
++                }
++                ParsedLine::Skip => continue,
++            };
++            match message {
+                 Message::Assistant { message, .. } => {
+                     // 届いた分をその場でクライアントへ流しつつ、要約用に全文も貯める。
+                     let mut piece = String::new();
+@@ -225,7 +371,10 @@ impl WritingAgent for ClaudeAgent {
+                 _ => {}
+             }
+         }
+-        Ok(full)
++        Ok(TurnReply {
++            text: full,
++            rate_limit,
++        })
+     }
+ 
+     async fn interrupt(&self) -> Result<(), AgentError> {

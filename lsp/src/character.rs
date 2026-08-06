@@ -305,7 +305,10 @@ impl CharacterStore {
         let guard = self.0.workspaces.lock();
         let Some(files) = guard.get(workspace_root) else {
             return Err(LlmError::GenericError {
-                message: format!("No character files loaded for workspace {:?}", workspace_root),
+                message: format!(
+                    "No character files loaded for workspace {:?}",
+                    workspace_root
+                ),
             });
         };
         for file in files.values() {
@@ -352,7 +355,12 @@ impl CharacterStore {
     /// 直前の自己書き込みハッシュと一致すればエコーとして無視し`false`を返す。
     /// 不一致なら真の外部変更としてメモリを全置換し`true`を返す
     /// (呼び出し側は`true`のときだけ`refresh_highlight_names`等の後続処理をする)。
-    pub(crate) fn reconcile(&self, workspace_root: &Path, path: &Path, disk_content: String) -> bool {
+    pub(crate) fn reconcile(
+        &self,
+        workspace_root: &Path,
+        path: &Path,
+        disk_content: String,
+    ) -> bool {
         let hash = hash_content(&disk_content);
         let mut guard = self.0.workspaces.lock();
         let files = guard.entry(workspace_root.to_path_buf()).or_default();
@@ -361,7 +369,10 @@ impl CharacterStore {
         {
             return false;
         }
-        files.insert(path.to_path_buf(), CharacterFile::from_content(disk_content));
+        files.insert(
+            path.to_path_buf(),
+            CharacterFile::from_content(disk_content),
+        );
         true
     }
 
@@ -459,17 +470,6 @@ pub(crate) fn comrak_options() -> comrak::Options<'static> {
         .ignore_empty_links(true)
         .build();
     options
-}
-
-/// Markdown 文字列からキャラクターレベルを推定する。
-///
-/// `detect_char_level` の文字列入力版。`character_updater` 等で共有する。
-/// 検出できない場合は `0` を返す。
-pub(crate) fn detect_char_level_str(text: &str) -> u8 {
-    let arena = Arena::new();
-    let options = comrak_options();
-    let root = comrak::parse_document(&arena, text, &options);
-    detect_char_level(root)
 }
 
 /// Markdown 文字列をパースし、全キャラクターの全セクションを `HashMap` で返す。
@@ -737,7 +737,10 @@ mod tests {
         let result = store.search(
             &root,
             "クライン",
-            &[CharacterAttribute::Background, CharacterAttribute::Personality],
+            &[
+                CharacterAttribute::Background,
+                CharacterAttribute::Personality,
+            ],
         );
         assert!(result.is_ok(), "{:?}", result);
         let text = result.unwrap();
@@ -774,6 +777,14 @@ mod tests {
             CharacterAttribute::try_from("通称"),
             Ok(CharacterAttribute::Alias)
         );
+    }
+
+    /// `detect_char_level` のテスト用ヘルパ: Markdown文字列をパースしてから渡す。
+    fn detect_char_level_str(text: &str) -> u8 {
+        let arena = Arena::new();
+        let options = comrak_options();
+        let root = comrak::parse_document(&arena, text, &options);
+        detect_char_level(root)
     }
 
     #[test]
@@ -949,7 +960,9 @@ mod tests {
             "
         );
         let (store, root) = make_store(&[("characters.md", MD)]);
-        let md = store.lookup_markdown(&root, "隊長").expect("aliasで見つかるはず");
+        let md = store
+            .lookup_markdown(&root, "隊長")
+            .expect("aliasで見つかるはず");
         assert!(md.contains("艦長"), "{}", md);
     }
 

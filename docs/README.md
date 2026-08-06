@@ -26,6 +26,7 @@
 中心機能は **Lindera による日本語形態素解析** と **LLM による文章補完・キャラクター設定の自動更新**。
 
 同じバイナリを `--acp` 付きで起動すると **ACP エージェント**として動き、Zed の Agent Panel
-から作者の相談相手になる。中身は Claude Agent SDK 経由の `claude` CLI で、原稿ディレクトリの
-ファイルを読み書きしながら話す。その会話の要約は補完のコンテキストとして LSP 側へ渡る
-（[acp-agent.md](acp-agent.md)）。
+から作者の相談相手になる（**debug ビルド限定**、`claude` CLI のサブスクリプション枠を
+そのまま使うため release には含まれない）。中身は Claude Agent SDK 経由の `claude` CLI で、
+原稿ディレクトリのファイルを読み書きしながら話す。その会話の要約は補完のコンテキストとして
+LSP 側へ渡る（[acp-agent.md](acp-agent.md)）。

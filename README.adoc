@@ -42,10 +42,14 @@ ACP (Agent Client Protocol) エージェントとして起動します。
 Zedの Agent Panel から作者の相談相手として応答し、
 その会話の要約をLSP側の短文生成のコンテキストとして渡します。
 
+NOTE: `--acp` は **debug ビルド限定** です。`claude` CLI の
+サブスクリプション枠をそのまま使うため、`--release` の配布物には
+含まれません（`--acp` を渡すとメッセージを出して終了します）。
+
 中身は Claude Agent SDK 経由の `claude` CLI なので、
 プロット・キャラクター設定・メモの読み書きやWeb検索がそのまま使えます。
-`ANTHROPIC_API_KEY` を設定しなければ、ログイン済みCLIの
-サブスクリプション枠で動きます（APIキーは不要です）。
+`ANTHROPIC_API_KEY` を設定していても無視され、
+ログイン済みCLIのサブスクリプション枠で動きます（APIキーは不要です）。
 
 [source,bash]
 ----

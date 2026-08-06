@@ -32,6 +32,8 @@ http = "1.4.0"
 derive_more = { version = "2.1.1", features = ["error", "display"] }
 bitflags = "2"
 comrak = { version = "0.51.0", features = ["bon","syntect","shortcodes"] }
+uuid = { version = "1", features = ["v4"] }
+flate2 = "1"
 
 opentelemetry = "0.31.0"
 opentelemetry_sdk = { version = "0.31.0", features = ["trace", "metrics", "logs"] }

@@ -1,0 +1,521 @@
+diff --git a/lsp/src/highlight.rs b/lsp/src/highlight.rs
+index 4971df3..ddb4d7f 100644
+--- a/lsp/src/highlight.rs
++++ b/lsp/src/highlight.rs
+@@ -134,9 +134,6 @@ pub struct Highlighter {
+     /// Lindera トークナイザ。キャラ名のユーザー辞書差し替え(`rebuild_user_dictionary`)が
+     /// あるため RwLock で内部可変にしている。
+     tokenizer: RwLock<lindera::tokenizer::Tokenizer>,
+-    /// キャラクター一覧(名前+aliases、複合名分割済み)。人名ハイライトの絞り込みに使う。
+-    /// character_cache 側の更新経路(初期化スキャン/保存/外部ファイル監視)から `set_allowed_names` 経由で差し替えられる。
+-    allowed_names: RwLock<HashSet<String>>,
+ }
+ 
+ impl std::fmt::Debug for crate::highlight::Highlighter {
+@@ -159,46 +156,44 @@ impl Highlighter {
+ 
+         Self {
+             tokenizer: RwLock::new(tokenizer),
+-            allowed_names: RwLock::new(HashSet::new()),
+         }
+     }
+ 
+-    /// 人名ハイライトの許可名集合(キャラ名+aliases)を差し替える。
+-    /// 集合が実際に変化した場合 true を返す(ユーザー辞書再構築の要否判定に使う)。
+-    pub fn set_allowed_names(&self, names: HashSet<String>) -> bool {
+-        let mut guard = self.allowed_names.write();
+-        if *guard == names {
+-            return false;
+-        }
+-        *guard = names;
+-        true
++    /// 与えられたトークン(品詞details+表層形)がハイライト対象の人名かどうかを判定する。
++    /// `classify_normal`/`classify_bracket` のkeyword判定と同一基準であり、hover等
++    /// ハイライト以外の箇所でも同じ判定基準を使いたい場合に利用する
++    /// (例: `backend.rs` の hover ハンドラ。ハイライトされないトークンでhoverだけ
++    /// 表示されるという食い違いを防ぐため)。
++    /// `allowed` は呼び出し側が対象ドキュメントのワークスペースに応じて渡す
++    /// (`CharacterStore::allowed_names`)。
++    pub fn is_recognized_name(details: &[String], surface: &str, allowed: &HashSet<String>) -> bool {
++        Self::is_recognized_person_name(details, surface, allowed)
+     }
+ 
+-    /// allowed_names の全エントリを固有名詞(名詞,固有名詞,人名,一般)としてユーザー辞書に
+-    /// 登録し直す。空集合なら辞書を外す。
++    /// `names` の全エントリを固有名詞(名詞,固有名詞,人名,一般)としてユーザー辞書に
++    /// 登録し直す。空集合なら辞書を外す。`names`は全ワークスペースの許可名の和集合を渡す
++    /// (`CharacterStore::all_allowed_names`。トークナイズ品質の担保だけが目的で、
++    /// どのワークスペースの名前かを区別する必要はない)。
+     ///
+     /// lindera 2.3.2 はCSVファイル経由でしかユーザー辞書を構築できないため、一時ファイルに
+     /// 書き出してロード後に削除する。`Tokenizer.segmenter.user_dictionary` が pub なので、
+     /// 埋め込みIPADIC の再ロードなしに辞書だけを差し替えられる。
+-    pub fn rebuild_user_dictionary(&self) -> std::io::Result<()> {
++    pub fn rebuild_user_dictionary(&self, names: &HashSet<String>) -> std::io::Result<()> {
+         use std::io::{Error, ErrorKind};
+ 
+-        let rows: Vec<String> = {
+-            let names = self.allowed_names.read();
+-            names
+-                .iter()
+-                .filter(|n| {
+-                    // CSVを壊す文字を含む名前は登録スキップ(表層一致ハイライトは引き続き機能する)
+-                    let unsafe_csv =
+-                        n.contains(',') || n.contains('"') || n.contains('\n') || n.contains('\r');
+-                    if unsafe_csv {
+-                        warn!("ユーザー辞書登録をスキップ(CSV非対応文字を含む): {:?}", n);
+-                    }
+-                    !unsafe_csv
+-                })
+-                .map(|n| Self::user_dict_csv_row(n, "人名", "一般"))
+-                .collect()
+-        };
++        let rows: Vec<String> = names
++            .iter()
++            .filter(|n| {
++                // CSVを壊す文字を含む名前は登録スキップ(表層一致ハイライトは引き続き機能する)
++                let unsafe_csv =
++                    n.contains(',') || n.contains('"') || n.contains('\n') || n.contains('\r');
++                if unsafe_csv {
++                    warn!("ユーザー辞書登録をスキップ(CSV非対応文字を含む): {:?}", n);
++                }
++                !unsafe_csv
++            })
++            .map(|n| Self::user_dict_csv_row(n, "人名", "一般"))
++            .collect();
+ 
+         if rows.is_empty() {
+             self.tokenizer.write().segmenter.user_dictionary = None;
+@@ -238,13 +233,17 @@ impl Highlighter {
+     }
+ 
+     /// ユーザー辞書CSVの1行(IPADIC 詳細13カラム形式)を組み立てる。
+-    /// 文脈ID 0/コスト -10000 は lindera が簡易形式に自動付与する実績値
+-    /// (0=未定義文脈、-10000でViterbi上1トークン化を強く優先)。
++    /// 文脈ID 0はlindera が簡易形式に自動付与する実績値(未定義文脈)。
++    /// コスト2000は「1文字の人名でも単独トークンとして切り出す」ことと
++    /// 「"高原"/"原因"/"原則"等の一般語を誤って分割しない」ことを両立する値として実測で選定
++    /// (500〜10000の範囲で両立を確認、IPADIC実在の人名エントリと同程度の常識的なコスト感)。
++    /// -10000のような極端に低いコストは、字面が短い名前ほど一般語の部分文字列と衝突しやすく
++    /// 誤分割を招くため避ける。
+     /// 原形=表層形とし(`text_to_lindera_token` の d[6]=="*" 除外フィルタを回避)、読み/発音は "*"。
+     /// 組織(固有名詞,組織,*)・地域(固有名詞,地域,一般)のサポート追加時は subcategory を変えて呼ぶ。
+     fn user_dict_csv_row(surface: &str, subcategory2: &str, subcategory3: &str) -> String {
+         format!(
+-            "{s},0,0,-10000,名詞,固有名詞,{c2},{c3},*,*,{s},*,*",
++            "{s},0,0,2000,名詞,固有名詞,{c2},{c3},*,*,{s},*,*",
+             s = surface,
+             c2 = subcategory2,
+             c3 = subcategory3,
+@@ -378,11 +377,11 @@ impl Highlighter {
+         &self,
+         line: &mut LineData,
+         start_depth: u32,
++        allowed: &HashSet<String>,
+     ) -> (Vec<SemanticToken>, u32) {
+         let end_depth = self.tag_line_depth(line, start_depth);
+ 
+         let mut result = Vec::new();
+-        let allowed = self.allowed_names.read();
+         for token in line.tokens.iter() {
+             // 人名判定に使う表層文字列
+             let surface = &line.text[token.byte_start..token.byte_end];
+@@ -395,9 +394,9 @@ impl Highlighter {
+             ) {
+                 ("記号", Some("括弧開")) | ("記号", Some("括弧閉")) => Some("comment"),
+                 _ if token.tag == TokenStatus::InBracket => {
+-                    Self::classify_bracket(&token.details, surface, &allowed)
++                    Self::classify_bracket(&token.details, surface, allowed)
+                 }
+-                _ => Self::classify_normal(&token.details, surface, &allowed),
++                _ => Self::classify_normal(&token.details, surface, allowed),
+             };
+ 
+             if let Some(k) = kind {
+@@ -416,8 +415,26 @@ impl Highlighter {
+     /// 本体コードは深さを明示する `tokenize_with_depth`/`ensure_bracket_depth` を使うため、
+     /// 現在はテスト専用。
+     #[allow(dead_code)]
+-    pub fn tokenize(&self, line: &mut LineData) -> Vec<SemanticToken> {
+-        self.tokenize_with_depth(line, 0).0
++    pub fn tokenize(&self, line: &mut LineData, allowed: &HashSet<String>) -> Vec<SemanticToken> {
++        self.tokenize_with_depth(line, 0, allowed).0
++    }
++
++    /// トークンが「許可名一致の人名」であるかを判定する共通述語。
++    ///
++    /// `classify_normal`/`classify_bracket` のkeyword判定条件そのもの
++    /// (品詞が固有名詞,人名 かつ 表層形が許可名集合に含まれる)であり、
++    /// hover等ハイライト以外の箇所からも同一基準で判定できるよう公開している
++    /// (`Highlighter::is_recognized_name` 経由)。
++    /// ここでの判定が変わらない限り hover とハイライトは常に一致する。
++    fn is_recognized_person_name(
++        details: &[String],
++        surface: &str,
++        allowed: &HashSet<String>,
++    ) -> bool {
++        details.first().map(String::as_str) == Some("名詞")
++            && details.get(1).map(String::as_str) == Some("固有名詞")
++            && details.get(2).map(String::as_str) == Some("人名")
++            && allowed.contains(surface)
+     }
+ 
+     /// 通常モードでの品詞→トークン種別マッピング。
+@@ -439,7 +456,7 @@ impl Highlighter {
+         match details[0].as_str() {
+             "名詞" => match v.as_ref() {
+                 ["固有名詞", "人名", ..] => {
+-                    if allowed.contains(surface) {
++                    if Self::is_recognized_person_name(details, surface, allowed) {
+                         Some("keyword")
+                     } else {
+                         None
+@@ -476,7 +493,7 @@ impl Highlighter {
+         match details[0].as_str() {
+             "名詞" => match v.as_ref() {
+                 ["固有名詞", "人名", ..] => {
+-                    if allowed.contains(surface) {
++                    if Self::is_recognized_person_name(details, surface, allowed) {
+                         Some("keyword")
+                     } else {
+                         Some("string")
+@@ -545,16 +562,28 @@ mod tests {
+         assert_eq!(t.modifier, 0);
+     }
+ 
++    /// 空の許可名集合(名前判定を伴わないテスト用)。
++    fn no_names() -> HashSet<String> {
++        HashSet::new()
++    }
++
+     /// 括弧内モード(開始深さ1)でトークン化するテスト用ヘルパ。
+-    fn tokenize_in_bracket(h: &Highlighter, line: &mut LineData) -> Vec<SemanticToken> {
+-        h.tokenize_with_depth(line, 1).0
++    fn tokenize_in_bracket(
++        h: &Highlighter,
++        line: &mut LineData,
++        allowed: &HashSet<String>,
++    ) -> Vec<SemanticToken> {
++        h.tokenize_with_depth(line, 1, allowed).0
+     }
+ 
+     #[test]
+     fn test_tokenize_conversation_produces_tokens() {
+         let hilighter = Highlighter::new();
+-        let tokens =
+-            tokenize_in_bracket(&hilighter, &mut LineData::from_str("これはテストです。").unwrap());
++        let tokens = tokenize_in_bracket(
++            &hilighter,
++            &mut LineData::from_str("これはテストです。").unwrap(),
++            &no_names(),
++        );
+         assert!(
+             !tokens.is_empty(),
+             "tokenize_conversation should produce tokens"
+@@ -593,14 +622,18 @@ mod tests {
+     #[test]
+     fn test_tokenize_conversation_empty_string() {
+         let hilighter = Highlighter::new();
+-        let tokens = hilighter.tokenize(&mut LineData::from_str("").unwrap());
++        let tokens = hilighter.tokenize(&mut LineData::from_str("").unwrap(), &no_names());
+         assert!(tokens.is_empty(), "Empty string should produce no tokens");
+     }
+ 
+     #[test]
+     fn test_tokenize_conversation_unknown_words() {
+         let hilighter = Highlighter::new();
+-        let tokens = tokenize_in_bracket(&hilighter, &mut LineData::from_str("がびがび").unwrap());
++        let tokens = tokenize_in_bracket(
++            &hilighter,
++            &mut LineData::from_str("がびがび").unwrap(),
++            &no_names(),
++        );
+         // "がびがび" は名詞として扱われるはず
+         assert_eq!(tokens[0].token_type, SemanticTokenType::String as u32);
+     }
+@@ -608,8 +641,10 @@ mod tests {
+     #[test]
+     fn test_tokenize_conversation_complex_sentence() {
+         let hilighter = Highlighter::new();
+-        let tokens = hilighter
+-            .tokenize(&mut LineData::from_str("吾輩は猫である。名前はまだない。").unwrap());
++        let tokens = hilighter.tokenize(
++            &mut LineData::from_str("吾輩は猫である。名前はまだない。").unwrap(),
++            &no_names(),
++        );
+         assert!(!tokens.is_empty());
+     }
+ 
+@@ -617,17 +652,119 @@ mod tests {
+     fn test_registered_person_name_is_keyword() {
+         // "田中" は Lindera IPADIC で 固有名詞,人名,姓 の単一トークンになる(実測確認済み)。
+         let h = Highlighter::new();
+-        h.set_allowed_names(HashSet::from(["田中".to_string()]));
+-        let tokens = h.tokenize(&mut LineData::from_str("田中").unwrap());
++        let allowed = HashSet::from(["田中".to_string()]);
++        let tokens = h.tokenize(&mut LineData::from_str("田中").unwrap(), &allowed);
++        assert_eq!(tokens.len(), 1, "{:?}", tokens);
++        assert_eq!(tokens[0].token_type, SemanticTokenType::Keyword as u32);
++    }
++
++    #[test]
++    fn test_is_recognized_name_consistent_with_highlight_for_common_word_collision() {
++        // "コンドル"はIPADICに一般名詞(禿鷲)として登録されており、ユーザー辞書登録名でも
++        // Viterbiで一般名詞側の経路が選ばれ 固有名詞,人名 にならない(実測確認済み)。
++        // is_recognized_name はハイライトと同じ基準で判定するため、この場合は一致してfalseを返す
++        // (hoverでも表示されなくなり、ハイライトとの食い違いが起きない)。
++        let h = Highlighter::new();
++        let allowed = HashSet::from([
++            "ジョサイア・コンドル".to_string(),
++            "ジョサイア".to_string(),
++            "コンドル".to_string(),
++        ]);
++        h.rebuild_user_dictionary(&allowed).expect("辞書再構築に失敗");
++
++        let text = "ジョサイア・コンドルの手による";
++        let tokens = h.text_to_lindera_token(text);
++
++        let conder = tokens
++            .iter()
++            .find(|t| &text[t.byte_start..t.byte_end] == "コンドル")
++            .expect("「コンドル」トークンが見つからない");
++        assert!(
++            !Highlighter::is_recognized_name(&conder.details, "コンドル", &allowed),
++            "{:?}",
++            conder.details
++        );
++
++        let josiah = tokens
++            .iter()
++            .find(|t| &text[t.byte_start..t.byte_end] == "ジョサイア")
++            .expect("「ジョサイア」トークンが見つからない");
++        assert!(
++            Highlighter::is_recognized_name(&josiah.details, "ジョサイア", &allowed),
++            "{:?}",
++            josiah.details
++        );
++
++        // ハイライト結果とも一致すること
++        let sem = h.tokenize(&mut LineData::from_str(text).unwrap(), &allowed);
++        assert_eq!(sem.len(), 2, "{:?}", sem); // ジョサイア(keyword) + "・"(comment) のみ
++    }
++
++    #[test]
++    fn test_single_char_registered_name_is_keyword() {
++        // 1文字の姓("原")はユーザー辞書登録(コスト3000)によって固有名詞,人名として
++        // 単独トークンに切り出され、許可名一致で keyword になる。
++        let h = Highlighter::new();
++        let allowed = HashSet::from(["原".to_string(), "原顕三郎".to_string()]);
++        h.rebuild_user_dictionary(&allowed).expect("辞書再構築に失敗");
++
++        let tokens = h.tokenize(&mut LineData::from_str("原は独りごちた").unwrap(), &allowed);
++        assert_eq!(
++            tokens[0].token_type,
++            SemanticTokenType::Keyword as u32,
++            "{:?}",
++            tokens
++        );
++        assert_eq!(tokens[0].length, 1, "{:?}", tokens);
++
++        // フルネームは1トークンとして keyword になる(単独名との共存回帰確認)
++        let tokens = h.tokenize(&mut LineData::from_str("原顕三郎少将").unwrap(), &allowed);
++        assert_eq!(
++            tokens[0].token_type,
++            SemanticTokenType::Keyword as u32,
++            "{:?}",
++            tokens
++        );
++        assert_eq!(tokens[0].length, 4, "{:?}", tokens); // "原顕三郎"
++    }
++
++    #[test]
++    fn test_unknown_katakana_name_still_single_token() {
++        // コスト3000への変更後も、IPADIC未知のカタカナ名(例: "シルビア")が
++        // 引き続き1トークンでkeywordになること(コスト緩和による回帰確認)。
++        let h = Highlighter::new();
++        let allowed = HashSet::from(["シルビア".to_string()]);
++        h.rebuild_user_dictionary(&allowed).expect("辞書再構築に失敗");
++
++        let tokens = h.tokenize(&mut LineData::from_str("シルビア").unwrap(), &allowed);
+         assert_eq!(tokens.len(), 1, "{:?}", tokens);
+         assert_eq!(tokens[0].token_type, SemanticTokenType::Keyword as u32);
+     }
+ 
++    #[test]
++    fn test_single_char_registered_name_does_not_split_common_words() {
++        // 1文字人名のユーザー辞書登録が、"高原"/"原因"/"原則"のような一般語を
++        // 誤って分割してハイライトしないこと。
++        let h = Highlighter::new();
++        let allowed = HashSet::from(["原".to_string()]);
++        h.rebuild_user_dictionary(&allowed).expect("辞書再構築に失敗");
++
++        for word in ["高原", "原因", "原則"] {
++            let tokens = h.tokenize(&mut LineData::from_str(word).unwrap(), &allowed);
++            assert!(
++                tokens.is_empty(),
++                "{} が「原」の誤分割でハイライトされてしまっている: {:?}",
++                word,
++                tokens
++            );
++        }
++    }
++
+     #[test]
+     fn test_unregistered_person_name_not_highlighted_normal() {
+         // 許可名集合が空の場合、通常モードでは固有名詞人名でも一切トークンを生成しない。
+         let h = Highlighter::new();
+-        let tokens = h.tokenize(&mut LineData::from_str("田中").unwrap());
++        let tokens = h.tokenize(&mut LineData::from_str("田中").unwrap(), &no_names());
+         assert!(tokens.is_empty(), "{:?}", tokens);
+     }
+ 
+@@ -635,7 +772,7 @@ mod tests {
+     fn test_unregistered_person_name_in_bracket_is_string() {
+         // 括弧内モードでは、許可名集合に無い語は一般名詞と同じ string にフォールバックする。
+         let h = Highlighter::new();
+-        let tokens = tokenize_in_bracket(&h, &mut LineData::from_str("田中").unwrap());
++        let tokens = tokenize_in_bracket(&h, &mut LineData::from_str("田中").unwrap(), &no_names());
+         assert_eq!(tokens.len(), 1, "{:?}", tokens);
+         assert_eq!(tokens[0].token_type, SemanticTokenType::String as u32);
+     }
+@@ -645,10 +782,11 @@ mod tests {
+         // 組織名("自民党": 固有名詞,組織)・地域名("東京": 固有名詞,地域,一般、"日本": 固有名詞,地域,国)は
+         // 品詞ベースの判定ロジックをコメントアウトしているため、許可名集合に入っていなければ
+         // Variable/Function は生成されない(通常モードでは None -> トークン自体が生成されない)。
+-        // 許可名一致は品詞を問わず keyword になる新仕様のため、ここでは許可名集合を空にして検証する。
++        // keyword 化は「固有名詞,人名」かつ許可名集合に一致した場合のみで、組織名・地域名は
++        // 許可名集合に入っていても対象外(classify_normal/classify_bracket 参照)。
+         let h = Highlighter::new();
+         for word in ["自民党", "東京", "日本"] {
+-            let tokens = h.tokenize(&mut LineData::from_str(word).unwrap());
++            let tokens = h.tokenize(&mut LineData::from_str(word).unwrap(), &no_names());
+             assert!(
+                 tokens.is_empty(),
+                 "{} が組織/地域としてハイライトされてしまっている: {:?}",
+@@ -661,8 +799,11 @@ mod tests {
+     #[test]
+     fn test_encode_semantic_tokens_same_line_uses_relative_start() {
+         let hilighter = Highlighter::new();
+-        let tokens =
+-            tokenize_in_bracket(&hilighter, &mut LineData::from_str("これはテストです。").unwrap());
++        let tokens = tokenize_in_bracket(
++            &hilighter,
++            &mut LineData::from_str("これはテストです。").unwrap(),
++            &no_names(),
++        );
+         let encoded = Highlighter::to_semantic_tokens([tokens.clone()]);
+         assert!(encoded.len() >= 3);
+         assert_eq!(encoded[1].delta_line, 0);
+@@ -691,7 +832,9 @@ mod tests {
+         let encoded = Highlighter::to_semantic_tokens(
+             ["これはテストです。", "", "これはテストです。"]
+                 .iter()
+-                .map(|s| tokenize_in_bracket(&hilighter, &mut LineData::from_str(s).unwrap()))
++                .map(|s| {
++                    tokenize_in_bracket(&hilighter, &mut LineData::from_str(s).unwrap(), &no_names())
++                })
+                 .collect::<Vec<_>>(),
+         );
+         assert!(encoded.len() >= 6);
+@@ -702,8 +845,11 @@ mod tests {
+     #[test]
+     fn test_encode_semantic_tokens_preserves_length_type_modifier() {
+         let hilighter = Highlighter::new();
+-        let source =
+-            tokenize_in_bracket(&hilighter, &mut LineData::from_str("これはテストです。").unwrap());
++        let source = tokenize_in_bracket(
++            &hilighter,
++            &mut LineData::from_str("これはテストです。").unwrap(),
++            &no_names(),
++        );
+ 
+         let encoded = Highlighter::to_semantic_tokens([source.clone()]);
+ 
+@@ -723,7 +869,7 @@ mod tests {
+     fn test_particle_ha_is_skipped_outside_bracket() {
+         // 括弧内モードでは許可名一致以外すべて string に丸められる
+         let h = Highlighter::new();
+-        let tokens = tokenize_in_bracket(&h, &mut LineData::from_str("猫は").unwrap());
++        let tokens = tokenize_in_bracket(&h, &mut LineData::from_str("猫は").unwrap(), &no_names());
+         assert_eq!(tokens.len(), 2, "猫は should produce 2 token");
+         assert_eq!(tokens[0].token_type, SemanticTokenType::String as u32);
+     }
+@@ -733,7 +879,7 @@ mod tests {
+         // 括弧開・括弧閉自体は括弧外扱いで "comment"
+         let h = Highlighter::new();
+         let mut l = LineData::from_str("「テスト」").unwrap();
+-        let tokens = h.tokenize(&mut l);
++        let tokens = h.tokenize(&mut l, &no_names());
+         // [「(comment), テスト(keyword/名詞), 」(comment)]
+         assert_eq!(tokens.len(), 3, "「テスト」 should produce 3 tokens");
+         assert_eq!(
+@@ -773,7 +919,7 @@ mod tests {
+         // 括弧内では _ カテゴリが "string" になる
+         // "猫は" で「猫(名詞)」「は(助詞)」に分かれる → 括弧内の「は」が string になるか
+         let h = Highlighter::new();
+-        let tokens = h.tokenize(&mut LineData::from_str("「猫は」").unwrap());
++        let tokens = h.tokenize(&mut LineData::from_str("「猫は」").unwrap(), &no_names());
+         // [「(comment), 猫(keyword), は(string), 」(comment)]
+         assert_eq!(tokens.len(), 4, "「猫は」 should produce 4 tokens");
+         assert_eq!(
+@@ -787,9 +933,11 @@ mod tests {
+     fn test_bracket_mode_persists_across_tokenize_calls() {
+         // 複数行にまたがる括弧で、深さを戻り値で次の行へ引き継ぐ
+         let h = Highlighter::new();
+-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「猫").unwrap(), 0); // 括弧開 → depth=1
++        let names = no_names();
++        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「猫").unwrap(), 0, &names); // 括弧開 → depth=1
+         assert_eq!(d, 1);
+-        let (inside, d) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d); // 括弧内 → は が "string"
++        let (inside, d) =
++            h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d, &names); // 括弧内 → は が "string"
+         // [猫(keyword), は(string)]
+         assert_eq!(
+             inside.len(),
+@@ -801,9 +949,10 @@ mod tests {
+             SemanticTokenType::String as u32,
+             "助詞 should be string when inside bracket across lines"
+         );
+-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d); // 括弧閉 → depth=0
++        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d, &names); // 括弧閉 → depth=0
+         assert_eq!(d, 0);
+-        let (outside, _) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d); // 括弧外 → は スキップ
++        let (outside, _) =
++            h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d, &names); // 括弧外 → は スキップ
+         assert_eq!(
+             outside.len(),
+             0,
+@@ -815,23 +964,26 @@ mod tests {
+     fn test_nested_brackets_depth() {
+         // ネストした括弧でdepthが正しく管理される
+         let h = Highlighter::new();
+-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「").unwrap(), 0); // depth=1
+-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「").unwrap(), d); // depth=2
++        let names = no_names();
++        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「").unwrap(), 0, &names); // depth=1
++        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「").unwrap(), d, &names); // depth=2
+         assert_eq!(d, 2);
+-        let (inner, d) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d); // depth=2 → は=string
++        let (inner, d) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d, &names); // depth=2 → は=string
+         assert_eq!(inner.len(), 2, "should be in bracket mode at depth 2");
+         assert_eq!(inner[1].token_type, SemanticTokenType::String as u32);
+-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d); // depth=1
+-        let (still_inside, d) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d); // depth=1 → は=string
++        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d, &names); // depth=1
++        let (still_inside, d) =
++            h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d, &names); // depth=1 → は=string
+         assert_eq!(
+             still_inside.len(),
+             2,
+             "should still be in bracket mode at depth 1"
+         );
+         assert_eq!(still_inside[1].token_type, SemanticTokenType::String as u32);
+-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d); // depth=0
++        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d, &names); // depth=0
+         assert_eq!(d, 0);
+-        let (outside, _) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d); // depth=0 → は スキップ
++        let (outside, _) =
++            h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d, &names); // depth=0 → は スキップ
+         assert_eq!(
+             outside.len(),
+             0,

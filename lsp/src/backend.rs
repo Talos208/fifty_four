@@ -20,7 +20,7 @@ use dashmap::try_result::TryResult;
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::ops::DerefMut;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use tower_lsp_server::lsp_types::*;
@@ -49,7 +49,6 @@ pub(crate) struct Backend {
     // false にすると ACP エージェントのチャット要約を補完プロンプトへ埋め込まない
     chat_context_enabled: std::sync::atomic::AtomicBool,
     chat_context_max_chars: std::sync::atomic::AtomicUsize,
-    chat_context_ttl_secs: std::sync::atomic::AtomicU64,
 
     highlighter: Highlighter,
     // デバッグビルド専用のDB操作
@@ -168,20 +167,14 @@ impl LanguageServer for Backend {
                     self.chat_context_max_chars
                         .store(v as usize, std::sync::atomic::Ordering::Relaxed);
                 }
-                if let Some(v) = cc.get("ttl_secs").and_then(|v| v.as_u64()) {
-                    self.chat_context_ttl_secs
-                        .store(v, std::sync::atomic::Ordering::Relaxed);
-                }
             } else {
                 debug!("no chat_context config; using defaults");
             }
             debug!(
-                "chat_context effective: enabled={} max_chars={} ttl_secs={}",
+                "chat_context effective: enabled={} max_chars={}",
                 self.chat_context_enabled
                     .load(std::sync::atomic::Ordering::Relaxed),
                 self.chat_context_max_chars
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                self.chat_context_ttl_secs
                     .load(std::sync::atomic::Ordering::Relaxed),
             );
 
@@ -475,15 +468,15 @@ impl LanguageServer for Backend {
                     let content = match tokio::fs::read_to_string(&path).await {
                         Ok(c) => c,
                         Err(e) => {
-                            warn!(
-                                "did_change_watched_files: failed to read {:?}: {}",
-                                path, e
-                            );
+                            warn!("did_change_watched_files: failed to read {:?}: {}", path, e);
                             continue;
                         }
                     };
                     if self.character_store.reconcile(&ws, &path, content) {
-                        debug!("did_change_watched_files: 外部変更として取り込み: {:?}", path);
+                        debug!(
+                            "did_change_watched_files: 外部変更として取り込み: {:?}",
+                            path
+                        );
                         any_changed = true;
                     } else {
                         debug!(
@@ -1301,9 +1294,6 @@ impl Backend {
             chat_context_max_chars: std::sync::atomic::AtomicUsize::new(
                 crate::chat_context::DEFAULT_MAX_CHARS,
             ),
-            chat_context_ttl_secs: std::sync::atomic::AtomicU64::new(
-                crate::chat_context::DEFAULT_TTL_SECS,
-            ),
             highlighter: Highlighter::new(),
             db: Arc::new(FlightRecorder::open_default()),
             character_store: CharacterStore::new(),
@@ -1346,11 +1336,8 @@ impl Backend {
         if !self.chat_context_enabled.load(Relaxed) {
             return String::new();
         }
-        match crate::chat_context::read_digest(
-            workspace,
-            self.chat_context_max_chars.load(Relaxed),
-            std::time::Duration::from_secs(self.chat_context_ttl_secs.load(Relaxed)),
-        ) {
+        match crate::chat_context::read_digest(workspace, self.chat_context_max_chars.load(Relaxed))
+        {
             Some(digest) => format!(
                 "# 作者がいま書こうとしていること\n\n{}\n\nこれは作者との会話から要約したもので、本文ではない。続きを考える手掛かりとしてのみ使い、この文面をそのまま候補に含めてはならない。\n",
                 digest

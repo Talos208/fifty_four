@@ -1,0 +1,4066 @@
+diff --git a/lsp/src/backend.rs b/lsp/src/backend.rs
+index 673139f..e090f89 100644
+--- a/lsp/src/backend.rs
++++ b/lsp/src/backend.rs
+@@ -5,10 +5,7 @@
+ //! 構築は `Backend::new` に集約し、フィールドは private のまま保つ
+ //! (`main()` からは構造体リテラルではなくこのコンストラクタ経由で初期化する)。
+ 
+-use crate::character::{
+-    CharacterCache, FileCacheEntry, collect_allowed_names, lookup_character_markdown,
+-    parse_all_content,
+-};
++use crate::character::CharacterStore;
+ use crate::character_updater::UpdateState;
+ use crate::flight_recorder::{FlightRecorder, PendingCandidate};
+ use crate::highlight::Highlighter;
+@@ -23,7 +20,7 @@ use dashmap::try_result::TryResult;
+ use log::{debug, error, info, trace, warn};
+ use std::collections::HashMap;
+ use std::ops::DerefMut;
+-use std::path::{Path, PathBuf};
++use std::path::PathBuf;
+ use std::str::FromStr;
+ use std::sync::Arc;
+ use tower_lsp_server::lsp_types::*;
+@@ -57,8 +54,8 @@ pub(crate) struct Backend {
+     highlighter: Highlighter,
+     // デバッグビルド専用のDB操作
+     db: Arc<FlightRecorder>,
+-    // キャラクター設定ファイルのパース結果キャッシュ
+-    character_cache: CharacterCache,
++    // キャラクター設定ファイルのメモリ上の正本(SSoT)。ディスクはload/dump先でしかない。
++    character_store: CharacterStore,
+     // URI ごとのキャラクター更新トリガー状態
+     update_states: DashMap<String, Arc<parking_lot::Mutex<UpdateState>>>,
+     // URI ごとの直近で実際に LLM を呼んだ code_action 呼び出し時刻(デバウンス用)。
+@@ -249,7 +246,7 @@ impl LanguageServer for Backend {
+             // キャラ名にカーソルを合わせた際、そのキャラの設定をMarkdownで表示する。
+             hover_provider: Some(HoverProviderCapability::Simple(true)),
+             // save 通知(did_save)を有効化するため Kind ではなく Options 形式にする。
+-            // キャラクター設定ファイル保存時に character_cache を再構築するために使う。
++            // キャラクター設定ファイル保存時に character_store を調和(reconcile)するために使う。
+             text_document_sync: Some(TextDocumentSyncCapability::Options(
+                 TextDocumentSyncOptions {
+                     open_close: Some(true),
+@@ -355,13 +352,12 @@ impl LanguageServer for Backend {
+         let res = self.client.configuration(req).await.unwrap();
+         debug!("{:?}", res);
+ 
+-        // (a) ワークスペース初期化時にキャラクターファイルを能動スキャンし character_cache を populate する。
+-        // LLM補完のtool calling実行を待たずに、人名ハイライトの絞り込みをすぐ使えるようにするため。
++        // (a) ワークスペース初期化時にキャラクターファイルを能動スキャンし character_store へ
++        // ロードする。LLM補完のtool calling実行を待たずに、人名ハイライトの絞り込みをすぐ
++        // 使えるようにするため。
+         let workspace_paths: Vec<PathBuf> = self.workspace.lock().await.clone();
+         for ws in &workspace_paths {
+-            for path in Self::list_character_files(ws) {
+-                self.reparse_character_file(&path).await;
+-            }
++            self.character_store.load_workspace(ws).await;
+         }
+ 
+         // (c) 外部エディタ/gitなどによるキャラクターファイルの変更も検知できるよう、
+@@ -418,26 +414,42 @@ impl LanguageServer for Backend {
+         let _ = self.client.semantic_tokens_refresh().await;
+     }
+ 
+-    /// (b) キャラクター設定ファイル保存時に character_cache を再構築する。
+-    /// 保存直後の内容をディスクから読み直し、人名ハイライトの許可名集合へ即座に反映する。
++    /// (b) キャラクター設定ファイル保存時、character_store を調和(reconcile)する。
++    /// 保存直後の内容をディスクから読み直し、自己書き込みのエコーでなければ(＝内容が
++    /// character_updater による直前の書き込みと一致しなければ)取り込んで許可名集合へ反映する。
+     async fn did_save(&self, params: DidSaveTextDocumentParams) {
+         let uri = params.text_document.uri.as_str();
+         if !self.is_character_file(uri) {
+             return;
+         }
+-        debug!("did_save[{}]: character file, reparsing", uri);
+         let Some(path) = params.text_document.uri.to_file_path() else {
+             warn!("did_save[{}]: failed to convert uri to file path", uri);
+             return;
+         };
+-        self.reparse_character_file(&path).await;
+-        self.refresh_highlight_names().await;
++        let Some(ws) = self.resolve_workspace(&params.text_document.uri).await else {
++            warn!("did_save[{}]: 所属ワークスペースが特定できない", uri);
++            return;
++        };
++        let content = match tokio::fs::read_to_string(&path).await {
++            Ok(c) => c,
++            Err(e) => {
++                warn!("did_save[{}]: failed to read {:?}: {}", uri, path, e);
++                return;
++            }
++        };
++        if self.character_store.reconcile(&ws, &path, content) {
++            debug!("did_save[{}]: 外部変更として取り込み", uri);
++            self.refresh_highlight_names().await;
++        } else {
++            debug!("did_save[{}]: 自己書き込みのエコーのため無視", uri);
++        }
+     }
+ 
+     /// (c) workspace/didChangeWatchedFiles: エディタ外(他プログラム・git等)での
+-    /// キャラクター設定ファイル変更を検知し character_cache を再構築する。
++    /// キャラクター設定ファイル変更を検知し character_store を調和(reconcile)する。
+     /// `initialized` で動的登録した watcher からの通知を受ける。
+     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
++        let mut any_changed = false;
+         for change in params.changes {
+             let Some(path) = change.uri.to_file_path().map(|p| p.into_owned()) else {
+                 warn!(
+@@ -446,18 +458,45 @@ impl LanguageServer for Backend {
+                 );
+                 continue;
+             };
++            let Some(ws) = self.resolve_workspace(&change.uri).await else {
++                warn!(
++                    "did_change_watched_files: 所属ワークスペースが特定できない: {:?}",
++                    path
++                );
++                continue;
++            };
+             match change.typ {
+                 FileChangeType::DELETED => {
+-                    debug!("did_change_watched_files: removing {:?} from cache", path);
+-                    self.character_cache.0.lock().remove(&path);
++                    debug!("did_change_watched_files: removing {:?} from store", path);
++                    self.character_store.remove(&ws, &path);
++                    any_changed = true;
+                 }
+                 _ => {
+-                    debug!("did_change_watched_files: reparsing {:?}", path);
+-                    self.reparse_character_file(&path).await;
++                    let content = match tokio::fs::read_to_string(&path).await {
++                        Ok(c) => c,
++                        Err(e) => {
++                            warn!(
++                                "did_change_watched_files: failed to read {:?}: {}",
++                                path, e
++                            );
++                            continue;
++                        }
++                    };
++                    if self.character_store.reconcile(&ws, &path, content) {
++                        debug!("did_change_watched_files: 外部変更として取り込み: {:?}", path);
++                        any_changed = true;
++                    } else {
++                        debug!(
++                            "did_change_watched_files: 自己書き込みのエコーのため無視: {:?}",
++                            path
++                        );
++                    }
+                 }
+             }
+         }
+-        self.refresh_highlight_names().await;
++        if any_changed {
++            self.refresh_highlight_names().await;
++        }
+     }
+ 
+     // #[instrument]
+@@ -505,10 +544,8 @@ impl LanguageServer for Backend {
+                 .as_slice(),
+         );
+ 
+-        self.record_change(
+-            param.text_document.uri.as_str(),
+-            param.content_changes.as_slice(),
+-        );
++        self.record_change(&param.text_document.uri, param.content_changes.as_slice())
++            .await;
+ 
+         let _ = self.client.semantic_tokens_refresh().await;
+     }
+@@ -533,6 +570,10 @@ impl LanguageServer for Backend {
+         debug!("semantic_token_full");
+ 
+         let uri = params.text_document.uri.as_str();
++        let allowed = match self.resolve_workspace(&params.text_document.uri).await {
++            Some(ws) => self.character_store.allowed_names(&ws),
++            None => std::collections::HashSet::new(),
++        };
+ 
+         let vec = {
+             // 共有ストアの行を直接更新する(get_mut)。深さを 0 から畳み込みながら全行を
+@@ -542,7 +583,7 @@ impl LanguageServer for Backend {
+             let mut depth = 0u32;
+             let mut per_line = Vec::with_capacity(lines.len());
+             for line in lines.iter_mut() {
+-                let (toks, d) = self.highlighter.tokenize_with_depth(line, depth);
++                let (toks, d) = self.highlighter.tokenize_with_depth(line, depth, &allowed);
+                 depth = d;
+                 per_line.push(toks);
+             }
+@@ -573,6 +614,12 @@ impl LanguageServer for Backend {
+         let line_no = pos.position.line as usize;
+         let utf16_offset = pos.position.character as usize;
+ 
++        // カーソル位置のドキュメントが属するワークスペースを特定する。マッチしなければ
++        // hoverを出さない(誤って別ワークスペースのキャラ情報を出さないための安全側の判断)。
++        let Some(ws) = self.resolve_workspace(&pos.text_document.uri).await else {
++            return Ok(None);
++        };
++
+         let mut tmp: RefMut<_, _> = match self.text.try_get_mut(uri) {
+             TryResult::Locked | TryResult::Absent => return Ok(None),
+             TryResult::Present(t) => t,
+@@ -596,7 +643,14 @@ impl LanguageServer for Backend {
+         let surface = tmp[line_no].surface(&tkn).to_string();
+         drop(tmp);
+ 
+-        let markdown = lookup_character_markdown(&self.character_cache, &surface);
++        let allowed = self.character_store.allowed_names(&ws);
++        // ハイライトと同じ判定基準(品詞=固有名詞,人名 かつ 許可名一致)を通ったトークンのみ
++        // hoverを出す。これによりハイライトされないトークンでhoverだけ表示される食い違いを防ぐ。
++        if !Highlighter::is_recognized_name(&tkn.details, &surface, &allowed) {
++            return Ok(None);
++        }
++
++        let markdown = self.character_store.lookup_markdown(&ws, &surface);
+ 
+         Ok(markdown.map(|value| Hover {
+             contents: HoverContents::Markup(MarkupContent {
+@@ -793,7 +847,7 @@ impl LanguageServer for Backend {
+             .use_llm_with_option(options, async |l| {
+                 l.add_tool(crate::tools::CharacterInfoTool::new(
+                     workspace,
+-                    self.character_cache.clone(),
++                    self.character_store.clone(),
+                 ));
+                 l.add_tool(crate::tools::PlotInfoTool::new(workspace));
+                 l.add(Content::Text(prompt));
+@@ -1056,7 +1110,7 @@ impl LanguageServer for Backend {
+             .use_llm_with_option(options, async |l| {
+                 l.add_tool(crate::tools::CharacterInfoTool::new(
+                     workspace,
+-                    self.character_cache.clone(),
++                    self.character_store.clone(),
+                 ));
+                 l.add_tool(crate::tools::PlotInfoTool::new(workspace));
+                 l.add(Content::Text(prompt));
+@@ -1252,7 +1306,7 @@ impl Backend {
+             ),
+             highlighter: Highlighter::new(),
+             db: Arc::new(FlightRecorder::open_default()),
+-            character_cache: CharacterCache::new(),
++            character_store: CharacterStore::new(),
+             update_states: DashMap::new(),
+             code_action_last_call: DashMap::new(),
+             work_done_progress_supported: std::sync::atomic::AtomicBool::new(false),
+@@ -1419,71 +1473,30 @@ impl Backend {
+         uri.contains("/characters/") || uri.ends_with("/characters.md")
+     }
+ 
+-    /// workspace 配下の全キャラクターファイルパスを列挙する。
+-    /// `characters.md`（単一ファイル）と `characters/*.md`（ディレクトリ）の両方に対応する
+-    /// （`find_character_file_path` のファイル探索ロジックを「全件列挙」向けに一般化したもの）。
+-    fn list_character_files(workspace: &Path) -> Vec<PathBuf> {
+-        let mut files = Vec::new();
+-
+-        let single = workspace.join("characters").with_extension("md");
+-        if single.is_file() {
+-            files.push(single);
+-        }
+-
+-        let dir = workspace.join("characters");
+-        if dir.is_dir()
+-            && let Ok(entries) = dir.read_dir()
+-        {
+-            for entry in entries.flatten() {
+-                let path = entry.path();
+-                if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
+-                    files.push(path);
+-                }
+-            }
+-        }
+-
+-        files
+-    }
+-
+-    /// 1ファイルを読み込み parse して character_cache に反映する。
+-    /// 読み込みに失敗した場合はログのみで static に無視する(呼び出し元は複数ファイルを回すため)。
+-    async fn reparse_character_file(&self, path: &Path) {
+-        let modified = std::fs::metadata(path)
+-            .and_then(|m| m.modified())
+-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+-
+-        let content = match tokio::fs::read_to_string(path).await {
+-            Ok(c) => c,
+-            Err(e) => {
+-                warn!("reparse_character_file: failed to read {:?}: {}", path, e);
+-                return;
+-            }
+-        };
+-
+-        let characters = parse_all_content(&content);
+-        self.character_cache.0.lock().insert(
+-            path.to_path_buf(),
+-            FileCacheEntry {
+-                modified,
+-                characters,
+-            },
+-        );
++    /// URIから、それを含む最長一致のワークスペースrootを解決する。
++    /// マッチしない場合は最初のワークスペース(あれば)へフォールバックする。
++    async fn resolve_workspace(&self, uri: &Uri) -> Option<PathBuf> {
++        let doc_path = uri.to_file_path()?.into_owned();
++        let roots = self.workspace.lock().await;
++        CharacterStore::resolve_workspace_for(&doc_path, &roots)
++            .cloned()
++            .or_else(|| roots.first().cloned())
+     }
+ 
+-    /// character_cache 全体から人名ハイライトの許可名集合を再構築し Highlighter に反映、
+-    /// クライアントへ semanticTokens の再取得を要求する。
+-    /// 名前集合が変化した場合は、キャラ名を Lindera ユーザー辞書に固有名詞として登録し直し、
+-    /// 旧辞書でトークナイズ済みのキャッシュを破棄する(誤分割されていた名前の再解析のため)。
++    /// character_store の全ワークスペース合計の許可名集合で Linderaユーザー辞書を再構築し、
++    /// クライアントへ semanticTokens の再取得を要求する。トークナイズ品質の担保だけが
++    /// 目的で、どのワークスペースの名前かはここでは区別しない
++    /// (ハイライト・hoverの最終判定はワークスペーススコープの許可名集合で別途行う)。
+     async fn refresh_highlight_names(&self) {
+-        let names = collect_allowed_names(&self.character_cache);
+-        debug!("refresh_highlight_names: {} 件の許可名", names.len());
+-        let changed = self.highlighter.set_allowed_names(names);
+-        if changed {
+-            if let Err(e) = self.highlighter.rebuild_user_dictionary() {
+-                warn!("ユーザー辞書の再構築に失敗: {}", e);
+-            }
+-            self.invalidate_token_caches();
++        let names = self.character_store.all_allowed_names();
++        debug!(
++            "refresh_highlight_names: {} 件の許可名(全ワークスペース合計)",
++            names.len()
++        );
++        if let Err(e) = self.highlighter.rebuild_user_dictionary(&names) {
++            warn!("ユーザー辞書の再構築に失敗: {}", e);
+         }
++        self.invalidate_token_caches();
+         if let Err(e) = self.client.semantic_tokens_refresh().await {
+             warn!("semantic_tokens_refresh failed: {:?}", e);
+         }
+@@ -1505,9 +1518,12 @@ impl Backend {
+     ///   idle 確定なら `min_chars` 以上で発火・未満でクリア。
+     /// - 現在の変更を取り込んだ後、`max_chars` 以上なら即時発火。
+     /// 発火時に spawn する非同期タスクは `crate::character_updater::run` だけ。
+-    fn record_change(&self, uri: &str, changes: &[TextDocumentContentChangeEvent]) {
++    /// ワークスペース解決(`resolve_workspace`)を伴うため async。
++    async fn record_change(&self, doc_uri: &Uri, changes: &[TextDocumentContentChangeEvent]) {
+         use std::sync::atomic::Ordering::Relaxed;
+ 
++        let uri = doc_uri.as_str();
++
+         if !self.character_updater_enabled.load(Relaxed) {
+             debug!("record_change[{}]: disabled, skip", uri);
+             return;
+@@ -1516,6 +1532,13 @@ impl Backend {
+             debug!("record_change[{}]: character file, skip", uri);
+             return;
+         }
++        let Some(workspace) = self.resolve_workspace(doc_uri).await else {
++            debug!(
++                "record_change[{}]: ワークスペースが特定できないためスキップ",
++                uri
++            );
++            return;
++        };
+ 
+         let state_arc = self
+             .update_states
+@@ -1619,7 +1642,8 @@ impl Backend {
+             );
+             tokio::spawn(crate::character_updater::run(
+                 uri.to_string(),
+-                self.workspace.clone(),
++                workspace,
++                self.character_store.clone(),
+                 text,
+                 self.background_llm.clone(),
+                 self.db.clone(),
+diff --git a/lsp/src/character.rs b/lsp/src/character.rs
+index 43b45e0..07fac21 100644
+--- a/lsp/src/character.rs
++++ b/lsp/src/character.rs
+@@ -8,11 +8,11 @@ use crate::llm::LlmError;
+ use comrak::arena_tree::NodeEdge;
+ use comrak::nodes::{AstNode, NodeValue};
+ use comrak::{Arena, options};
++#[allow(unused_imports)]
++use log::{debug, trace};
+ use std::collections::HashMap;
+ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+-#[allow(unused_imports)]
+-use log::{debug, trace};
+ 
+ #[derive(Debug, PartialEq, Clone)]
+ pub(crate) enum CharacterAttribute {
+@@ -92,58 +92,321 @@ pub(crate) struct CharacterEntry {
+     pub(crate) aliases: Vec<String>,
+ }
+ 
+-/// 1ファイル分のキャッシュ
+-#[derive(Debug)]
+-pub(crate) struct FileCacheEntry {
+-    pub(crate) modified: std::time::SystemTime,
+-    /// key: heading 全文（部分一致検索用）
++/// 1キャラクターファイルのメモリ上の正本。ディスクはこの値のload/dump先でしかない。
++#[derive(Debug, Clone)]
++pub(crate) struct CharacterFile {
++    /// 現在のMarkdown全文。書き込み(character_updater)・外部変更取り込みの両方でここが更新される。
++    pub(crate) content: String,
++    /// `content` から派生した読み取り用インデックス(ハイライト許可名・hover検索用)。
++    /// `content` を更新するたびに再計算する。
+     pub(crate) characters: HashMap<String, CharacterEntry>,
++    /// 直前にこのプロセス自身が書き込んだ内容のハッシュ。watcherイベントの内容ハッシュと
++    /// 一致すれば自己書き込みのエコーとして無視する(`CharacterStore::reconcile` が使う)。
++    pub(crate) last_written_hash: Option<u64>,
++}
++
++impl CharacterFile {
++    fn from_content(content: String) -> Self {
++        let characters = parse_all_content(&content);
++        Self {
++            content,
++            characters,
++            last_written_hash: None,
++        }
++    }
++}
++
++fn hash_content(s: &str) -> u64 {
++    use std::hash::{Hash, Hasher};
++    let mut h = std::collections::hash_map::DefaultHasher::new();
++    s.hash(&mut h);
++    h.finish()
++}
++
++fn add_allowed_name(n: &str, names: &mut std::collections::HashSet<String>) {
++    let n = n.trim();
++    if !n.is_empty() {
++        names.insert(n.to_string());
++    }
++}
++
++/// 「・」による複合名分割は行わない(西欧式の名・姓区切りとは限らず、分割するなら
++/// 姓・名の区分を登録時に別途持つ必要があるため)。文字数による除外も行わない
++/// (1文字の姓等も対象)。誤マッチ抑止はユーザー辞書側のコスト調整
++/// (`Highlighter::user_dict_csv_row`)で担保する。
++fn collect_names_from(
++    characters: &HashMap<String, CharacterEntry>,
++    names: &mut std::collections::HashSet<String>,
++) {
++    for (heading_key, entry) in characters {
++        add_allowed_name(character_display_name(heading_key), names);
++        for alias in &entry.aliases {
++            add_allowed_name(alias, names);
++        }
++    }
++}
++
++fn matches_surface(heading_key: &str, entry: &CharacterEntry, surface: &str) -> bool {
++    character_display_name(heading_key) == surface || entry.aliases.iter().any(|a| a == surface)
+ }
+ 
+-/// 全ファイルのキャッシュ (Arc で複数の CharacterInfoTool インスタンス間で共有)
++#[derive(Debug)]
++struct CharacterStoreState {
++    /// ワークスペースroot -> そのワークスペース配下のキャラクターファイル群
++    workspaces: parking_lot::Mutex<HashMap<PathBuf, HashMap<PathBuf, CharacterFile>>>,
++    /// ワークスペースroot単位の書き込み直列化ロック。`character_updater::run` がどの
++    /// ドキュメントURIから発火しても、同一ワークスペースの plan→バッチマージ→apply は
++    /// このロックで直列化される(同一キャラクターファイルへの並行read-modify-writeを防ぐ)。
++    write_locks: dashmap::DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>,
++}
++
++/// 全ワークスペースのキャラクター設定ファイルをメモリ上に保持する正本(SSoT)。
++/// ディスクはload/dump先でしかない(`Backend`と`CharacterInfoTool`で共有する)。
+ #[derive(Debug, Clone)]
+-pub(crate) struct CharacterCache(pub(crate) Arc<parking_lot::Mutex<HashMap<PathBuf, FileCacheEntry>>>);
++pub(crate) struct CharacterStore(Arc<CharacterStoreState>);
+ 
+-impl CharacterCache {
++impl CharacterStore {
+     pub(crate) fn new() -> Self {
+-        Self(Arc::new(parking_lot::Mutex::new(HashMap::new())))
++        Self(Arc::new(CharacterStoreState {
++            workspaces: parking_lot::Mutex::new(HashMap::new()),
++            write_locks: dashmap::DashMap::new(),
++        }))
+     }
+-}
+ 
+-/// workspace 内でキャラクター名に対応するファイルパスを解決する自由関数。
+-pub(crate) fn find_character_file_path(
+-    workspace: &Path,
+-    name: &str,
+-) -> std::result::Result<PathBuf, LlmError> {
+-    let single = workspace.join("characters").with_extension("md");
+-    trace!("{:?}", &single);
+-    if single.exists() && single.is_file() {
+-        return Ok(single);
+-    }
+-
+-    let dir = workspace.join("characters");
+-    if !dir.exists() || !dir.is_dir() {
+-        return Err(LlmError::GenericError {
+-            message: format!("Found no directory {:?}", &dir),
+-        });
+-    }
+-
+-    for entry in dir
+-        .read_dir()
+-        .map_err(|_| LlmError::GenericError {
+-            message: format!("Failed to read directory {:?}", &dir),
+-        })?
+-        .flatten()
+-    {
+-        debug!("{:?}", entry.file_name());
+-        if entry.file_name().to_string_lossy().starts_with(name) {
+-            return Ok(entry.path());
++    /// `root`配下のキャラクターファイル一覧を検出する(`characters.md`単一ファイル形式・
++    /// `characters/*.md`フォルダ形式の両対応)。`Backend`/`character_updater`どちらからも
++    /// 使う唯一のファイル探索実装。
++    pub(crate) fn discover_character_files(root: &Path) -> Vec<PathBuf> {
++        let mut files = Vec::new();
++
++        let single = root.join("characters").with_extension("md");
++        if single.is_file() {
++            files.push(single);
++        }
++
++        let dir = root.join("characters");
++        if dir.is_dir()
++            && let Ok(entries) = dir.read_dir()
++        {
++            for entry in entries.flatten() {
++                let path = entry.path();
++                if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
++                    files.push(path);
++                }
++            }
++        }
++
++        files
++    }
++
++    /// `root`配下のキャラクターファイルを列挙・読込・パースしてメモリへロードする。
++    /// 1件も見つからない場合は空の`characters.md`を新規作成してロードする。
++    pub(crate) async fn load_workspace(&self, root: &Path) {
++        let mut files = Self::discover_character_files(root);
++        if files.is_empty() {
++            let new_path = root.join("characters.md");
++            match tokio::fs::write(&new_path, "").await {
++                Ok(_) => {
++                    debug!("CharacterStore::load_workspace: created {:?}", new_path);
++                    files.push(new_path);
++                }
++                Err(e) => {
++                    debug!(
++                        "CharacterStore::load_workspace: characters.md新規作成に失敗 {:?}: {}",
++                        new_path, e
++                    );
++                    return;
++                }
++            }
+         }
++
++        let mut loaded = HashMap::new();
++        for path in files {
++            match tokio::fs::read_to_string(&path).await {
++                Ok(content) => {
++                    loaded.insert(path, CharacterFile::from_content(content));
++                }
++                Err(e) => debug!(
++                    "CharacterStore::load_workspace: 読み込み失敗 {:?}: {}",
++                    path, e
++                ),
++            }
++        }
++        self.0.workspaces.lock().insert(root.to_path_buf(), loaded);
++    }
++
++    /// ドキュメントパスを含む最長一致のワークスペースrootを返す。
++    pub(crate) fn resolve_workspace_for<'a>(
++        doc_path: &Path,
++        roots: &'a [PathBuf],
++    ) -> Option<&'a PathBuf> {
++        roots
++            .iter()
++            .filter(|root| doc_path.starts_with(root))
++            .max_by_key(|root| root.as_os_str().len())
++    }
++
++    /// 指定ワークスペースの許可名集合を構築する(人名ハイライトの絞り込み用)。
++    pub(crate) fn allowed_names(&self, workspace_root: &Path) -> std::collections::HashSet<String> {
++        let mut names = std::collections::HashSet::new();
++        let guard = self.0.workspaces.lock();
++        if let Some(files) = guard.get(workspace_root) {
++            for file in files.values() {
++                collect_names_from(&file.characters, &mut names);
++            }
++        }
++        names
++    }
++
++    /// 全ワークスペースの許可名の和集合(Linderaユーザー辞書構築用。トークナイズ品質の
++    /// 担保だけが目的で、どのワークスペースの名前かを区別する必要はない)。
++    pub(crate) fn all_allowed_names(&self) -> std::collections::HashSet<String> {
++        let mut names = std::collections::HashSet::new();
++        let guard = self.0.workspaces.lock();
++        for files in guard.values() {
++            for file in files.values() {
++                collect_names_from(&file.characters, &mut names);
++            }
++        }
++        names
++    }
++
++    /// 指定ワークスペース内のみを対象にした、`surface`(表示名/alias)に一致する
++    /// キャラクターの Markdown 化した説明文を返す(hover表示用)。
++    /// 同名のキャラが複数ファイルに存在する場合は "---" 区切りで連結して返す。
++    pub(crate) fn lookup_markdown(&self, workspace_root: &Path, surface: &str) -> Option<String> {
++        if surface.is_empty() {
++            return None;
++        }
++        let guard = self.0.workspaces.lock();
++        let files = guard.get(workspace_root)?;
++        let hits: Vec<String> = files
++            .values()
++            .flat_map(|f| f.characters.iter())
++            .filter(|(heading_key, entry)| matches_surface(heading_key, entry, surface))
++            .map(|(heading_key, entry)| character_entry_to_markdown(heading_key, entry))
++            .collect();
++        if hits.is_empty() {
++            None
++        } else {
++            Some(hits.join("\n\n---\n\n"))
++        }
++    }
++
++    /// `name`(部分一致)にマッチする最初のキャラクターについて、`tags`が示す属性の
++    /// セクション本文を返す(`CharacterInfoTool`用)。ワークスペース内の全ファイルを
++    /// 横断して検索する(1ファイルへの決め打ちをしない)。
++    pub(crate) fn search(
++        &self,
++        workspace_root: &Path,
++        name: &str,
++        tags: &[CharacterAttribute],
++    ) -> std::result::Result<String, LlmError> {
++        let guard = self.0.workspaces.lock();
++        let Some(files) = guard.get(workspace_root) else {
++            return Err(LlmError::GenericError {
++                message: format!("No character files loaded for workspace {:?}", workspace_root),
++            });
++        };
++        for file in files.values() {
++            let Some((_, entry)) = file.characters.iter().find(|(k, _)| k.contains(name)) else {
++                continue;
++            };
++            let matched: Vec<&str> = entry
++                .sections
++                .iter()
++                .filter(|s| tags.iter().any(|t| s.tags.contains(t)))
++                .map(|s| s.text.trim())
++                .filter(|t| !t.is_empty())
++                .collect();
++            if !matched.is_empty() {
++                return Ok(matched.join("\n\n"));
++            }
++        }
++        Err(LlmError::GenericError {
++            message: format!("Character '{}' not found (or no matching sections)", name),
++        })
++    }
++
++    /// メモリの`content`/`characters`/`last_written_hash`を即座に更新してからディスクへ
++    /// 書き出す。メモリ更新はディスク書き込みの成否と独立(メモリが正本、ディスクは
++    /// ベストエフォートな永続化という設計上の帰結)。
++    pub(crate) async fn write(
++        &self,
++        workspace_root: &Path,
++        path: &Path,
++        new_content: String,
++    ) -> std::io::Result<()> {
++        let hash = hash_content(&new_content);
++        {
++            let mut guard = self.0.workspaces.lock();
++            let files = guard.entry(workspace_root.to_path_buf()).or_default();
++            let mut file = CharacterFile::from_content(new_content.clone());
++            file.last_written_hash = Some(hash);
++            files.insert(path.to_path_buf(), file);
++        }
++        tokio::fs::write(path, new_content).await
++    }
++
++    /// `did_save`/`did_change_watched_files`から呼ぶ。`disk_content`のハッシュが
++    /// 直前の自己書き込みハッシュと一致すればエコーとして無視し`false`を返す。
++    /// 不一致なら真の外部変更としてメモリを全置換し`true`を返す
++    /// (呼び出し側は`true`のときだけ`refresh_highlight_names`等の後続処理をする)。
++    pub(crate) fn reconcile(&self, workspace_root: &Path, path: &Path, disk_content: String) -> bool {
++        let hash = hash_content(&disk_content);
++        let mut guard = self.0.workspaces.lock();
++        let files = guard.entry(workspace_root.to_path_buf()).or_default();
++        if let Some(existing) = files.get(path)
++            && existing.last_written_hash == Some(hash)
++        {
++            return false;
++        }
++        files.insert(path.to_path_buf(), CharacterFile::from_content(disk_content));
++        true
++    }
++
++    /// 指定ワークスペースの該当ファイルをメモリから除去する(削除イベント用)。
++    pub(crate) fn remove(&self, workspace_root: &Path, path: &Path) {
++        if let Some(files) = self.0.workspaces.lock().get_mut(workspace_root) {
++            files.remove(path);
++        }
++    }
++
++    /// 指定ワークスペースのキャラクターファイルパス一覧を返す。
++    pub(crate) fn files_in(&self, workspace_root: &Path) -> Vec<PathBuf> {
++        self.0
++            .workspaces
++            .lock()
++            .get(workspace_root)
++            .map(|f| f.keys().cloned().collect())
++            .unwrap_or_default()
++    }
++
++    /// 指定ワークスペースの、指定パスの現在のMarkdown全文を返す。
++    pub(crate) fn content_of(&self, workspace_root: &Path, path: &Path) -> Option<String> {
++        self.0
++            .workspaces
++            .lock()
++            .get(workspace_root)?
++            .get(path)
++            .map(|f| f.content.clone())
+     }
+ 
+-    Err(LlmError::GenericError {
+-        message: format!("Found no file for '{}' in {:?}", name, &dir),
+-    })
++    /// ワークスペースroot単位の書き込みロックを取得する。`character_updater::run`が
++    /// どのドキュメントURIから発火しても、同一ワークスペースの plan→バッチマージ→apply
++    /// はこのガードが生きている間、直列化される。
++    pub(crate) async fn acquire_write_lock(
++        &self,
++        workspace_root: &Path,
++    ) -> tokio::sync::OwnedMutexGuard<()> {
++        let lock = self
++            .0
++            .write_locks
++            .entry(workspace_root.to_path_buf())
++            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
++            .clone();
++        lock.lock_owned().await
++    }
+ }
+ 
+ /// ファイル内の heading 構造からキャラクターを表す heading レベルを推定する。
+@@ -152,7 +415,7 @@ pub(crate) fn find_character_file_path(
+ /// 最も出現回数が多い「子持ちレベル」を返す。タイ時は深レベル(より多くの # を持つ)優先。
+ /// 例: `# Story / ## キャラ / ### 属性` のように各レベルが 1 件ずつの場合、
+ /// タイトル(1)よりキャラクター(2)を選ぶ方が意味的に正しい。
+-fn detect_char_level<'a>(root: &'a AstNode<'a>) -> u8 {
++pub(crate) fn detect_char_level<'a>(root: &'a AstNode<'a>) -> u8 {
+     let mut counts: HashMap<u8, usize> = HashMap::new();
+     let mut has_sub: Vec<u8> = Vec::new();
+     let mut prev: u8 = 0;
+@@ -212,7 +475,6 @@ pub(crate) fn detect_char_level_str(text: &str) -> u8 {
+ /// Markdown 文字列をパースし、全キャラクターの全セクションを `HashMap` で返す。
+ ///
+ /// キーは heading 全文（例: "ジェフ・クライン（艦長）"）。
+-/// 属性 heading のテキストを「・」で分割してタグ群を生成する。
+ pub(crate) fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry> {
+     let arena = Arena::new();
+     let options = comrak_options();
+@@ -259,7 +521,7 @@ pub(crate) fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry
+                 current_section = None;
+                 if h.level == char_level {
+                     let t = heading_text(node);
+-                    trace!("{}", t);
++                    debug!("{}", t);
+                     current_char = Some(t);
+                 } else {
+                     // タイトルなどキャラクターレベルより上の heading はスキップ
+@@ -269,7 +531,7 @@ pub(crate) fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry
+             NodeValue::Heading(h) if h.level == char_level + 1 && current_char.is_some() => {
+                 flush_section!();
+                 let t = heading_text(node);
+-                trace!("{}", t);
++                debug!("{}", t);
+                 let tags = t
+                     .split(['・', '、', ',', '/', ' '])
+                     .filter_map(|s| CharacterAttribute::try_from(s).ok())
+@@ -318,40 +580,6 @@ fn character_display_name(heading_key: &str) -> &str {
+     heading_key[..end].trim()
+ }
+ 
+-/// `character_cache` 全体から、人名ハイライトの絞り込みに使う許可名集合を構築する。
+-/// 各キャラの表示名・aliasesに加え、「・」区切りの複合名は各部分も対象に含める
+-/// （例: "ジェフ・クライン" -> "ジェフ・クライン","ジェフ","クライン"）。
+-/// 1文字の断片は助詞等との誤マッチが起きやすいため除外する。
+-pub(crate) fn collect_allowed_names(cache: &CharacterCache) -> std::collections::HashSet<String> {
+-    let mut names = std::collections::HashSet::new();
+-
+-    let mut add_name = |n: &str| {
+-        let n = n.trim();
+-        if n.chars().count() >= 2 {
+-            names.insert(n.to_string());
+-        }
+-    };
+-
+-    let guard = cache.0.lock();
+-    for file_entry in guard.values() {
+-        for heading_key in file_entry.characters.keys() {
+-            let display_name = character_display_name(heading_key);
+-            add_name(display_name);
+-            for part in display_name.split('・') {
+-                add_name(part);
+-            }
+-            for alias in &file_entry.characters[heading_key].aliases {
+-                add_name(alias);
+-                for part in alias.split('・') {
+-                    add_name(part);
+-                }
+-            }
+-        }
+-    }
+-
+-    names
+-}
+-
+ /// キャラクターエントリを、キャラ情報ツール向けの完全な Markdown ドキュメントへ変換する。
+ fn character_entry_to_markdown(heading_key: &str, entry: &CharacterEntry) -> String {
+     let mut out = format!("# {}", heading_key);
+@@ -361,62 +589,14 @@ fn character_entry_to_markdown(heading_key: &str, entry: &CharacterEntry) -> Str
+         if text.is_empty() {
+             continue;
+         }
+-        if section.tags.is_empty() {
+-            // 見出しが CharacterAttribute に認識されなかったセクション。
+-            // 元の生見出し文字列は保持していないため、誤ったラベルを付けるより本文のみ出す。
+-            out.push_str(&format!("\n\n{}", text));
+-        } else {
+-            let heading = section
+-                .tags
+-                .iter()
+-                .map(|t| t.canonical_heading())
+-                .collect::<Vec<_>>()
+-                .join("・");
+-            out.push_str(&format!("\n\n## {}\n{}", heading, text));
+-        }
++        out.push_str(&format!("\n\n{}", text));
+     }
+ 
+     out
+ }
+ 
+-/// `character_cache` 全体を横断し、`surface`(表示名/「・」分割部分名/alias)に一致する
+-/// キャラクターを探して Markdown 化した説明文を返す(ホバー表示用)。
+-/// 一致判定は `collect_allowed_names` と同じルールを逆向きに適用する。
+-/// 同名のキャラが複数ファイルに存在する場合は "---" 区切りで連結して返す。
+-pub(crate) fn lookup_character_markdown(cache: &CharacterCache, surface: &str) -> Option<String> {
+-    if surface.chars().count() < 2 {
+-        return None;
+-    }
+-
+-    let matches_surface = |heading_key: &str, entry: &CharacterEntry| -> bool {
+-        let display_name = character_display_name(heading_key);
+-        if display_name == surface || display_name.split('・').any(|p| p == surface) {
+-            return true;
+-        }
+-        entry
+-            .aliases
+-            .iter()
+-            .any(|a| a == surface || a.split('・').any(|p| p == surface))
+-    };
+-
+-    let guard = cache.0.lock();
+-    let hits: Vec<String> = guard
+-        .values()
+-        .flat_map(|file_entry| file_entry.characters.iter())
+-        .filter(|(heading_key, entry)| matches_surface(heading_key, entry))
+-        .map(|(heading_key, entry)| character_entry_to_markdown(heading_key, entry))
+-        .collect();
+-    drop(guard);
+-
+-    if hits.is_empty() {
+-        None
+-    } else {
+-        Some(hits.join("\n\n---\n\n"))
+-    }
+-}
+-
+ /// 見出しノードの直接子から `Text` ノードを結合してキャラクター名や属性名を返す。
+-fn heading_text<'a>(node: &'a AstNode<'a>) -> String {
++pub(crate) fn heading_text<'a>(node: &'a AstNode<'a>) -> String {
+     node.children()
+         .filter_map(|c| {
+             if let NodeValue::Text(ref cow) = c.data.borrow().value {
+@@ -451,7 +631,6 @@ fn node_to_plain_text<'a>(node: &'a AstNode<'a>) -> String {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use crate::tools::CharacterInfoTool;
+     use indoc::indoc;
+ 
+     const CHARACTERS_MD: &str = indoc!(
+@@ -486,11 +665,15 @@ mod tests {
+         "
+     );
+ 
+-    fn make_entry(md: &str) -> FileCacheEntry {
+-        FileCacheEntry {
+-            modified: std::time::SystemTime::UNIX_EPOCH,
+-            characters: parse_all_content(md),
++    /// テスト用: 単一ワークスペース("/ws")に`files`(ファイル名, Markdown全文)を
++    /// 全て読み込んだ`CharacterStore`を作る。
++    fn make_store(files: &[(&str, &str)]) -> (CharacterStore, PathBuf) {
++        let store = CharacterStore::new();
++        let root = PathBuf::from("/ws");
++        for (name, md) in files {
++            store.reconcile(&root, &root.join(name), md.to_string());
+         }
++        (store, root)
+     }
+ 
+     #[test]
+@@ -507,24 +690,24 @@ mod tests {
+ 
+     #[test]
+     fn test_parse_characters_md_background() {
+-        let entry = make_entry(CHARACTERS_MD);
+-        let result = CharacterInfoTool::search_cache(&entry, "クライン", &["背景".to_string()]);
++        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
++        let result = store.search(&root, "クライン", &[CharacterAttribute::Background]);
+         assert!(result.is_ok(), "{:?}", result);
+         assert!(result.unwrap().contains("予備役"));
+     }
+ 
+     #[test]
+     fn test_parse_characters_md_expression() {
+-        let entry = make_entry(CHARACTERS_MD);
+-        let result = CharacterInfoTool::search_cache(&entry, "シルビア", &["描写".to_string()]);
++        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
++        let result = store.search(&root, "シルビア", &[CharacterAttribute::Style]);
+         assert!(result.is_ok(), "{:?}", result);
+         assert!(result.unwrap().contains("成長の兆し"));
+     }
+ 
+     #[test]
+     fn test_parse_characters_md_personality() {
+-        let entry = make_entry(CHARACTERS_MD);
+-        let result = CharacterInfoTool::search_cache(&entry, "ジェフ", &["性格".to_string()]);
++        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
++        let result = store.search(&root, "ジェフ", &[CharacterAttribute::Personality]);
+         assert!(result.is_ok(), "{:?}", result);
+         assert!(result.unwrap().starts_with("落ち着いていて"));
+     }
+@@ -532,14 +715,14 @@ mod tests {
+     #[test]
+     fn test_parse_characters_md_multi_tag_from_heading() {
+         // "性格・口調" heading が ["性格", "口調"] に分割されること
+-        let entry = make_entry(CHARACTERS_MD);
+-        let by_kuchou = CharacterInfoTool::search_cache(&entry, "ジェフ", &["口調".to_string()]);
++        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
++        let by_kuchou = store.search(&root, "ジェフ", &[CharacterAttribute::Expression]);
+         assert!(
+             by_kuchou.is_ok(),
+             "「口調」タグでヒットしない: {:?}",
+             by_kuchou
+         );
+-        let by_seikaku = CharacterInfoTool::search_cache(&entry, "ジェフ", &["性格".to_string()]);
++        let by_seikaku = store.search(&root, "ジェフ", &[CharacterAttribute::Personality]);
+         assert_eq!(
+             by_kuchou.unwrap(),
+             by_seikaku.unwrap(),
+@@ -550,11 +733,11 @@ mod tests {
+     #[test]
+     fn test_parse_characters_md_or_search() {
+         // 複数タグ OR 検索: 異なるセクションがまとめて返ること
+-        let entry = make_entry(CHARACTERS_MD);
+-        let result = CharacterInfoTool::search_cache(
+-            &entry,
++        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
++        let result = store.search(
++            &root,
+             "クライン",
+-            &["背景".to_string(), "性格".to_string()],
++            &[CharacterAttribute::Background, CharacterAttribute::Personality],
+         );
+         assert!(result.is_ok(), "{:?}", result);
+         let text = result.unwrap();
+@@ -567,8 +750,8 @@ mod tests {
+ 
+     #[test]
+     fn test_parse_characters_md_failure() {
+-        let entry = make_entry(CHARACTERS_MD);
+-        let result = CharacterInfoTool::search_cache(&entry, "ユルゲン", &["性格".to_string()]);
++        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
++        let result = store.search(&root, "ユルゲン", &[CharacterAttribute::Personality]);
+         assert!(result.is_err(), "存在しないキャラクターでエラーにならない");
+     }
+ 
+@@ -593,6 +776,41 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_detect_char_level_str_with_story_heading() {
++        // # Story / ## キャラ / ### 属性 の構造
++        let md = "\
++# Story
++## ジェフ
++### 性格
++- 落ち着いている。
++## シルビア
++### 背景
++- 不明。
++";
++        assert_eq!(detect_char_level_str(md), 2);
++    }
++
++    #[test]
++    fn test_detect_char_level_str_top_level_chars() {
++        // # キャラ / ## 属性 の構造
++        let md = "\
++# ジェフ
++## 性格
++- 落ち着いている。
++# シルビア
++## 背景
++- 不明。
++";
++        assert_eq!(detect_char_level_str(md), 1);
++    }
++
++    #[test]
++    fn test_detect_char_level_str_empty() {
++        assert_eq!(detect_char_level_str(""), 0);
++        assert_eq!(detect_char_level_str("本文だけ、見出しなし。"), 0);
++    }
++
+     #[test]
+     fn test_parse_aliases_from_heading() {
+         const MD: &str = indoc!(
+@@ -644,17 +862,13 @@ mod tests {
+ 
+     #[test]
+     fn test_collect_allowed_names() {
+-        let cache = CharacterCache::new();
+-        cache
+-            .0
+-            .lock()
+-            .insert(PathBuf::from("characters.md"), make_entry(CHARACTERS_MD));
+-        let names = collect_allowed_names(&cache);
++        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
++        let names = store.allowed_names(&root);
+ 
+-        // フルネーム・「・」分割された部分名が含まれること
++        // フルネーム(表示名)がそのまま含まれること。「・」による分割は行わない
+         assert!(names.contains("ジェフ・クライン"), "{:?}", names);
+-        assert!(names.contains("ジェフ"), "{:?}", names);
+-        assert!(names.contains("クライン"), "{:?}", names);
++        assert!(!names.contains("ジェフ"), "{:?}", names);
++        assert!(!names.contains("クライン"), "{:?}", names);
+         assert!(names.contains("シルビア"), "{:?}", names);
+ 
+         // alias未登録の役職名は含まれないこと
+@@ -670,15 +884,25 @@ mod tests {
+             - 隊長
+             "
+         );
+-        let cache = CharacterCache::new();
+-        cache
+-            .0
+-            .lock()
+-            .insert(PathBuf::from("characters.md"), make_entry(MD));
+-        let names = collect_allowed_names(&cache);
++        let (store, root) = make_store(&[("characters.md", MD)]);
++        let names = store.allowed_names(&root);
+         assert!(names.contains("隊長"), "{:?}", names);
+     }
+ 
++    #[test]
++    fn test_collect_allowed_names_includes_single_char_alias() {
++        const MD: &str = indoc!(
++            "## 原顕三郎（司令）
++            ### 呼称
++            - 原
++            "
++        );
++        let (store, root) = make_store(&[("characters.md", MD)]);
++        let names = store.allowed_names(&root);
++        // 1文字のaliasも文字数で除外されず許可名に含まれること
++        assert!(names.contains("原"), "{:?}", names);
++    }
++
+     #[test]
+     fn test_character_entry_to_markdown() {
+         let chars = parse_all_content(CHARACTERS_MD);
+@@ -700,26 +924,18 @@ mod tests {
+ 
+     #[test]
+     fn test_lookup_character_markdown_display_name() {
+-        let cache = CharacterCache::new();
+-        cache
+-            .0
+-            .lock()
+-            .insert(PathBuf::from("characters.md"), make_entry(CHARACTERS_MD));
+-        let md =
+-            lookup_character_markdown(&cache, "ジェフ・クライン").expect("表示名で見つかるはず");
++        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
++        let md = store
++            .lookup_markdown(&root, "ジェフ・クライン")
++            .expect("表示名で見つかるはず");
+         assert!(md.contains("予備役"), "{}", md);
+     }
+ 
+     #[test]
+-    fn test_lookup_character_markdown_split_part() {
+-        let cache = CharacterCache::new();
+-        cache
+-            .0
+-            .lock()
+-            .insert(PathBuf::from("characters.md"), make_entry(CHARACTERS_MD));
+-        let md =
+-            lookup_character_markdown(&cache, "クライン").expect("「・」分割部分名で見つかるはず");
+-        assert!(md.contains("予備役"), "{}", md);
++    fn test_lookup_character_markdown_does_not_match_partial_name() {
++        // 「・」による複合名分割は行わないため、部分名では見つからないこと
++        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
++        assert!(store.lookup_markdown(&root, "クライン").is_none());
+     }
+ 
+     #[test]
+@@ -732,25 +948,34 @@ mod tests {
+             - ムサイ艦の艦長。
+             "
+         );
+-        let cache = CharacterCache::new();
+-        cache
+-            .0
+-            .lock()
+-            .insert(PathBuf::from("characters.md"), make_entry(MD));
+-        let md = lookup_character_markdown(&cache, "隊長").expect("aliasで見つかるはず");
++        let (store, root) = make_store(&[("characters.md", MD)]);
++        let md = store.lookup_markdown(&root, "隊長").expect("aliasで見つかるはず");
+         assert!(md.contains("艦長"), "{}", md);
+     }
+ 
+     #[test]
+     fn test_lookup_character_markdown_miss() {
+-        let cache = CharacterCache::new();
+-        cache
+-            .0
+-            .lock()
+-            .insert(PathBuf::from("characters.md"), make_entry(CHARACTERS_MD));
+-        assert!(lookup_character_markdown(&cache, "存在しない人").is_none());
+-        // 1文字はノイズ除外(collect_allowed_namesと同じ基準)で必ずNone
+-        assert!(lookup_character_markdown(&cache, "ジ").is_none());
++        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
++        assert!(store.lookup_markdown(&root, "存在しない人").is_none());
++        // どの表示名/aliasとも完全一致しないため None
++        assert!(store.lookup_markdown(&root, "ジ").is_none());
++    }
++
++    #[test]
++    fn test_lookup_character_markdown_single_char_alias() {
++        const MD: &str = indoc!(
++            "## 原顕三郎（司令）
++            ### 呼称
++            - 原
++            ### 背景・立場
++            - 遣泰艦隊司令。
++            "
++        );
++        let (store, root) = make_store(&[("characters.md", MD)]);
++        let md = store
++            .lookup_markdown(&root, "原")
++            .expect("1文字aliasで見つかるはず");
++        assert!(md.contains("遣泰艦隊司令"), "{}", md);
+     }
+ 
+     #[test]
+@@ -767,16 +992,15 @@ mod tests {
+             - 通信班所属。
+             "
+         );
+-        let cache = CharacterCache::new();
+-        {
+-            let mut guard = cache.0.lock();
+-            guard.insert(PathBuf::from("a.md"), make_entry(MD_A));
+-            guard.insert(PathBuf::from("b.md"), make_entry(MD_B));
+-        }
++        let (store, root) = make_store(&[("a.md", MD_A), ("b.md", MD_B)]);
+ 
+-        let md_a = lookup_character_markdown(&cache, "アリス").expect("a.mdのキャラが見つかるはず");
++        let md_a = store
++            .lookup_markdown(&root, "アリス")
++            .expect("a.mdのキャラが見つかるはず");
+         assert!(md_a.contains("整備班"), "{}", md_a);
+-        let md_b = lookup_character_markdown(&cache, "ボブ").expect("b.mdのキャラが見つかるはず");
++        let md_b = store
++            .lookup_markdown(&root, "ボブ")
++            .expect("b.mdのキャラが見つかるはず");
+         assert!(md_b.contains("通信班"), "{}", md_b);
+     }
+ 
+@@ -794,17 +1018,60 @@ mod tests {
+             - B船の通信士。
+             "
+         );
+-        let cache = CharacterCache::new();
+-        {
+-            let mut guard = cache.0.lock();
+-            guard.insert(PathBuf::from("a.md"), make_entry(MD_A));
+-            guard.insert(PathBuf::from("b.md"), make_entry(MD_B));
+-        }
++        let (store, root) = make_store(&[("a.md", MD_A), ("b.md", MD_B)]);
+ 
+-        let md =
+-            lookup_character_markdown(&cache, "タナカ").expect("両ファイルのタナカが見つかるはず");
++        let md = store
++            .lookup_markdown(&root, "タナカ")
++            .expect("両ファイルのタナカが見つかるはず");
+         assert!(md.contains("A船の整備士"), "{}", md);
+         assert!(md.contains("B船の通信士"), "{}", md);
+         assert!(md.contains("---"), "{} に区切り線が含まれるはず", md);
+     }
++
++    #[tokio::test]
++    async fn test_reconcile_ignores_self_write_echo() {
++        // write() で書いた内容と同じ内容のreconcileは自己書き込みのエコーとしてfalseを返す
++        // (再パース不要・変更なし)。異なる内容なら真の外部変更としてtrueを返す。
++        let dir = std::env::temp_dir().join("ff_character_store_echo_test");
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("characters.md");
++
++        let store = CharacterStore::new();
++        store
++            .write(&dir, &path, CHARACTERS_MD.to_string())
++            .await
++            .unwrap();
++
++        assert!(
++            !store.reconcile(&dir, &path, CHARACTERS_MD.to_string()),
++            "自己書き込みと同一内容はエコーとして無視されるはず"
++        );
++
++        let changed = format!("{}\n追記。", CHARACTERS_MD);
++        assert!(
++            store.reconcile(&dir, &path, changed.clone()),
++            "内容が異なれば真の外部変更として取り込まれるはず"
++        );
++        assert_eq!(store.content_of(&dir, &path), Some(changed));
++
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn test_resolve_workspace_for_picks_longest_match() {
++        let roots = vec![PathBuf::from("/ws"), PathBuf::from("/ws/nested")];
++        let doc = PathBuf::from("/ws/nested/chapters/ch01.md");
++        assert_eq!(
++            CharacterStore::resolve_workspace_for(&doc, &roots),
++            Some(&roots[1])
++        );
++    }
++
++    #[test]
++    fn test_resolve_workspace_for_no_match_returns_none() {
++        let roots = vec![PathBuf::from("/ws")];
++        let doc = PathBuf::from("/other/chapters/ch01.md");
++        assert_eq!(CharacterStore::resolve_workspace_for(&doc, &roots), None);
++    }
+ }
+diff --git a/lsp/src/character_ast.rs b/lsp/src/character_ast.rs
+new file mode 100644
+index 0000000..2266548
+--- /dev/null
++++ b/lsp/src/character_ast.rs
+@@ -0,0 +1,428 @@
++//! `character_updater` の適用フェーズ(`apply_plan`)向け、comrak AST ベースの
++//! Markdownドキュメント編集プリミティブ。
++//!
++//! 旧実装は `replace_section`/`append_attribute_section` 等、行ベースの文字列
++//! スプライシングで見出し検出・本文差し替えを独自に再実装していた(ATX見出しのみ対応、
++//! コードフェンスの ``` のみ対応、見出しはレンダリング後テキストへの部分一致等)。
++//!
++//! ここでは代わりに、ただ1つのプリミティブに統一する:
++//! **新規/置換テキストを対象ドキュメントと同じ `Arena` に追記パースし、
++//! 結果のノード列を `insert_before`/`append`/`detach` で繋ぎ替える。**
++//!
++//! これにより `NodeValue::Heading` 等を手組みする必要が無くなり、ブロック境界の判定は
++//! 常に comrak 自身のパーサに委譲される(フェンス誤検出・setext非対応等の脆さが構造的に無くなる)。
++//!
++//! `Arena` は `Send` ではないため、ここでの操作は `apply_plan` の `async` 関数内で
++//! `.await` をまたがない同期スコープに閉じ込めて使うこと。
++
++use crate::character::{CharacterAttribute, comrak_options, heading_text};
++use comrak::Arena;
++use comrak::nodes::{AstNode, NodeHeading, NodeValue};
++
++/// 見出しノードのレベル(1〜6)を返す。見出しでなければ `None`。
++fn heading_level(node: &AstNode) -> Option<u8> {
++    match node.data.borrow().value {
++        NodeValue::Heading(NodeHeading { level, .. }) => Some(level),
++        _ => None,
++    }
++}
++
++/// 見出しテキストを区切り文字（「・」「、」「,」「/」半角スペース）で分割し、
++/// `CharacterAttribute` として解釈できるものだけを返す。
++/// `replace_section`(旧実装)が使っていたのと同じ規則。
++fn heading_attribute_tags(text: &str) -> Vec<CharacterAttribute> {
++    text.split(['・', '、', ',', '/', ' '])
++        .filter_map(|s| CharacterAttribute::try_from(s).ok())
++        .collect()
++}
++
++/// `root` の直接の子から、見出しテキストが `char_name` を含む最初の見出しノードを探す。
++/// 見つかった場合は (ノード, レベル) を返す。
++fn find_char_heading<'a>(root: &'a AstNode<'a>, char_name: &str) -> Option<(&'a AstNode<'a>, u8)> {
++    root.children().find_map(|n| {
++        let level = heading_level(n)?;
++        heading_text(n).contains(char_name).then_some((n, level))
++    })
++}
++
++/// `start` の次の兄弟から走査し、レベルが `max_level` 以下の見出しに最初に出会ったノードを返す。
++/// 見つからなければ `None`(＝ドキュメント末尾までがセクション)。
++fn next_heading_at_or_above<'a>(start: &'a AstNode<'a>, max_level: u8) -> Option<&'a AstNode<'a>> {
++    let mut cur = start.next_sibling();
++    while let Some(n) = cur {
++        if let Some(lv) = heading_level(n) {
++            if lv <= max_level {
++                return Some(n);
++            }
++        }
++        cur = n.next_sibling();
++    }
++    None
++}
++
++/// `start`(exclusive)から `end`(exclusive、`None` ならドキュメント末尾まで)の間にある
++/// 兄弟ノードを出現順に集める。
++fn siblings_between<'a>(
++    start: &'a AstNode<'a>,
++    end: Option<&'a AstNode<'a>>,
++) -> Vec<&'a AstNode<'a>> {
++    let mut out = Vec::new();
++    let mut cur = start.next_sibling();
++    while let Some(n) = cur {
++        if let Some(e) = end {
++            if std::ptr::eq(n, e) {
++                break;
++            }
++        }
++        out.push(n);
++        cur = n.next_sibling();
++    }
++    out
++}
++
++/// 1ファイル分のMarkdownドキュメントを保持し、複数の変異操作を逐次適用できるようにする。
++/// 最終的に `render()` で1回だけCommonMark文字列化する。
++pub struct FileDoc<'a> {
++    arena: &'a Arena<'a>,
++    root: &'a AstNode<'a>,
++    options: comrak::Options<'static>,
++}
++
++impl<'a> FileDoc<'a> {
++    /// 既存ファイルの内容(または新規ファイル用の空文字列)をパースする。
++    pub fn parse(arena: &'a Arena<'a>, text: &str) -> Self {
++        let mut options = comrak_options();
++        // 行ベース時代の互換のためインデント型ではなくフェンス型でコードブロックを保持する。
++        options.render.prefer_fenced = true;
++        let root = comrak::parse_document(arena, text, &options);
++        Self {
++            arena,
++            root,
++            options,
++        }
++    }
++
++    /// テキスト断片を、このドキュメントと同じ `arena` に追記パースする。
++    /// 返り値の子ノード群は `self.root` へ `insert_before`/`append` でそのまま繋ぎ替えられる。
++    fn parse_fragment(&self, text: &str) -> &'a AstNode<'a> {
++        comrak::parse_document(self.arena, text, &self.options)
++    }
++
++    /// ドキュメント全体をCommonMarkとしてレンダリングする。
++    pub fn render(&self) -> String {
++        let mut buf = String::new();
++        comrak::format_commonmark(self.root, &self.options, &mut buf)
++            .expect("format_commonmark はメモリ上のバッファ書き込みで失敗しない");
++        buf
++    }
++
++    /// 指定キャラクター・属性のセクション本文を丸ごと差し替える。
++    /// 対象(キャラクター見出し、または属性見出し)が見つからない場合は `false`。
++    /// `new_body` が空(trim後)の場合は本文を空にする(旧 `replace_section` と同じ)。
++    pub fn replace_section(
++        &self,
++        char_name: &str,
++        attribute: &CharacterAttribute,
++        new_body: &str,
++    ) -> bool {
++        let Some((char_heading, char_level)) = find_char_heading(self.root, char_name) else {
++            return false;
++        };
++        let char_block_end = next_heading_at_or_above(char_heading, char_level);
++
++        // 属性見出し候補: キャラクターブロック内で、レベルが char_level+1 の見出し。
++        let attr_heading = siblings_between(char_heading, char_block_end)
++            .into_iter()
++            .find(|n| {
++                heading_level(n) == Some(char_level + 1)
++                    && heading_attribute_tags(&heading_text(n)).contains(attribute)
++            });
++        let Some(attr_heading) = attr_heading else {
++            return false;
++        };
++
++        // このセクションの終端: 属性見出し自身と同レベル以上の見出み、無ければキャラブロック終端。
++        let section_end =
++            next_heading_at_or_above(attr_heading, char_level + 1).or(char_block_end);
++
++        for n in siblings_between(attr_heading, section_end) {
++            n.detach();
++        }
++
++        if !new_body.trim().is_empty() {
++            let fragment = self.parse_fragment(new_body);
++            let new_nodes: Vec<_> = fragment.children().collect();
++            for n in new_nodes {
++                match section_end {
++                    Some(end) => end.insert_before(n),
++                    None => self.root.append(n),
++                }
++            }
++        }
++
++        true
++    }
++
++    /// 指定キャラクターの見出しブロック末尾に、新しい属性セクションを追記する。
++    /// キャラクター見出しが見つからない場合は `false`。
++    pub fn append_attribute_section(
++        &self,
++        char_name: &str,
++        attr_heading: &str,
++        body: &str,
++    ) -> bool {
++        let Some((char_heading, char_level)) = find_char_heading(self.root, char_name) else {
++            return false;
++        };
++        let char_block_end = next_heading_at_or_above(char_heading, char_level);
++
++        let attr_prefix = "#".repeat((char_level + 1) as usize);
++        let fragment_text = format!("{} {}\n{}\n", attr_prefix, attr_heading, body.trim_end());
++        let fragment = self.parse_fragment(&fragment_text);
++        let new_nodes: Vec<_> = fragment.children().collect();
++        for n in new_nodes {
++            match char_block_end {
++                Some(end) => end.insert_before(n),
++                None => self.root.append(n),
++            }
++        }
++
++        true
++    }
++
++    /// ドキュメント末尾に、新規キャラクターのブロックを全属性まとめて追記する。
++    /// 見出しレベルは既存ドキュメントから推測し、不明な場合は `#`/`##` を使用する
++    /// (`character::detect_char_level` に委譲)。
++    pub fn append_new_character(&self, char_name: &str, sections: &[(&'static str, String)]) {
++        let cl = crate::character::detect_char_level(self.root);
++        let (cl, al) = if cl == 0 { (1, 2) } else { (cl, cl + 1) };
++        let char_prefix = "#".repeat(cl as usize);
++        let attr_prefix = "#".repeat(al as usize);
++
++        let mut text = format!("{} {}\n", char_prefix, char_name);
++        for (heading, body) in sections {
++            text.push_str(&format!("\n{} {}\n{}\n", attr_prefix, heading, body.trim_end()));
++        }
++
++        let fragment = self.parse_fragment(&text);
++        let new_nodes: Vec<_> = fragment.children().collect();
++        for n in new_nodes {
++            self.root.append(n);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const SAMPLE_MD: &str = "\
++# Story
++## ジェフ（艦長）
++### 背景
++- 予備役上がり。
++### 性格・口調
++- 落ち着いている。
++## シルビア
++### 性格
++- 真面目。
++";
++
++    #[test]
++    fn test_replace_section_found() {
++        let arena = Arena::new();
++        let doc = FileDoc::parse(&arena, SAMPLE_MD);
++        let ok = doc.replace_section(
++            "ジェフ",
++            &CharacterAttribute::Background,
++            "- 予備役上がりで、元警備隊員。\n- フォン・ブラウン出身。",
++        );
++        assert!(ok);
++        let out = doc.render();
++        assert!(out.contains("予備役上がりで、元警備隊員"));
++        assert!(out.contains("フォン・ブラウン出身"));
++        assert!(
++            out.contains("落ち着いている"),
++            "他セクションが保持されること: {out}"
++        );
++        assert!(out.contains("シルビア"), "別キャラが保持されること: {out}");
++    }
++
++    #[test]
++    fn test_replace_section_can_still_replace_body() {
++        let arena = Arena::new();
++        let doc = FileDoc::parse(&arena, SAMPLE_MD);
++        let ok = doc.replace_section(
++            "ジェフ",
++            &CharacterAttribute::Background,
++            "- 元警備隊員で予備役上がり。",
++        );
++        assert!(ok);
++        let out = doc.render();
++        assert!(out.contains("元警備隊員で予備役上がり"));
++        assert!(
++            !out.contains("- 予備役上がり。\n"),
++            "replace_section 自体は指定本文へ差し替えること: {out}"
++        );
++        assert!(
++            out.contains("落ち着いている"),
++            "他セクションが保持されること: {out}"
++        );
++        assert!(out.contains("シルビア"), "別キャラが保持されること: {out}");
++    }
++
++    #[test]
++    fn test_replace_section_not_found() {
++        let arena = Arena::new();
++        let doc = FileDoc::parse(&arena, SAMPLE_MD);
++        // appearance セクションはないので false
++        let ok = doc.replace_section("ジェフ", &CharacterAttribute::Appearance, "特になし");
++        assert!(!ok);
++    }
++
++    #[test]
++    fn test_replace_section_other_char_untouched() {
++        let arena = Arena::new();
++        let doc = FileDoc::parse(&arena, SAMPLE_MD);
++        let ok = doc.replace_section(
++            "シルビア",
++            &CharacterAttribute::Personality,
++            "- 真面目だが、緊張しやすい面もある。",
++        );
++        assert!(ok);
++        let out = doc.render();
++        assert!(
++            out.contains("落ち着いている"),
++            "ジェフのセクションが保持されること: {out}"
++        );
++        assert!(
++            out.contains("真面目だが、緊張しやすい面もある"),
++            "意味的に統合されたテキストを書けること: {out}"
++        );
++    }
++
++    #[test]
++    fn test_append_attribute_section_to_existing_char() {
++        let md = "\
++# Story
++## ジェフ（艦長）
++### 性格
++- 落ち着いている。
++## シルビア
++### 背景
++- 不明。
++";
++        let arena = Arena::new();
++        let doc = FileDoc::parse(&arena, md);
++        let ok = doc.append_attribute_section("ジェフ", "外見", "- 長身で白髪。");
++        assert!(ok);
++        let out = doc.render();
++        // 新属性がジェフのブロック内（シルビアの前）に挿入される
++        let jeff_end = out.find("## シルビア").unwrap_or(out.len());
++        assert!(out.contains("外見"), "属性見出しがあること: {out}");
++        assert!(
++            out.find("外見").unwrap() < jeff_end,
++            "シルビアより前に挿入されること: {out}"
++        );
++        assert!(
++            out.contains("落ち着いている"),
++            "既存属性が保持されること: {out}"
++        );
++        assert!(out.contains("シルビア"), "他キャラが保持されること: {out}");
++    }
++
++    #[test]
++    fn test_append_attribute_section_at_eof() {
++        // キャラが最後のブロック(次の同レベル見出しがない)
++        let md = "\
++## ジェフ
++### 性格
++- 落ち着いている。
++";
++        let arena = Arena::new();
++        let doc = FileDoc::parse(&arena, md);
++        let ok = doc.append_attribute_section("ジェフ", "外見", "- 長身。");
++        assert!(ok);
++        let out = doc.render();
++        assert!(out.contains("外見"), "属性見出しがあること: {out}");
++        assert!(out.contains("長身"), "属性本文があること: {out}");
++        assert!(
++            out.contains("落ち着いている"),
++            "既存属性が保持されること: {out}"
++        );
++    }
++
++    #[test]
++    fn test_append_attribute_section_char_not_found() {
++        let md = "## ジェフ\n### 性格\n- 落ち着いている。\n";
++        let arena = Arena::new();
++        let doc = FileDoc::parse(&arena, md);
++        let ok = doc.append_attribute_section("存在しない", "外見", "- 不明。");
++        assert!(!ok);
++    }
++
++    #[test]
++    fn test_append_new_character() {
++        let md = "\
++# Story
++## ジェフ
++### 性格
++- 落ち着いている。
++";
++        let arena = Arena::new();
++        let doc = FileDoc::parse(&arena, md);
++        doc.append_new_character("新キャラ", &[("背景", "- 謎の人物。".to_string())]);
++        let out = doc.render();
++        assert!(out.contains("新キャラ"), "新キャラ見出しがあること: {out}");
++        assert!(out.contains("背景"), "属性見出しがあること: {out}");
++        assert!(out.contains("謎の人物"), "属性本文があること: {out}");
++        assert!(
++            out.contains("落ち着いている"),
++            "既存キャラが保持されること: {out}"
++        );
++        let jeff_pos = out.find("ジェフ").unwrap();
++        let new_pos = out.find("新キャラ").unwrap();
++        assert!(new_pos > jeff_pos, "新キャラが末尾に追加されること: {out}");
++    }
++
++    #[test]
++    fn test_append_new_character_empty_file() {
++        // 空ファイルはデフォルトレベル(1/2)を使用
++        let arena = Arena::new();
++        let doc = FileDoc::parse(&arena, "");
++        doc.append_new_character("新キャラ", &[("性格", "- 明るい。".to_string())]);
++        let out = doc.render();
++        assert!(out.contains("# 新キャラ"), "レベル1のキャラ見出し: {out}");
++        assert!(out.contains("## 性格"), "レベル2の属性見出し: {out}");
++        assert!(out.contains("明るい"), "属性本文: {out}");
++    }
++
++    #[test]
++    fn test_multiple_ops_applied_to_same_doc_in_sequence() {
++        // apply_plan のファイル単位バッチ適用を模したシナリオ:
++        // 同一ドキュメントへ「既存キャラの差し替え」「既存キャラへの追記」
++        // 「新規キャラ追加」を順に適用しても、全て正しく反映されること。
++        let arena = Arena::new();
++        let doc = FileDoc::parse(&arena, SAMPLE_MD);
++
++        assert!(doc.replace_section(
++            "ジェフ",
++            &CharacterAttribute::Background,
++            "- 予備役上がりで、元警備隊員。",
++        ));
++        assert!(doc.append_attribute_section("ジェフ", "外見", "- 長身。"));
++        doc.append_new_character("新キャラ", &[("性格", "- 明るい。".to_string())]);
++
++        let out = doc.render();
++        assert!(out.contains("元警備隊員"), "{out}");
++        assert!(out.contains("外見"), "{out}");
++        assert!(out.contains("長身"), "{out}");
++        assert!(out.contains("新キャラ"), "{out}");
++        assert!(out.contains("明るい"), "{out}");
++        assert!(out.contains("シルビア"), "他キャラが保持されること: {out}");
++        assert!(
++            out.contains("落ち着いている"),
++            "ジェフの他セクションが保持されること: {out}"
++        );
++    }
++}
+diff --git a/lsp/src/character_updater.rs b/lsp/src/character_updater.rs
+index 7f80464..073132b 100644
+--- a/lsp/src/character_updater.rs
++++ b/lsp/src/character_updater.rs
+@@ -1,4 +1,5 @@
+-use crate::character::{CharacterAttribute, parse_all_content, split_aliases};
++use crate::character::{CharacterAttribute, CharacterStore, parse_all_content, split_aliases};
++use crate::character_ast::FileDoc;
+ use crate::flight_recorder::FlightRecorder;
+ use crate::llm::{Content, LlmInterface, ModelCapability};
+ use crate::text::{extract_json, shorten_middle};
+@@ -131,7 +132,11 @@ fn value_to_text(v: &Value) -> String {
+ /// フラット形式 `{name, attribute, text}` の1項目を正規化する。
+ /// `text` が文字列以外の場合はフラット化して救済する。
+ fn update_from_flat(item: &Value) -> Option<UpdateItem> {
+-    let name = item.get("name").and_then(|v| v.as_str())?.trim().to_string();
++    let name = item
++        .get("name")
++        .and_then(|v| v.as_str())?
++        .trim()
++        .to_string();
+     let attribute = item
+         .get("attribute")
+         .and_then(|v| v.as_str())?
+@@ -198,119 +203,13 @@ fn parse_updates(response: &str) -> Option<Vec<UpdateItem>> {
+     None
+ }
+ 
+-/// Markdown ファイルのテキストを行走査して、指定キャラクター・属性のセクション本文を差し替える。
+-/// 対象が見つかった場合は新しいファイル全体のテキストを返し、見つからなければ None を返す。
+-pub fn replace_section(
+-    file_text: &str,
+-    char_name: &str,
+-    attribute: &CharacterAttribute,
+-    new_body: &str,
+-) -> Option<String> {
+-    let lines: Vec<&str> = file_text.lines().collect();
+-    let total = lines.len();
+-
+-    // heading の "#" 数と見出しテキストを返す(owned String で返してライフタイム問題を回避)
+-    let parse_heading = |line: &str, in_fence: bool| -> Option<(u8, String)> {
+-        if in_fence {
+-            return None;
+-        }
+-        let trimmed = line.trim_end();
+-        if !trimmed.starts_with('#') {
+-            return None;
+-        }
+-        let level = trimmed.bytes().take_while(|&b| b == b'#').count() as u8;
+-        let text = trimmed[level as usize..].trim().to_string();
+-        Some((level, text))
+-    };
+-
+-    let mut in_fence = false;
+-    let mut char_level: Option<u8> = None;
+-    let mut char_start: Option<usize> = None;
+-    let mut attr_body_start: Option<usize> = None;
+-    let mut attr_body_end: Option<usize> = None;
+-
+-    for (i, &line) in lines.iter().enumerate() {
+-        if line.trim_start().starts_with("```") {
+-            in_fence = !in_fence;
+-        }
+-
+-        if let Some((level, text)) = parse_heading(line, in_fence) {
+-            if let Some(cl) = char_level {
+-                if level <= cl {
+-                    // キャラクターレベルより上か同レベルの heading に来た → キャラクター終了
+-                    if attr_body_start.is_some() && attr_body_end.is_none() {
+-                        attr_body_end = Some(i);
+-                        break;
+-                    }
+-                    char_level = None;
+-                    char_start = None;
+-                    attr_body_start = None;
+-                }
+-                if let Some(astart) = attr_body_start {
+-                    if attr_body_end.is_none() && level <= cl + 1 {
+-                        // 属性ヘッダより同レベル/上位の heading → セクション終了
+-                        attr_body_end = Some(i);
+-                        break;
+-                    }
+-                    let _ = astart;
+-                }
+-                if attr_body_start.is_none() && level == cl + 1 {
+-                    // 属性ヘッダ候補
+-                    let attr_tags: Vec<CharacterAttribute> = text
+-                        .split(['・', '、', ',', '/', ' '])
+-                        .filter_map(|s| CharacterAttribute::try_from(s).ok())
+-                        .collect();
+-                    if attr_tags.contains(attribute) {
+-                        attr_body_start = Some(i + 1);
+-                    }
+-                }
+-            } else {
+-                // キャラクターヘッダを探す
+-                if text.contains(char_name) {
+-                    char_level = Some(level);
+-                    char_start = Some(i);
+-                }
+-            }
+-        }
+-    }
+-
+-    // ファイル末尾でセクション終了した場合
+-    if attr_body_start.is_some() && attr_body_end.is_none() {
+-        attr_body_end = Some(total);
+-    }
+-
+-    let (body_start, body_end) = match (attr_body_start, attr_body_end) {
+-        (Some(s), Some(e)) => (s, e),
+-        _ => return None,
+-    };
+-
+-    let _ = char_start;
+-
+-    let mut out = String::new();
+-    for (i, &line) in lines.iter().enumerate() {
+-        if i < body_start || i >= body_end {
+-            out.push_str(line);
+-            out.push('\n');
+-        } else if i == body_start {
+-            if !new_body.is_empty() {
+-                out.push_str(new_body);
+-                if !new_body.ends_with('\n') {
+-                    out.push('\n');
+-                }
+-            }
+-        }
+-    }
+-
+-    Some(out)
+-}
+-
+ /// 書き込み直前に Markdown 全体を comrak で正規化する(パース→CommonMark 書き戻し)。
+ /// パースと同じ `comrak_options` を使い、折返しなし(width=0)・箇条書き "-" で出力する。
+-/// セクション差し替え・追記の繰り返しで生じる空行や記法の不揃いを、書き込みのたびに整える。
++/// `character_ast::FileDoc` は既にこの正規化を経た文字列を返すため、通常は冪等な
++/// 安全ネットとしてのみ働く。
+ fn format_markdown(text: &str) -> String {
+     let mut options = crate::character::comrak_options();
+-    // インデント型ではなくフェンス型でコードブロックを保持する
+-    // (replace_section 等の行走査が ``` フェンスを前提にしているため)。
++    // インデント型ではなくフェンス型でコードブロックを保持する。
+     options.render.prefer_fenced = true;
+     comrak::markdown_to_commonmark(text, &options)
+ }
+@@ -355,7 +254,8 @@ fn strip_attribute_label(text: &str, attr: &CharacterAttribute) -> String {
+ 
+     let trimmed = text.trim_start();
+     match trimmed.split_once('\n') {
+-        Some((first_line, rest)) => match strip_label_from_line(first_line, canonical, english_key) {
++        Some((first_line, rest)) => match strip_label_from_line(first_line, canonical, english_key)
++        {
+             Some(stripped) => {
+                 let stripped = stripped.trim_start();
+                 if stripped.is_empty() {
+@@ -419,7 +319,11 @@ fn merge_alias_bodies(old_body: &str, new_text: &str, char_name: &str) -> Option
+ /// 新規セクション/新規キャラクターの本文を組み立てる。
+ /// Alias は箇条書きへ正規化し(`merge_alias_bodies` を空の旧本文で流用)、
+ /// 追加すべき別名が無ければ `None`(呼び出し側で "no change" として記録・スキップする)。
+-fn build_new_section_body(attr: &CharacterAttribute, new_text: &str, char_name: &str) -> Option<String> {
++fn build_new_section_body(
++    attr: &CharacterAttribute,
++    new_text: &str,
++    char_name: &str,
++) -> Option<String> {
+     if *attr == CharacterAttribute::Alias {
+         merge_alias_bodies("", new_text, char_name)
+     } else {
+@@ -514,6 +418,8 @@ fn build_batch_merge_prompt(groups: &[CharMergeGroup]) -> Option<String> {
+ /// 各 `merged_text` にはコードフェンス除去・前置きラベル除去を適用する。
+ /// パース不能・スキーマ不一致の要素は黙って読み飛ばす(欠落分は呼び出し側で old 維持)。
+ fn extract_batch_merges(raw: &str) -> HashMap<(String, String), String> {
++    debug!("raw: {}", raw);
++
+     let mut out = HashMap::new();
+     let Some(json) = extract_json(raw) else {
+         return out;
+@@ -639,9 +545,14 @@ impl Drop for RunningGuard {
+ /// `full_text` は発火時にスナップショットした編集ファイルの全文テキスト。
+ /// 完了時は `running = false` に戻すだけで、カウンタはリセットしない
+ /// (発火時に既にリセット済み・実行中に入った編集を保持するため)。
++/// `workspace` は呼び出し元(`Backend::record_change`)が発火元ドキュメントのURIから
++/// `CharacterStore::resolve_workspace_for` で解決済みのものを渡す(旧: `workspace_arc.first()`
++/// を常に使っていたため、複数ワークスペースを開いていると誤ったワークスペースに書き込む
++/// バグがあった)。
+ pub async fn run(
+     uri: String,
+-    workspace_arc: Arc<TokioMutex<Vec<PathBuf>>>,
++    workspace: PathBuf,
++    character_store: CharacterStore,
+     full_text: String,
+     llm: Arc<TokioMutex<Option<Box<dyn LlmInterface>>>>,
+     recorder: Arc<FlightRecorder>,
+@@ -661,44 +572,27 @@ pub async fn run(
+         return;
+     }
+ 
+-    let workspace = {
+-        let ws = workspace_arc.lock().await;
+-        ws.first().cloned().unwrap_or_default()
+-    };
+     debug!("character_updater::run: workspace={:?}", workspace);
+ 
+-    // 1. characters/*.md を全て収集(1件も無ければ characters.md を新規作成して処理を続ける)
+-    let mut char_files = collect_character_files(&workspace).await;
+-    if char_files.is_empty() {
+-        debug!(
+-            "character_updater: no character files found under {:?}, creating characters.md",
+-            workspace
+-        );
+-        let new_path = workspace.join("characters.md");
+-        match tokio::fs::write(&new_path, "").await {
+-            Ok(_) => {
+-                info!("character_updater: created {:?}", new_path);
+-                char_files.push(new_path);
+-            }
+-            Err(e) => {
+-                error!("character_updater: failed to create characters.md: {}", e);
+-                return;
+-            }
+-        }
++    // 1. character_store が当該ワークスペースを未ロードなら、ここでロードする
++    // (1件も無ければ CharacterStore::load_workspace が characters.md を新規作成する)。
++    if character_store.files_in(&workspace).is_empty() {
++        character_store.load_workspace(&workspace).await;
+     }
+     debug!(
+         "character_updater::run: {} character file(s) found",
+-        char_files.len()
++        character_store.files_in(&workspace).len()
+     );
+ 
+     // 2. プロンプトを読み込み、frontmatter を分離(補完側と共通のヘルパを使用)
+-    let (prompt_body, frontmatter_data) = match crate::frontmatter::load_prompt("prompt_character_update.md") {
+-        Some(v) => v,
+-        None => {
+-            error!("prompt_character_update.md not found");
+-            return;
+-        }
+-    };
++    let (prompt_body, frontmatter_data) =
++        match crate::frontmatter::load_prompt("prompt_character_update.md") {
++            Some(v) => v,
++            None => {
++                error!("prompt_character_update.md not found");
++                return;
++            }
++        };
+ 
+     let prompt = prompt_body.replace("{{TEXT}}", &full_text);
+ 
+@@ -781,13 +675,17 @@ pub async fn run(
+                     }
+                 }
+ 
+-                // 5. 差し替え・追記・新規作成を適用
++                // 5. 差し替え・追記・新規作成を適用。
++                // ワークスペース単位の書き込みロックで plan→バッチマージ→apply を直列化する
++                // (別ドキュメントから発火した並行runが同じキャラクターファイルを
++                // 同時に読み書きしてロストアップデートになるのを防ぐ)。
+                 match updates {
+                     Some(items) => {
++                        let _write_guard = character_store.acquire_write_lock(&workspace).await;
+                         apply_updates(
+                             &items,
+                             update_id,
+-                            char_files,
++                            &character_store,
+                             &workspace,
+                             &recorder,
+                             llm_client.as_mut(),
+@@ -811,33 +709,6 @@ pub async fn run(
+     // _guard が Drop されて running = false に戻る
+ }
+ 
+-/// characters/ 配下の全 .md ファイルのパスを収集する。
+-async fn collect_character_files(workspace: &Path) -> Vec<PathBuf> {
+-    let mut files = Vec::new();
+-
+-    let single = workspace.join("characters.md");
+-    if single.is_file() {
+-        files.push(single);
+-        return files;
+-    }
+-
+-    let dir = workspace.join("characters");
+-    if !dir.is_dir() {
+-        return files;
+-    }
+-
+-    if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+-        while let Ok(Some(entry)) = entries.next_entry().await {
+-            let p = entry.path();
+-            if p.extension().map(|e| e == "md").unwrap_or(false) {
+-                files.push(p);
+-            }
+-        }
+-    }
+-
+-    files
+-}
+-
+ /// 宛先の物理セクションを一意に識別するキー(解決後セクション同一性)。
+ /// 属性シノニム(「性格」/"personality")や多タグ見出し(「性格・口調」)は
+ /// 同じ `sec_idx` に解決されるため、このキーで自然に1宛先へ合流する。
+@@ -967,8 +838,12 @@ fn merge_into_new(
+     // 既出の新規キャラ op へ合流。同属性セクションが既にあれば本文へ連結する
+     // (plan[op_idx] を可変借用中は plan.push できないため、Skip はフラグ経由で後から積む)。
+     let mut skip_rec: Option<RecordInfo> = None;
+-    if let ResolvedOp::AppendCharacter { sections, records, .. }
+-    | ResolvedOp::CreateFile { sections, records, .. } = &mut plan[op_idx]
++    if let ResolvedOp::AppendCharacter {
++        sections, records, ..
++    }
++    | ResolvedOp::CreateFile {
++        sections, records, ..
++    } = &mut plan[op_idx]
+     {
+         match sections
+             .iter_mut()
+@@ -1017,7 +892,8 @@ fn plan_updates(
+     let mut plan: Vec<ResolvedOp> = Vec::new();
+     let mut groups: Vec<CharMergeGroup> = Vec::new();
+ 
+-    let mut parsed: HashMap<PathBuf, HashMap<String, crate::character::CharacterEntry>> = HashMap::new();
++    let mut parsed: HashMap<PathBuf, HashMap<String, crate::character::CharacterEntry>> =
++        HashMap::new();
+     // 合流用インデックス群。値は plan / groups 内の位置。
+     let mut merge_by_section: HashMap<SectionKey, (usize, usize, usize)> = HashMap::new(); // (group, sec, op)
+     let mut alias_by_section: HashMap<SectionKey, usize> = HashMap::new();
+@@ -1182,8 +1058,9 @@ fn plan_updates(
+                 };
+                 match merge_alias_bodies(&current, &new_text, name) {
+                     Some(m) => {
+-                        if let ResolvedOp::ReplaceAlias { merged, records, .. } =
+-                            &mut plan[op_idx]
++                        if let ResolvedOp::ReplaceAlias {
++                            merged, records, ..
++                        } = &mut plan[op_idx]
+                         {
+                             *merged = m;
+                             records.push(rec);
+@@ -1328,10 +1205,7 @@ async fn run_batch_merge(
+     }
+     llm_client.add(Content::Text(prompt));
+     let resp = llm_client.chat().await?;
+-    debug!(
+-        "character_updater: batch merge response received :{}",
+-        resp
+-    );
++    debug!("character_updater: batch merge response received :{}", resp);
+     let mut merged = extract_batch_merges(&resp);
+ 
+     // 全滅判定: 期待キーが1件も引けない応答はスキーマ不適合とみなす
+@@ -1385,43 +1259,354 @@ fn record_all(
+     }
+ }
+ 
+-/// Markdown を整形して書き込み、records 全件の成否を記録する。
+-async fn write_and_record(
+-    file: &Path,
+-    content: &str,
++/// 1つの `ResolvedOp` を `FileDoc` に適用した結果。
++/// `wrote` は「このopがドキュメントに変更を加えたか」であり、実際にファイルへ
++/// 書き込まれるかどうか(グループ内に1つでも `wrote` な op があるか)とは独立している。
++struct OpOutcome {
++    records: Vec<RecordInfo>,
++    old: Option<String>,
++    wrote: bool,
++    note: Option<&'static str>,
++    /// 新規キャラクター作成(AppendCharacter/CreateFile)の場合に true。ログ文言の出し分けに使う。
++    is_new_character: bool,
++}
++
++/// `Skip`/`CreateFile` 以外の `ResolvedOp` が対象とする既存ファイルパスを返す。
++fn existing_op_file(op: &ResolvedOp) -> Option<&Path> {
++    match op {
++        ResolvedOp::Merge { file, .. }
++        | ResolvedOp::ReplaceAlias { file, .. }
++        | ResolvedOp::AppendSection { file, .. }
++        | ResolvedOp::AppendCharacter { file, .. } => Some(file.as_path()),
++        ResolvedOp::Skip { .. } | ResolvedOp::CreateFile { .. } => None,
++    }
++}
++
++/// `FileDoc` に対して1つの `ResolvedOp` を適用し、結果を `OpOutcome` として返す。
++/// `Skip` はグルーピング前に処理済みのためここには来ない。
++fn apply_one_op(
++    doc: &FileDoc,
++    op: ResolvedOp,
++    merged_map: Option<&HashMap<(String, String), String>>,
++) -> OpOutcome {
++    match op {
++        ResolvedOp::Skip { .. } => unreachable!("Skip はグルーピング前に処理済み"),
++        ResolvedOp::Merge {
++            section_name,
++            attr,
++            key,
++            old_body,
++            records,
++            ..
++        } => {
++            let looked = merged_map.and_then(|m| lookup_merged(m, &key.0, &key.1, &attr));
++            let Some(m) = looked else {
++                // マージ結果が不確定なら書かない(old 維持)。
++                let note = if merged_map.is_some() {
++                    "merge missing"
++                } else {
++                    "semantic merge failed"
++                };
++                warn!(
++                    "character_updater: no batch merge result for {}/{}, keep old",
++                    key.0, key.1
++                );
++                return OpOutcome {
++                    records,
++                    old: Some(old_body),
++                    wrote: false,
++                    note: Some(note),
++                    is_new_character: false,
++                };
++            };
++            // 意味マージ LLM がラベルを付けてきた場合の保険。
++            let m = strip_attribute_label(m, &attr);
++            if m.trim().is_empty() || m.trim() == old_body.trim() {
++                debug!(
++                    "character_updater: {}/{} no change to merge, skip",
++                    key.0, key.1
++                );
++                return OpOutcome {
++                    records,
++                    old: Some(old_body),
++                    wrote: false,
++                    note: Some("no change"),
++                    is_new_character: false,
++                };
++            }
++            if doc.replace_section(&section_name, &attr, &m) {
++                OpOutcome {
++                    records,
++                    old: Some(old_body),
++                    wrote: true,
++                    note: None,
++                    is_new_character: false,
++                }
++            } else {
++                warn!(
++                    "character_updater: replace_section failed for {}/{}",
++                    key.0, key.1
++                );
++                OpOutcome {
++                    records,
++                    old: Some(old_body),
++                    wrote: false,
++                    note: Some("replace_section failed"),
++                    is_new_character: false,
++                }
++            }
++        }
++        ResolvedOp::ReplaceAlias {
++            section_name,
++            old,
++            merged,
++            records,
++            ..
++        } => {
++            if doc.replace_section(&section_name, &CharacterAttribute::Alias, &merged) {
++                OpOutcome {
++                    records,
++                    old: Some(old),
++                    wrote: true,
++                    note: None,
++                    is_new_character: false,
++                }
++            } else {
++                warn!(
++                    "character_updater: replace_section failed for {}/呼称",
++                    section_name
++                );
++                OpOutcome {
++                    records,
++                    old: Some(old),
++                    wrote: false,
++                    note: Some("replace_section failed"),
++                    is_new_character: false,
++                }
++            }
++        }
++        ResolvedOp::AppendSection {
++            section_name,
++            heading,
++            body,
++            records,
++            ..
++        } => {
++            if doc.append_attribute_section(&section_name, heading, &body) {
++                OpOutcome {
++                    records,
++                    old: None,
++                    wrote: true,
++                    note: None,
++                    is_new_character: false,
++                }
++            } else {
++                warn!(
++                    "character_updater: append_attribute_section failed for {}/{}",
++                    section_name, heading
++                );
++                OpOutcome {
++                    records,
++                    old: None,
++                    wrote: false,
++                    note: Some("append_attribute_section failed"),
++                    is_new_character: false,
++                }
++            }
++        }
++        ResolvedOp::AppendCharacter {
++            name,
++            sections,
++            records,
++            ..
++        } => {
++            doc.append_new_character(&name, &sections);
++            OpOutcome {
++                records,
++                old: None,
++                wrote: true,
++                note: None,
++                is_new_character: true,
++            }
++        }
++        ResolvedOp::CreateFile {
++            name,
++            sections,
++            records,
++        } => {
++            doc.append_new_character(&name, &sections);
++            OpOutcome {
++                records,
++                old: None,
++                wrote: true,
++                note: None,
++                is_new_character: true,
++            }
++        }
++    }
++}
++
++/// 1ファイル宛ての `ResolvedOp` 群を、1回の read/parse/write にまとめて適用する。
++/// `is_create` はグループ内の全 op が `CreateFile`(＝対象ファイルがまだ存在しない)であることを示す。
++async fn apply_ops_to_file(
++    file: PathBuf,
++    ops: Vec<ResolvedOp>,
++    is_create: bool,
++    merged_map: Option<&HashMap<(String, String), String>>,
+     update_id: i64,
+-    records: &[RecordInfo],
+-    old: Option<&str>,
++    workspace: &Path,
++    character_store: &CharacterStore,
+     recorder: &FlightRecorder,
+ ) {
+-    match tokio::fs::write(file, format_markdown(content)).await {
+-        Ok(_) => {
+-            for r in records {
+-                info!("character_updater: updated {}/{}", r.name, r.attr_str);
++    // character_store のメモリ内容を読む(ディスクは読まない。メモリがSSoTのため)。
++    let content = if is_create {
++        String::new()
++    } else {
++        match character_store.content_of(workspace, &file) {
++            Some(c) => c,
++            None => {
++                warn!(
++                    "character_updater: {:?} が character_store に見つからない",
++                    file
++                );
++                for op in ops {
++                    let records = match op {
++                        ResolvedOp::Merge { records, .. }
++                        | ResolvedOp::ReplaceAlias { records, .. }
++                        | ResolvedOp::AppendSection { records, .. }
++                        | ResolvedOp::AppendCharacter { records, .. }
++                        | ResolvedOp::CreateFile { records, .. } => records,
++                        ResolvedOp::Skip { .. } => unreachable!("Skip はグルーピング前に処理済み"),
++                    };
++                    record_all(
++                        recorder,
++                        update_id,
++                        &records,
++                        None,
++                        false,
++                        Some("character file not loaded in store"),
++                    );
++                }
++                return;
+             }
+-            record_all(recorder, update_id, records, old, true, None);
+         }
+-        Err(e) => {
+-            error!("character_updater: failed to write {:?}: {}", file, e);
+-            record_all(recorder, update_id, records, old, false, Some("write failed"));
++    };
++
++    // AST 変異は同期スコープに閉じ込める(Arena は Send ではないため .await をまたげない)。
++    let (rendered, outcomes) = {
++        let arena = comrak::Arena::new();
++        let doc = FileDoc::parse(&arena, &content);
++        let outcomes: Vec<OpOutcome> = ops
++            .into_iter()
++            .map(|op| apply_one_op(&doc, op, merged_map))
++            .collect();
++        (doc.render(), outcomes)
++    };
++
++    let any_write = outcomes.iter().any(|o| o.wrote);
++    if any_write {
++        if let Some(parent) = file.parent() {
++            if let Err(e) = tokio::fs::create_dir_all(parent).await {
++                error!(
++                    "character_updater: failed to create characters directory {:?}: {}",
++                    parent, e
++                );
++                for o in &outcomes {
++                    record_all(
++                        recorder,
++                        update_id,
++                        &o.records,
++                        o.old.as_deref(),
++                        false,
++                        Some("failed to create characters directory"),
++                    );
++                }
++                return;
++            }
++        }
++        // character_store.write がメモリ更新(＋自己書き込みハッシュの記録)とディスクdumpを
++        // まとめて行う(メモリがSSoT、ディスクはload/dump先でしかないという設計の帰結)。
++        match character_store
++            .write(workspace, &file, format_markdown(&rendered))
++            .await
++        {
++            Ok(_) => {
++                for o in &outcomes {
++                    if !o.wrote {
++                        continue;
++                    }
++                    if o.is_new_character {
++                        info!("character_updater: created/updated {:?}", file);
++                    }
++                    for r in &o.records {
++                        info!(
++                            "character_updater: updated {}/{}: {}",
++                            r.name, r.attr_str, r.new_text
++                        );
++                    }
++                }
++                for o in &outcomes {
++                    record_all(
++                        recorder,
++                        update_id,
++                        &o.records,
++                        o.old.as_deref(),
++                        o.wrote,
++                        o.note,
++                    );
++                }
++                return;
++            }
++            Err(e) => {
++                error!("character_updater: failed to write {:?}: {}", file, e);
++                for o in &outcomes {
++                    let (success, note) = if o.wrote {
++                        (false, Some("write failed"))
++                    } else {
++                        (false, o.note)
++                    };
++                    record_all(recorder, update_id, &o.records, o.old.as_deref(), success, note);
++                }
++                return;
++            }
+         }
+     }
++
++    // 何も変更が無かった場合(全 op が no-change/not-found 等) → ファイルには触れない。
++    for o in &outcomes {
++        record_all(
++            recorder,
++            update_id,
++            &o.records,
++            o.old.as_deref(),
++            o.wrote,
++            o.note,
++        );
++    }
+ }
+ 
+-/// (C) 適用フェーズ: 解決済み操作を逐次適用する。
+-/// 各操作は書き込み直前にファイルを読み直す(read-fresh)ため、同一ファイル内の
+-/// 先行書き込みと合成される(replace_section は対象セクションの行区間のみ差し替えるので
+-/// 他セクションへの書き込みとは干渉しない)。
++/// (C) 適用フェーズ: 解決済み操作をファイル単位にグルーピングし、
++/// ファイルごとに1回だけ read → AST 構築 → 全op適用 → render → write する
++/// (旧: opごとに read-fresh して行ベースで部分差し替え)。
+ /// `merged_map` が `None` の場合はバッチマージ自体が失敗している(全 Merge を old 維持で記録)。
+ async fn apply_plan(
+     plan: Vec<ResolvedOp>,
+     merged_map: Option<&HashMap<(String, String), String>>,
+     update_id: i64,
+     workspace: &Path,
++    character_store: &CharacterStore,
+     recorder: &FlightRecorder,
+ ) {
++    let chars_dir = workspace.join("characters");
++
++    // ファイルパス(既存ファイル、または CreateFile 用に新規算出したパス)ごとに op をまとめる。
++    // 出現順を保つため、初出順のキー列を別途持つ。
++    let mut order: Vec<PathBuf> = Vec::new();
++    let mut groups: HashMap<PathBuf, Vec<ResolvedOp>> = HashMap::new();
++    let mut create_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
++
+     for op in plan {
+-        match op {
++        let path = match &op {
+             ResolvedOp::Skip { record, note, old } => {
+                 debug!(
+                     "character_updater: {}/{} skip: {}",
+@@ -1436,233 +1621,56 @@ async fn apply_plan(
+                     false,
+                     Some(note),
+                 );
++                continue;
+             }
+-            ResolvedOp::Merge {
+-                file,
+-                section_name,
+-                attr,
+-                key,
+-                old_body,
+-                records,
+-            } => {
+-                let looked = merged_map.and_then(|m| lookup_merged(m, &key.0, &key.1, &attr));
+-                let Some(m) = looked else {
+-                    // マージ結果が不確定なら書かない(old 維持)。
+-                    let note = if merged_map.is_some() {
+-                        "merge missing"
+-                    } else {
+-                        "semantic merge failed"
+-                    };
+-                    warn!(
+-                        "character_updater: no batch merge result for {}/{}, keep old",
+-                        key.0, key.1
+-                    );
+-                    record_all(recorder, update_id, &records, Some(&old_body), false, Some(note));
+-                    continue;
+-                };
+-                // 意味マージ LLM がラベルを付けてきた場合の保険。
+-                let m = strip_attribute_label(m, &attr);
+-                if m.trim().is_empty() || m.trim() == old_body.trim() {
+-                    debug!(
+-                        "character_updater: {}/{} no change to merge, skip",
+-                        key.0, key.1
++            ResolvedOp::CreateFile { name, records, .. } => {
++                let stem = sanitize_file_stem(name);
++                if stem.trim_matches('_').is_empty() {
++                    error!(
++                        "character_updater: cannot convert character name {:?} to a file name",
++                        name
+                     );
+                     record_all(
+                         recorder,
+                         update_id,
+-                        &records,
+-                        Some(&old_body),
++                        records,
++                        None,
+                         false,
+-                        Some("no change"),
++                        Some("failed to create character file"),
+                     );
+                     continue;
+                 }
+-                let content = match tokio::fs::read_to_string(&file).await {
+-                    Ok(c) => c,
+-                    Err(e) => {
+-                        warn!(
+-                            "character_updater: failed to read character file {:?}: {}",
+-                            file, e
+-                        );
+-                        record_all(
+-                            recorder,
+-                            update_id,
+-                            &records,
+-                            Some(&old_body),
+-                            false,
+-                            Some("failed to read character file"),
+-                        );
+-                        continue;
+-                    }
+-                };
+-                match replace_section(&content, &section_name, &attr, &m) {
+-                    Some(c) => {
+-                        write_and_record(&file, &c, update_id, &records, Some(&old_body), recorder)
+-                            .await
+-                    }
+-                    None => {
+-                        warn!(
+-                            "character_updater: replace_section failed for {}/{}",
+-                            key.0, key.1
+-                        );
+-                        record_all(
+-                            recorder,
+-                            update_id,
+-                            &records,
+-                            Some(&old_body),
+-                            false,
+-                            Some("replace_section failed"),
+-                        );
+-                    }
+-                }
+-            }
+-            ResolvedOp::ReplaceAlias {
+-                file,
+-                section_name,
+-                old,
+-                merged,
+-                records,
+-            } => {
+-                let content = match tokio::fs::read_to_string(&file).await {
+-                    Ok(c) => c,
+-                    Err(e) => {
+-                        warn!(
+-                            "character_updater: failed to read character file {:?}: {}",
+-                            file, e
+-                        );
+-                        record_all(
+-                            recorder,
+-                            update_id,
+-                            &records,
+-                            Some(&old),
+-                            false,
+-                            Some("failed to read character file"),
+-                        );
+-                        continue;
+-                    }
+-                };
+-                match replace_section(&content, &section_name, &CharacterAttribute::Alias, &merged)
+-                {
+-                    Some(c) => {
+-                        write_and_record(&file, &c, update_id, &records, Some(&old), recorder)
+-                            .await
+-                    }
+-                    None => {
+-                        warn!(
+-                            "character_updater: replace_section failed for {}/呼称",
+-                            section_name
+-                        );
+-                        record_all(
+-                            recorder,
+-                            update_id,
+-                            &records,
+-                            Some(&old),
+-                            false,
+-                            Some("replace_section failed"),
+-                        );
+-                    }
+-                }
+-            }
+-            ResolvedOp::AppendSection {
+-                file,
+-                section_name,
+-                heading,
+-                body,
+-                records,
+-            } => {
+-                let content = match tokio::fs::read_to_string(&file).await {
+-                    Ok(c) => c,
+-                    Err(e) => {
+-                        warn!(
+-                            "character_updater: failed to read character file {:?}: {}",
+-                            file, e
+-                        );
+-                        record_all(
+-                            recorder,
+-                            update_id,
+-                            &records,
+-                            None,
+-                            false,
+-                            Some("failed to read character file"),
+-                        );
+-                        continue;
+-                    }
+-                };
+-                match append_attribute_section(&content, &section_name, heading, &body) {
+-                    Some(c) => {
+-                        write_and_record(&file, &c, update_id, &records, None, recorder).await
+-                    }
+-                    None => {
+-                        warn!(
+-                            "character_updater: append_attribute_section failed for {}/{}",
+-                            section_name, heading
+-                        );
+-                        record_all(
+-                            recorder,
+-                            update_id,
+-                            &records,
+-                            None,
+-                            false,
+-                            Some("append_attribute_section failed"),
+-                        );
+-                    }
+-                }
+-            }
+-            ResolvedOp::AppendCharacter {
+-                file,
+-                name,
+-                sections,
+-                records,
+-            } => {
+-                let content = match tokio::fs::read_to_string(&file).await {
+-                    Ok(c) => c,
+-                    Err(e) => {
+-                        warn!(
+-                            "character_updater: failed to read character file {:?}: {}",
+-                            file, e
+-                        );
+-                        record_all(
+-                            recorder,
+-                            update_id,
+-                            &records,
+-                            None,
+-                            false,
+-                            Some("failed to read character file"),
+-                        );
+-                        continue;
+-                    }
+-                };
+-                let c = append_new_character_block(&content, &name, &sections);
+-                write_and_record(&file, &c, update_id, &records, None, recorder).await;
+-            }
+-            ResolvedOp::CreateFile {
+-                name,
+-                sections,
+-                records,
+-            } => {
+-                let chars_dir = workspace.join("characters");
+-                match create_character_file(&chars_dir, &name, &sections).await {
+-                    Some(new_path) => {
+-                        info!("character_updater: created {}", new_path.display());
+-                        record_all(recorder, update_id, &records, None, true, None);
+-                    }
+-                    None => {
+-                        warn!(
+-                            "character_updater: failed to create character file for {:?}",
+-                            name
+-                        );
+-                        record_all(
+-                            recorder,
+-                            update_id,
+-                            &records,
+-                            None,
+-                            false,
+-                            Some("failed to create character file"),
+-                        );
+-                    }
+-                }
++                let path = chars_dir.join(format!("{}.md", stem));
++                create_paths.insert(path.clone());
++                path
+             }
++            _ => existing_op_file(&op)
++                .expect("Skip/CreateFile 以外は必ず file を持つ")
++                .to_path_buf(),
++        };
++
++        if !groups.contains_key(&path) {
++            order.push(path.clone());
+         }
++        groups.entry(path).or_default().push(op);
++    }
++
++    for path in order {
++        let Some(ops) = groups.remove(&path) else {
++            continue;
++        };
++        let is_create = create_paths.contains(&path);
++        apply_ops_to_file(
++            path,
++            ops,
++            is_create,
++            merged_map,
++            update_id,
++            workspace,
++            character_store,
++            recorder,
++        )
++        .await;
+     }
+ }
+ 
+@@ -1673,26 +1681,24 @@ async fn apply_plan(
+ async fn apply_updates(
+     updates: &[UpdateItem],
+     update_id: i64,
+-    char_files: Vec<PathBuf>,
++    character_store: &CharacterStore,
+     workspace: &Path,
+     recorder: &FlightRecorder,
+     llm_client: &mut dyn LlmInterface,
+ ) {
+     debug!("character_updater: {} update(s) received", updates.len());
+ 
+-    // (A) 計画: 各ファイルを1回だけスナップショットして宛先を確定する
+-    let mut snapshots: HashMap<PathBuf, String> = HashMap::new();
+-    for f in &char_files {
+-        match tokio::fs::read_to_string(f).await {
+-            Ok(c) => {
+-                snapshots.insert(f.clone(), c);
+-            }
+-            Err(e) => warn!(
+-                "character_updater: failed to read character file {:?}: {}",
+-                f, e
+-            ),
+-        }
+-    }
++    // (A) 計画: character_store 上の現在のメモリ内容(＝正本)から宛先を確定する。
++    // ディスクを読み直さない(メモリがSSoTのため、ディスクは書き込み専用のdump先)。
++    let char_files = character_store.files_in(workspace);
++    let snapshots: HashMap<PathBuf, String> = char_files
++        .iter()
++        .filter_map(|f| {
++            character_store
++                .content_of(workspace, f)
++                .map(|c| (f.clone(), c))
++        })
++        .collect();
+     let (plan, groups) = plan_updates(updates, &char_files, &snapshots);
+ 
+     // (B) バッチマージ(対象が無ければ LLM を呼ばない)
+@@ -1709,7 +1715,7 @@ async fn apply_updates(
+     };
+ 
+     // (C) 適用
+-    apply_plan(plan, merged_map.as_ref(), update_id, workspace, recorder).await;
++    apply_plan(plan, merged_map.as_ref(), update_id, workspace, character_store, recorder).await;
+ }
+ 
+ /// ファイル一覧からキャラ名に対応するファイルを探す。
+@@ -1726,130 +1732,6 @@ fn find_character_file<'a>(files: &'a [PathBuf], name: &str) -> Option<&'a PathB
+     })
+ }
+ 
+-/// Markdown テキストの見出し構造を解析し、キャラクターレベルと属性レベルを返す。
+-/// `main.rs` の `detect_char_level_str` (comrak AST ベース) に委譲する。
+-/// 検出できない場合は `None`。
+-fn detect_levels(file_text: &str) -> Option<(u8, u8)> {
+-    let cl = crate::character::detect_char_level_str(file_text);
+-    (cl != 0).then(|| (cl, cl + 1))
+-}
+-
+-/// 指定キャラクターの見出しブロック内に、新しい属性セクションを追記する。
+-/// キャラクター見出しが見つからない場合は `None`。
+-fn append_attribute_section(
+-    file_text: &str,
+-    char_name: &str,
+-    attr_heading: &str,
+-    body: &str,
+-) -> Option<String> {
+-    let lines: Vec<&str> = file_text.lines().collect();
+-    let mut in_fence = false;
+-    let mut char_level: Option<u8> = None;
+-    let mut found_char = false;
+-    let mut insert_before = lines.len(); // デフォルト: ファイル末尾
+-
+-    for (i, &line) in lines.iter().enumerate() {
+-        if line.trim_start().starts_with("```") {
+-            in_fence = !in_fence;
+-        }
+-        if in_fence {
+-            continue;
+-        }
+-        let trimmed = line.trim_end();
+-        if !trimmed.starts_with('#') {
+-            continue;
+-        }
+-        let level = trimmed.bytes().take_while(|&b| b == b'#').count() as u8;
+-        let heading_text = trimmed[level as usize..].trim();
+-
+-        if !found_char {
+-            if heading_text.contains(char_name) {
+-                found_char = true;
+-                char_level = Some(level);
+-            }
+-        } else if level <= char_level.unwrap() {
+-            // このキャラクターブロックの終端
+-            insert_before = i;
+-            break;
+-        }
+-    }
+-
+-    if !found_char {
+-        return None;
+-    }
+-
+-    let cl = char_level.unwrap();
+-    let attr_prefix = "#".repeat((cl + 1) as usize);
+-    let new_section = format!("\n{} {}\n{}\n", attr_prefix, attr_heading, body.trim_end());
+-
+-    let mut out = String::new();
+-    for (i, &line) in lines.iter().enumerate() {
+-        if i == insert_before {
+-            out.push_str(&new_section);
+-        }
+-        out.push_str(line);
+-        out.push('\n');
+-    }
+-    if insert_before >= lines.len() {
+-        out.push_str(&new_section);
+-    }
+-
+-    Some(out)
+-}
+-
+-/// ファイル末尾に新規キャラクターのブロックを追記して返す。
+-/// 見出しレベルは既存ファイルから推測し、不明な場合は `#`/`##` を使用する。
+-fn append_new_character(
+-    file_text: &str,
+-    char_name: &str,
+-    attr_heading: &str,
+-    body: &str,
+-) -> String {
+-    let (cl, al) = detect_levels(file_text).unwrap_or((1, 2));
+-    let char_prefix = "#".repeat(cl as usize);
+-    let attr_prefix = "#".repeat(al as usize);
+-    let new_block = format!(
+-        "\n{} {}\n\n{} {}\n{}\n",
+-        char_prefix,
+-        char_name,
+-        attr_prefix,
+-        attr_heading,
+-        body.trim_end()
+-    );
+-
+-    let mut out = file_text.to_string();
+-    if !out.is_empty() && !out.ends_with('\n') {
+-        out.push('\n');
+-    }
+-    out.push_str(&new_block);
+-    out
+-}
+-
+-/// ファイル末尾へ新規キャラブロックを全属性まとめて追記する。
+-/// 先頭セクションは `append_new_character`、以降は `append_attribute_section` を連鎖させる
+-/// (逐次適用と同じ出力になる)。
+-fn append_new_character_block(
+-    file_text: &str,
+-    char_name: &str,
+-    sections: &[(&'static str, String)],
+-) -> String {
+-    let mut iter = sections.iter();
+-    let Some((heading, body)) = iter.next() else {
+-        return file_text.to_string();
+-    };
+-    let mut out = append_new_character(file_text, char_name, heading, body);
+-    for (heading, body) in iter {
+-        match append_attribute_section(&out, char_name, heading, body) {
+-            Some(c) => out = c,
+-            None => warn!(
+-                "character_updater: failed to append section {} to new character {}",
+-                heading, char_name
+-            ),
+-        }
+-    }
+-    out
+-}
+-
+ /// ファイル stem として使えない文字(`/ \ : * ? " < > |` および制御文字)を `_` に置換する。
+ /// キャラクター見出し(`# name`)には原名を使うため、このサニタイズはパス生成のみに適用する。
+ fn sanitize_file_stem(name: &str) -> String {
+@@ -1864,48 +1746,6 @@ fn sanitize_file_stem(name: &str) -> String {
+         .collect()
+ }
+ 
+-/// `chars_dir/<name>.md` を新規作成してパスを返す。作成に失敗した場合は `None`。
+-/// - ファイル名は `sanitize_file_stem` でサニタイズする(見出しは元の `name` を維持)。
+-/// - `chars_dir` が存在しない場合は `create_dir_all` で生成する。
+-/// - `sections` の全属性を1ファイルにまとめて書き出す(同一 run 内の順序依存を排除)。
+-async fn create_character_file(
+-    chars_dir: &Path,
+-    name: &str,
+-    sections: &[(&'static str, String)],
+-) -> Option<PathBuf> {
+-    let stem = sanitize_file_stem(name);
+-    if stem.trim_matches('_').is_empty() {
+-        error!(
+-            "character_updater: cannot convert character name {:?} to a file name",
+-            name
+-        );
+-        return None;
+-    }
+-    if let Err(e) = tokio::fs::create_dir_all(chars_dir).await {
+-        error!(
+-            "character_updater: failed to create characters directory {:?}: {}",
+-            chars_dir, e
+-        );
+-        return None;
+-    }
+-    let path = chars_dir.join(format!("{}.md", stem));
+-    // 見出しには原名を使う
+-    let mut content = format!("# {}\n", name);
+-    for (heading, body) in sections {
+-        content.push_str(&format!("\n## {}\n\n{}\n", heading, body.trim_end()));
+-    }
+-    match tokio::fs::write(&path, format_markdown(&content)).await {
+-        Ok(_) => {
+-            debug!("character_updater: created {:?}", path);
+-            Some(path)
+-        }
+-        Err(e) => {
+-            error!("character_updater: failed to create {:?}: {}", path, e);
+-            None
+-        }
+-    }
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -1961,25 +1801,6 @@ mod tests {
+ - 真面目。
+ ";
+ 
+-    #[test]
+-    fn test_replace_section_found() {
+-        let result = replace_section(
+-            SAMPLE_MD,
+-            "ジェフ",
+-            &CharacterAttribute::Background,
+-            "- 予備役上がりで、元警備隊員。\n- フォン・ブラウン出身。",
+-        );
+-        assert!(result.is_some());
+-        let out = result.unwrap();
+-        assert!(out.contains("予備役上がりで、元警備隊員"));
+-        assert!(out.contains("元警備隊員"));
+-        assert!(out.contains("フォン・ブラウン出身"));
+-        assert!(
+-            out.contains("落ち着いている"),
+-            "他セクションが保持されること"
+-        );
+-        assert!(out.contains("シルビア"), "別キャラが保持されること");
+-    }
+ 
+     #[test]
+     fn test_build_batch_merge_prompt_requests_meaningful_merge() {
+@@ -2472,13 +2293,23 @@ mod tests {
+             ("新キャラ", "背景", "- 謎の過去。"),
+         ]);
+         let (plan, groups) = plan_updates(&updates, &[], &HashMap::new());
+-        assert!(groups.is_empty(), "新規キャラは LLM マージ対象にならないこと");
++        assert!(
++            groups.is_empty(),
++            "新規キャラは LLM マージ対象にならないこと"
++        );
+         let creates: Vec<_> = plan
+             .iter()
+             .filter(|op| matches!(op, ResolvedOp::CreateFile { .. }))
+             .collect();
+-        assert_eq!(creates.len(), 1, "同一新規キャラは1つの CreateFile に集約されること");
+-        if let ResolvedOp::CreateFile { sections, records, .. } = creates[0] {
++        assert_eq!(
++            creates.len(),
++            1,
++            "同一新規キャラは1つの CreateFile に集約されること"
++        );
++        if let ResolvedOp::CreateFile {
++            sections, records, ..
++        } = creates[0]
++        {
+             assert_eq!(sections.len(), 2);
+             assert_eq!(records.len(), 2);
+         }
+@@ -2501,9 +2332,20 @@ mod tests {
+         let (plan, groups) = plan_updates(&updates, std::slice::from_ref(&file), &snapshots);
+         assert_eq!(groups.len(), 1);
+ 
++        let store = CharacterStore::new();
++        store.reconcile(&dir, &file, PLAN_MD.to_string());
++
+         let recorder = FlightRecorder::new(&dir.join("flight.db"));
+         let update_id = recorder.record_character_update("test://uri", "test-model", "prompt");
+-        apply_plan(plan, Some(&HashMap::new()), update_id, &dir, &recorder).await;
++        apply_plan(
++            plan,
++            Some(&HashMap::new()),
++            update_id,
++            &dir,
++            &store,
++            &recorder,
++        )
++        .await;
+ 
+         assert_eq!(
+             std::fs::read_to_string(&file).unwrap(),
+@@ -2539,10 +2381,8 @@ mod tests {
+ 
+     #[test]
+     fn test_strip_attribute_label_multiline_empty_after_colon() {
+-        let out = strip_attribute_label(
+-            "呼称：\n- 飛騨艦長\n- 高柳大佐",
+-            &CharacterAttribute::Alias,
+-        );
++        let out =
++            strip_attribute_label("呼称：\n- 飛騨艦長\n- 高柳大佐", &CharacterAttribute::Alias);
+         assert_eq!(out, "- 飛騨艦長\n- 高柳大佐");
+     }
+ 
+@@ -2563,7 +2403,10 @@ mod tests {
+     #[test]
+     fn test_strip_attribute_label_wrong_attribute_label_untouched() {
+         // 「背景：」は Personality のラベルとして一致しないので除去しない
+-        let out = strip_attribute_label("背景：過去に事故に遭った。", &CharacterAttribute::Personality);
++        let out = strip_attribute_label(
++            "背景：過去に事故に遭った。",
++            &CharacterAttribute::Personality,
++        );
+         assert_eq!(out, "背景：過去に事故に遭った。");
+     }
+ 
+@@ -2604,60 +2447,6 @@ mod tests {
+         assert_eq!(merged, "- 飛騨艦長\n- 高柳大佐");
+     }
+ 
+-    #[test]
+-    fn test_replace_section_can_still_replace_body() {
+-        let result = replace_section(
+-            SAMPLE_MD,
+-            "ジェフ",
+-            &CharacterAttribute::Background,
+-            "- 元警備隊員で予備役上がり。",
+-        );
+-        assert!(result.is_some());
+-        let out = result.unwrap();
+-        assert!(out.contains("元警備隊員で予備役上がり"));
+-        assert!(
+-            !out.contains("- 予備役上がり。\n"),
+-            "replace_section 自体は指定本文へ差し替えること"
+-        );
+-        assert!(
+-            out.contains("落ち着いている"),
+-            "他セクションが保持されること"
+-        );
+-        assert!(out.contains("シルビア"), "別キャラが保持されること");
+-    }
+-
+-    #[test]
+-    fn test_replace_section_not_found() {
+-        let result = replace_section(
+-            SAMPLE_MD,
+-            "ジェフ",
+-            &CharacterAttribute::Appearance,
+-            "特になし",
+-        );
+-        // appearance セクションはないので None
+-        assert!(result.is_none());
+-    }
+-
+-    #[test]
+-    fn test_replace_section_other_char_untouched() {
+-        let result = replace_section(
+-            SAMPLE_MD,
+-            "シルビア",
+-            &CharacterAttribute::Personality,
+-            "- 真面目だが、緊張しやすい面もある。",
+-        );
+-        assert!(result.is_some());
+-        let out = result.unwrap();
+-        assert!(
+-            out.contains("落ち着いている"),
+-            "ジェフのセクションが保持されること"
+-        );
+-        assert!(
+-            out.contains("- 真面目だが、緊張しやすい面もある。"),
+-            "意味的に統合されたテキストを書けること"
+-        );
+-    }
+-
+     #[test]
+     fn test_find_character_file_single() {
+         // 単一ファイル形式: characters.md はどのキャラ名でもヒットする(集約ファイル)
+@@ -2682,116 +2471,6 @@ mod tests {
+         assert_eq!(find_character_file(&files, "存在しない"), None);
+     }
+ 
+-    #[test]
+-    fn test_detect_levels_with_story_heading() {
+-        // # Story / ## キャラ / ### 属性 の構造
+-        let md = "\
+-# Story
+-## ジェフ
+-### 性格
+-- 落ち着いている。
+-## シルビア
+-### 背景
+-- 不明。
+-";
+-        assert_eq!(detect_levels(md), Some((2, 3)));
+-    }
+-
+-    #[test]
+-    fn test_detect_levels_top_level_chars() {
+-        // # キャラ / ## 属性 の構造
+-        let md = "\
+-# ジェフ
+-## 性格
+-- 落ち着いている。
+-# シルビア
+-## 背景
+-- 不明。
+-";
+-        assert_eq!(detect_levels(md), Some((1, 2)));
+-    }
+-
+-    #[test]
+-    fn test_detect_levels_empty() {
+-        assert_eq!(detect_levels(""), None);
+-        assert_eq!(detect_levels("本文だけ、見出しなし。"), None);
+-    }
+-
+-    #[test]
+-    fn test_append_attribute_section_to_existing_char() {
+-        let md = "\
+-# Story
+-## ジェフ（艦長）
+-### 性格
+-- 落ち着いている。
+-## シルビア
+-### 背景
+-- 不明。
+-";
+-        let result = append_attribute_section(md, "ジェフ", "外見", "- 長身で白髪。");
+-        assert!(result.is_some());
+-        let out = result.unwrap();
+-        // 新属性がジェフのブロック内（シルビアの前）に挿入される
+-        let jeff_end = out.find("## シルビア").unwrap_or(out.len());
+-        assert!(out.contains("### 外見"), "属性見出しがあること");
+-        assert!(
+-            out.find("### 外見").unwrap() < jeff_end,
+-            "シルビアより前に挿入されること"
+-        );
+-        assert!(out.contains("落ち着いている"), "既存属性が保持されること");
+-        assert!(out.contains("シルビア"), "他キャラが保持されること");
+-    }
+-
+-    #[test]
+-    fn test_append_attribute_section_at_eof() {
+-        // キャラが最後のブロック(次の同レベル見出しがない)
+-        let md = "\
+-## ジェフ
+-### 性格
+-- 落ち着いている。
+-";
+-        let result = append_attribute_section(md, "ジェフ", "外見", "- 長身。");
+-        assert!(result.is_some());
+-        let out = result.unwrap();
+-        assert!(out.contains("### 外見"), "属性見出しがあること");
+-        assert!(out.contains("長身"), "属性本文があること");
+-        assert!(out.contains("落ち着いている"), "既存属性が保持されること");
+-    }
+-
+-    #[test]
+-    fn test_append_attribute_section_char_not_found() {
+-        let md = "## ジェフ\n### 性格\n- 落ち着いている。\n";
+-        let result = append_attribute_section(md, "存在しない", "外見", "- 不明。");
+-        assert!(result.is_none());
+-    }
+-
+-    #[test]
+-    fn test_append_new_character() {
+-        let md = "\
+-# Story
+-## ジェフ
+-### 性格
+-- 落ち着いている。
+-";
+-        let out = append_new_character(md, "新キャラ", "背景", "- 謎の人物。");
+-        assert!(out.contains("## 新キャラ"), "新キャラ見出しがあること");
+-        assert!(out.contains("### 背景"), "属性見出しがあること");
+-        assert!(out.contains("謎の人物"), "属性本文があること");
+-        assert!(out.contains("落ち着いている"), "既存キャラが保持されること");
+-        let jeff_pos = out.find("## ジェフ").unwrap();
+-        let new_pos = out.find("## 新キャラ").unwrap();
+-        assert!(new_pos > jeff_pos, "新キャラが末尾に追加されること");
+-    }
+-
+-    #[test]
+-    fn test_append_new_character_empty_file() {
+-        // 空ファイルはデフォルトレベル(1/2)を使用
+-        let out = append_new_character("", "新キャラ", "性格", "- 明るい。");
+-        assert!(out.contains("# 新キャラ"), "レベル1のキャラ見出し");
+-        assert!(out.contains("## 性格"), "レベル2の属性見出し");
+-        assert!(out.contains("明るい"), "属性本文");
+-    }
+-
+     #[test]
+     fn test_sanitize_file_stem_normal() {
+         // 通常の日本語名はそのまま
+@@ -2925,5 +2604,4 @@ mod tests {
+             "quotes:\na\nb"
+         );
+     }
+-
+ }
+diff --git a/lsp/src/cursor_context.rs b/lsp/src/cursor_context.rs
+index 2081c49..11138ef 100644
+--- a/lsp/src/cursor_context.rs
++++ b/lsp/src/cursor_context.rs
+@@ -544,7 +544,7 @@ mod tests {
+         }
+ 
+         fn tokenize(&self, line: &mut LineData) {
+-            self.hl.tokenize(line);
++            self.hl.tokenize(line, &std::collections::HashSet::new());
+         }
+ 
+         /// 本番(completion)と同じ手順で分類する:
+diff --git a/lsp/src/highlight.rs b/lsp/src/highlight.rs
+index 4971df3..ddb4d7f 100644
+--- a/lsp/src/highlight.rs
++++ b/lsp/src/highlight.rs
+@@ -134,9 +134,6 @@ pub struct Highlighter {
+     /// Lindera トークナイザ。キャラ名のユーザー辞書差し替え(`rebuild_user_dictionary`)が
+     /// あるため RwLock で内部可変にしている。
+     tokenizer: RwLock<lindera::tokenizer::Tokenizer>,
+-    /// キャラクター一覧(名前+aliases、複合名分割済み)。人名ハイライトの絞り込みに使う。
+-    /// character_cache 側の更新経路(初期化スキャン/保存/外部ファイル監視)から `set_allowed_names` 経由で差し替えられる。
+-    allowed_names: RwLock<HashSet<String>>,
+ }
+ 
+ impl std::fmt::Debug for crate::highlight::Highlighter {
+@@ -159,46 +156,44 @@ impl Highlighter {
+ 
+         Self {
+             tokenizer: RwLock::new(tokenizer),
+-            allowed_names: RwLock::new(HashSet::new()),
+         }
+     }
+ 
+-    /// 人名ハイライトの許可名集合(キャラ名+aliases)を差し替える。
+-    /// 集合が実際に変化した場合 true を返す(ユーザー辞書再構築の要否判定に使う)。
+-    pub fn set_allowed_names(&self, names: HashSet<String>) -> bool {
+-        let mut guard = self.allowed_names.write();
+-        if *guard == names {
+-            return false;
+-        }
+-        *guard = names;
+-        true
++    /// 与えられたトークン(品詞details+表層形)がハイライト対象の人名かどうかを判定する。
++    /// `classify_normal`/`classify_bracket` のkeyword判定と同一基準であり、hover等
++    /// ハイライト以外の箇所でも同じ判定基準を使いたい場合に利用する
++    /// (例: `backend.rs` の hover ハンドラ。ハイライトされないトークンでhoverだけ
++    /// 表示されるという食い違いを防ぐため)。
++    /// `allowed` は呼び出し側が対象ドキュメントのワークスペースに応じて渡す
++    /// (`CharacterStore::allowed_names`)。
++    pub fn is_recognized_name(details: &[String], surface: &str, allowed: &HashSet<String>) -> bool {
++        Self::is_recognized_person_name(details, surface, allowed)
+     }
+ 
+-    /// allowed_names の全エントリを固有名詞(名詞,固有名詞,人名,一般)としてユーザー辞書に
+-    /// 登録し直す。空集合なら辞書を外す。
++    /// `names` の全エントリを固有名詞(名詞,固有名詞,人名,一般)としてユーザー辞書に
++    /// 登録し直す。空集合なら辞書を外す。`names`は全ワークスペースの許可名の和集合を渡す
++    /// (`CharacterStore::all_allowed_names`。トークナイズ品質の担保だけが目的で、
++    /// どのワークスペースの名前かを区別する必要はない)。
+     ///
+     /// lindera 2.3.2 はCSVファイル経由でしかユーザー辞書を構築できないため、一時ファイルに
+     /// 書き出してロード後に削除する。`Tokenizer.segmenter.user_dictionary` が pub なので、
+     /// 埋め込みIPADIC の再ロードなしに辞書だけを差し替えられる。
+-    pub fn rebuild_user_dictionary(&self) -> std::io::Result<()> {
++    pub fn rebuild_user_dictionary(&self, names: &HashSet<String>) -> std::io::Result<()> {
+         use std::io::{Error, ErrorKind};
+ 
+-        let rows: Vec<String> = {
+-            let names = self.allowed_names.read();
+-            names
+-                .iter()
+-                .filter(|n| {
+-                    // CSVを壊す文字を含む名前は登録スキップ(表層一致ハイライトは引き続き機能する)
+-                    let unsafe_csv =
+-                        n.contains(',') || n.contains('"') || n.contains('\n') || n.contains('\r');
+-                    if unsafe_csv {
+-                        warn!("ユーザー辞書登録をスキップ(CSV非対応文字を含む): {:?}", n);
+-                    }
+-                    !unsafe_csv
+-                })
+-                .map(|n| Self::user_dict_csv_row(n, "人名", "一般"))
+-                .collect()
+-        };
++        let rows: Vec<String> = names
++            .iter()
++            .filter(|n| {
++                // CSVを壊す文字を含む名前は登録スキップ(表層一致ハイライトは引き続き機能する)
++                let unsafe_csv =
++                    n.contains(',') || n.contains('"') || n.contains('\n') || n.contains('\r');
++                if unsafe_csv {
++                    warn!("ユーザー辞書登録をスキップ(CSV非対応文字を含む): {:?}", n);
++                }
++                !unsafe_csv
++            })
++            .map(|n| Self::user_dict_csv_row(n, "人名", "一般"))
++            .collect();
+ 
+         if rows.is_empty() {
+             self.tokenizer.write().segmenter.user_dictionary = None;
+@@ -238,13 +233,17 @@ impl Highlighter {
+     }
+ 
+     /// ユーザー辞書CSVの1行(IPADIC 詳細13カラム形式)を組み立てる。
+-    /// 文脈ID 0/コスト -10000 は lindera が簡易形式に自動付与する実績値
+-    /// (0=未定義文脈、-10000でViterbi上1トークン化を強く優先)。
++    /// 文脈ID 0はlindera が簡易形式に自動付与する実績値(未定義文脈)。
++    /// コスト2000は「1文字の人名でも単独トークンとして切り出す」ことと
++    /// 「"高原"/"原因"/"原則"等の一般語を誤って分割しない」ことを両立する値として実測で選定
++    /// (500〜10000の範囲で両立を確認、IPADIC実在の人名エントリと同程度の常識的なコスト感)。
++    /// -10000のような極端に低いコストは、字面が短い名前ほど一般語の部分文字列と衝突しやすく
++    /// 誤分割を招くため避ける。
+     /// 原形=表層形とし(`text_to_lindera_token` の d[6]=="*" 除外フィルタを回避)、読み/発音は "*"。
+     /// 組織(固有名詞,組織,*)・地域(固有名詞,地域,一般)のサポート追加時は subcategory を変えて呼ぶ。
+     fn user_dict_csv_row(surface: &str, subcategory2: &str, subcategory3: &str) -> String {
+         format!(
+-            "{s},0,0,-10000,名詞,固有名詞,{c2},{c3},*,*,{s},*,*",
++            "{s},0,0,2000,名詞,固有名詞,{c2},{c3},*,*,{s},*,*",
+             s = surface,
+             c2 = subcategory2,
+             c3 = subcategory3,
+@@ -378,11 +377,11 @@ impl Highlighter {
+         &self,
+         line: &mut LineData,
+         start_depth: u32,
++        allowed: &HashSet<String>,
+     ) -> (Vec<SemanticToken>, u32) {
+         let end_depth = self.tag_line_depth(line, start_depth);
+ 
+         let mut result = Vec::new();
+-        let allowed = self.allowed_names.read();
+         for token in line.tokens.iter() {
+             // 人名判定に使う表層文字列
+             let surface = &line.text[token.byte_start..token.byte_end];
+@@ -395,9 +394,9 @@ impl Highlighter {
+             ) {
+                 ("記号", Some("括弧開")) | ("記号", Some("括弧閉")) => Some("comment"),
+                 _ if token.tag == TokenStatus::InBracket => {
+-                    Self::classify_bracket(&token.details, surface, &allowed)
++                    Self::classify_bracket(&token.details, surface, allowed)
+                 }
+-                _ => Self::classify_normal(&token.details, surface, &allowed),
++                _ => Self::classify_normal(&token.details, surface, allowed),
+             };
+ 
+             if let Some(k) = kind {
+@@ -416,8 +415,26 @@ impl Highlighter {
+     /// 本体コードは深さを明示する `tokenize_with_depth`/`ensure_bracket_depth` を使うため、
+     /// 現在はテスト専用。
+     #[allow(dead_code)]
+-    pub fn tokenize(&self, line: &mut LineData) -> Vec<SemanticToken> {
+-        self.tokenize_with_depth(line, 0).0
++    pub fn tokenize(&self, line: &mut LineData, allowed: &HashSet<String>) -> Vec<SemanticToken> {
++        self.tokenize_with_depth(line, 0, allowed).0
++    }
++
++    /// トークンが「許可名一致の人名」であるかを判定する共通述語。
++    ///
++    /// `classify_normal`/`classify_bracket` のkeyword判定条件そのもの
++    /// (品詞が固有名詞,人名 かつ 表層形が許可名集合に含まれる)であり、
++    /// hover等ハイライト以外の箇所からも同一基準で判定できるよう公開している
++    /// (`Highlighter::is_recognized_name` 経由)。
++    /// ここでの判定が変わらない限り hover とハイライトは常に一致する。
++    fn is_recognized_person_name(
++        details: &[String],
++        surface: &str,
++        allowed: &HashSet<String>,
++    ) -> bool {
++        details.first().map(String::as_str) == Some("名詞")
++            && details.get(1).map(String::as_str) == Some("固有名詞")
++            && details.get(2).map(String::as_str) == Some("人名")
++            && allowed.contains(surface)
+     }
+ 
+     /// 通常モードでの品詞→トークン種別マッピング。
+@@ -439,7 +456,7 @@ impl Highlighter {
+         match details[0].as_str() {
+             "名詞" => match v.as_ref() {
+                 ["固有名詞", "人名", ..] => {
+-                    if allowed.contains(surface) {
++                    if Self::is_recognized_person_name(details, surface, allowed) {
+                         Some("keyword")
+                     } else {
+                         None
+@@ -476,7 +493,7 @@ impl Highlighter {
+         match details[0].as_str() {
+             "名詞" => match v.as_ref() {
+                 ["固有名詞", "人名", ..] => {
+-                    if allowed.contains(surface) {
++                    if Self::is_recognized_person_name(details, surface, allowed) {
+                         Some("keyword")
+                     } else {
+                         Some("string")
+@@ -545,16 +562,28 @@ mod tests {
+         assert_eq!(t.modifier, 0);
+     }
+ 
++    /// 空の許可名集合(名前判定を伴わないテスト用)。
++    fn no_names() -> HashSet<String> {
++        HashSet::new()
++    }
++
+     /// 括弧内モード(開始深さ1)でトークン化するテスト用ヘルパ。
+-    fn tokenize_in_bracket(h: &Highlighter, line: &mut LineData) -> Vec<SemanticToken> {
+-        h.tokenize_with_depth(line, 1).0
++    fn tokenize_in_bracket(
++        h: &Highlighter,
++        line: &mut LineData,
++        allowed: &HashSet<String>,
++    ) -> Vec<SemanticToken> {
++        h.tokenize_with_depth(line, 1, allowed).0
+     }
+ 
+     #[test]
+     fn test_tokenize_conversation_produces_tokens() {
+         let hilighter = Highlighter::new();
+-        let tokens =
+-            tokenize_in_bracket(&hilighter, &mut LineData::from_str("これはテストです。").unwrap());
++        let tokens = tokenize_in_bracket(
++            &hilighter,
++            &mut LineData::from_str("これはテストです。").unwrap(),
++            &no_names(),
++        );
+         assert!(
+             !tokens.is_empty(),
+             "tokenize_conversation should produce tokens"
+@@ -593,14 +622,18 @@ mod tests {
+     #[test]
+     fn test_tokenize_conversation_empty_string() {
+         let hilighter = Highlighter::new();
+-        let tokens = hilighter.tokenize(&mut LineData::from_str("").unwrap());
++        let tokens = hilighter.tokenize(&mut LineData::from_str("").unwrap(), &no_names());
+         assert!(tokens.is_empty(), "Empty string should produce no tokens");
+     }
+ 
+     #[test]
+     fn test_tokenize_conversation_unknown_words() {
+         let hilighter = Highlighter::new();
+-        let tokens = tokenize_in_bracket(&hilighter, &mut LineData::from_str("がびがび").unwrap());
++        let tokens = tokenize_in_bracket(
++            &hilighter,
++            &mut LineData::from_str("がびがび").unwrap(),
++            &no_names(),
++        );
+         // "がびがび" は名詞として扱われるはず
+         assert_eq!(tokens[0].token_type, SemanticTokenType::String as u32);
+     }
+@@ -608,8 +641,10 @@ mod tests {
+     #[test]
+     fn test_tokenize_conversation_complex_sentence() {
+         let hilighter = Highlighter::new();
+-        let tokens = hilighter
+-            .tokenize(&mut LineData::from_str("吾輩は猫である。名前はまだない。").unwrap());
++        let tokens = hilighter.tokenize(
++            &mut LineData::from_str("吾輩は猫である。名前はまだない。").unwrap(),
++            &no_names(),
++        );
+         assert!(!tokens.is_empty());
+     }
+ 
+@@ -617,17 +652,119 @@ mod tests {
+     fn test_registered_person_name_is_keyword() {
+         // "田中" は Lindera IPADIC で 固有名詞,人名,姓 の単一トークンになる(実測確認済み)。
+         let h = Highlighter::new();
+-        h.set_allowed_names(HashSet::from(["田中".to_string()]));
+-        let tokens = h.tokenize(&mut LineData::from_str("田中").unwrap());
++        let allowed = HashSet::from(["田中".to_string()]);
++        let tokens = h.tokenize(&mut LineData::from_str("田中").unwrap(), &allowed);
++        assert_eq!(tokens.len(), 1, "{:?}", tokens);
++        assert_eq!(tokens[0].token_type, SemanticTokenType::Keyword as u32);
++    }
++
++    #[test]
++    fn test_is_recognized_name_consistent_with_highlight_for_common_word_collision() {
++        // "コンドル"はIPADICに一般名詞(禿鷲)として登録されており、ユーザー辞書登録名でも
++        // Viterbiで一般名詞側の経路が選ばれ 固有名詞,人名 にならない(実測確認済み)。
++        // is_recognized_name はハイライトと同じ基準で判定するため、この場合は一致してfalseを返す
++        // (hoverでも表示されなくなり、ハイライトとの食い違いが起きない)。
++        let h = Highlighter::new();
++        let allowed = HashSet::from([
++            "ジョサイア・コンドル".to_string(),
++            "ジョサイア".to_string(),
++            "コンドル".to_string(),
++        ]);
++        h.rebuild_user_dictionary(&allowed).expect("辞書再構築に失敗");
++
++        let text = "ジョサイア・コンドルの手による";
++        let tokens = h.text_to_lindera_token(text);
++
++        let conder = tokens
++            .iter()
++            .find(|t| &text[t.byte_start..t.byte_end] == "コンドル")
++            .expect("「コンドル」トークンが見つからない");
++        assert!(
++            !Highlighter::is_recognized_name(&conder.details, "コンドル", &allowed),
++            "{:?}",
++            conder.details
++        );
++
++        let josiah = tokens
++            .iter()
++            .find(|t| &text[t.byte_start..t.byte_end] == "ジョサイア")
++            .expect("「ジョサイア」トークンが見つからない");
++        assert!(
++            Highlighter::is_recognized_name(&josiah.details, "ジョサイア", &allowed),
++            "{:?}",
++            josiah.details
++        );
++
++        // ハイライト結果とも一致すること
++        let sem = h.tokenize(&mut LineData::from_str(text).unwrap(), &allowed);
++        assert_eq!(sem.len(), 2, "{:?}", sem); // ジョサイア(keyword) + "・"(comment) のみ
++    }
++
++    #[test]
++    fn test_single_char_registered_name_is_keyword() {
++        // 1文字の姓("原")はユーザー辞書登録(コスト3000)によって固有名詞,人名として
++        // 単独トークンに切り出され、許可名一致で keyword になる。
++        let h = Highlighter::new();
++        let allowed = HashSet::from(["原".to_string(), "原顕三郎".to_string()]);
++        h.rebuild_user_dictionary(&allowed).expect("辞書再構築に失敗");
++
++        let tokens = h.tokenize(&mut LineData::from_str("原は独りごちた").unwrap(), &allowed);
++        assert_eq!(
++            tokens[0].token_type,
++            SemanticTokenType::Keyword as u32,
++            "{:?}",
++            tokens
++        );
++        assert_eq!(tokens[0].length, 1, "{:?}", tokens);
++
++        // フルネームは1トークンとして keyword になる(単独名との共存回帰確認)
++        let tokens = h.tokenize(&mut LineData::from_str("原顕三郎少将").unwrap(), &allowed);
++        assert_eq!(
++            tokens[0].token_type,
++            SemanticTokenType::Keyword as u32,
++            "{:?}",
++            tokens
++        );
++        assert_eq!(tokens[0].length, 4, "{:?}", tokens); // "原顕三郎"
++    }
++
++    #[test]
++    fn test_unknown_katakana_name_still_single_token() {
++        // コスト3000への変更後も、IPADIC未知のカタカナ名(例: "シルビア")が
++        // 引き続き1トークンでkeywordになること(コスト緩和による回帰確認)。
++        let h = Highlighter::new();
++        let allowed = HashSet::from(["シルビア".to_string()]);
++        h.rebuild_user_dictionary(&allowed).expect("辞書再構築に失敗");
++
++        let tokens = h.tokenize(&mut LineData::from_str("シルビア").unwrap(), &allowed);
+         assert_eq!(tokens.len(), 1, "{:?}", tokens);
+         assert_eq!(tokens[0].token_type, SemanticTokenType::Keyword as u32);
+     }
+ 
++    #[test]
++    fn test_single_char_registered_name_does_not_split_common_words() {
++        // 1文字人名のユーザー辞書登録が、"高原"/"原因"/"原則"のような一般語を
++        // 誤って分割してハイライトしないこと。
++        let h = Highlighter::new();
++        let allowed = HashSet::from(["原".to_string()]);
++        h.rebuild_user_dictionary(&allowed).expect("辞書再構築に失敗");
++
++        for word in ["高原", "原因", "原則"] {
++            let tokens = h.tokenize(&mut LineData::from_str(word).unwrap(), &allowed);
++            assert!(
++                tokens.is_empty(),
++                "{} が「原」の誤分割でハイライトされてしまっている: {:?}",
++                word,
++                tokens
++            );
++        }
++    }
++
+     #[test]
+     fn test_unregistered_person_name_not_highlighted_normal() {
+         // 許可名集合が空の場合、通常モードでは固有名詞人名でも一切トークンを生成しない。
+         let h = Highlighter::new();
+-        let tokens = h.tokenize(&mut LineData::from_str("田中").unwrap());
++        let tokens = h.tokenize(&mut LineData::from_str("田中").unwrap(), &no_names());
+         assert!(tokens.is_empty(), "{:?}", tokens);
+     }
+ 
+@@ -635,7 +772,7 @@ mod tests {
+     fn test_unregistered_person_name_in_bracket_is_string() {
+         // 括弧内モードでは、許可名集合に無い語は一般名詞と同じ string にフォールバックする。
+         let h = Highlighter::new();
+-        let tokens = tokenize_in_bracket(&h, &mut LineData::from_str("田中").unwrap());
++        let tokens = tokenize_in_bracket(&h, &mut LineData::from_str("田中").unwrap(), &no_names());
+         assert_eq!(tokens.len(), 1, "{:?}", tokens);
+         assert_eq!(tokens[0].token_type, SemanticTokenType::String as u32);
+     }
+@@ -645,10 +782,11 @@ mod tests {
+         // 組織名("自民党": 固有名詞,組織)・地域名("東京": 固有名詞,地域,一般、"日本": 固有名詞,地域,国)は
+         // 品詞ベースの判定ロジックをコメントアウトしているため、許可名集合に入っていなければ
+         // Variable/Function は生成されない(通常モードでは None -> トークン自体が生成されない)。
+-        // 許可名一致は品詞を問わず keyword になる新仕様のため、ここでは許可名集合を空にして検証する。
++        // keyword 化は「固有名詞,人名」かつ許可名集合に一致した場合のみで、組織名・地域名は
++        // 許可名集合に入っていても対象外(classify_normal/classify_bracket 参照)。
+         let h = Highlighter::new();
+         for word in ["自民党", "東京", "日本"] {
+-            let tokens = h.tokenize(&mut LineData::from_str(word).unwrap());
++            let tokens = h.tokenize(&mut LineData::from_str(word).unwrap(), &no_names());
+             assert!(
+                 tokens.is_empty(),
+                 "{} が組織/地域としてハイライトされてしまっている: {:?}",
+@@ -661,8 +799,11 @@ mod tests {
+     #[test]
+     fn test_encode_semantic_tokens_same_line_uses_relative_start() {
+         let hilighter = Highlighter::new();
+-        let tokens =
+-            tokenize_in_bracket(&hilighter, &mut LineData::from_str("これはテストです。").unwrap());
++        let tokens = tokenize_in_bracket(
++            &hilighter,
++            &mut LineData::from_str("これはテストです。").unwrap(),
++            &no_names(),
++        );
+         let encoded = Highlighter::to_semantic_tokens([tokens.clone()]);
+         assert!(encoded.len() >= 3);
+         assert_eq!(encoded[1].delta_line, 0);
+@@ -691,7 +832,9 @@ mod tests {
+         let encoded = Highlighter::to_semantic_tokens(
+             ["これはテストです。", "", "これはテストです。"]
+                 .iter()
+-                .map(|s| tokenize_in_bracket(&hilighter, &mut LineData::from_str(s).unwrap()))
++                .map(|s| {
++                    tokenize_in_bracket(&hilighter, &mut LineData::from_str(s).unwrap(), &no_names())
++                })
+                 .collect::<Vec<_>>(),
+         );
+         assert!(encoded.len() >= 6);
+@@ -702,8 +845,11 @@ mod tests {
+     #[test]
+     fn test_encode_semantic_tokens_preserves_length_type_modifier() {
+         let hilighter = Highlighter::new();
+-        let source =
+-            tokenize_in_bracket(&hilighter, &mut LineData::from_str("これはテストです。").unwrap());
++        let source = tokenize_in_bracket(
++            &hilighter,
++            &mut LineData::from_str("これはテストです。").unwrap(),
++            &no_names(),
++        );
+ 
+         let encoded = Highlighter::to_semantic_tokens([source.clone()]);
+ 
+@@ -723,7 +869,7 @@ mod tests {
+     fn test_particle_ha_is_skipped_outside_bracket() {
+         // 括弧内モードでは許可名一致以外すべて string に丸められる
+         let h = Highlighter::new();
+-        let tokens = tokenize_in_bracket(&h, &mut LineData::from_str("猫は").unwrap());
++        let tokens = tokenize_in_bracket(&h, &mut LineData::from_str("猫は").unwrap(), &no_names());
+         assert_eq!(tokens.len(), 2, "猫は should produce 2 token");
+         assert_eq!(tokens[0].token_type, SemanticTokenType::String as u32);
+     }
+@@ -733,7 +879,7 @@ mod tests {
+         // 括弧開・括弧閉自体は括弧外扱いで "comment"
+         let h = Highlighter::new();
+         let mut l = LineData::from_str("「テスト」").unwrap();
+-        let tokens = h.tokenize(&mut l);
++        let tokens = h.tokenize(&mut l, &no_names());
+         // [「(comment), テスト(keyword/名詞), 」(comment)]
+         assert_eq!(tokens.len(), 3, "「テスト」 should produce 3 tokens");
+         assert_eq!(
+@@ -773,7 +919,7 @@ mod tests {
+         // 括弧内では _ カテゴリが "string" になる
+         // "猫は" で「猫(名詞)」「は(助詞)」に分かれる → 括弧内の「は」が string になるか
+         let h = Highlighter::new();
+-        let tokens = h.tokenize(&mut LineData::from_str("「猫は」").unwrap());
++        let tokens = h.tokenize(&mut LineData::from_str("「猫は」").unwrap(), &no_names());
+         // [「(comment), 猫(keyword), は(string), 」(comment)]
+         assert_eq!(tokens.len(), 4, "「猫は」 should produce 4 tokens");
+         assert_eq!(
+@@ -787,9 +933,11 @@ mod tests {
+     fn test_bracket_mode_persists_across_tokenize_calls() {
+         // 複数行にまたがる括弧で、深さを戻り値で次の行へ引き継ぐ
+         let h = Highlighter::new();
+-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「猫").unwrap(), 0); // 括弧開 → depth=1
++        let names = no_names();
++        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「猫").unwrap(), 0, &names); // 括弧開 → depth=1
+         assert_eq!(d, 1);
+-        let (inside, d) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d); // 括弧内 → は が "string"
++        let (inside, d) =
++            h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d, &names); // 括弧内 → は が "string"
+         // [猫(keyword), は(string)]
+         assert_eq!(
+             inside.len(),
+@@ -801,9 +949,10 @@ mod tests {
+             SemanticTokenType::String as u32,
+             "助詞 should be string when inside bracket across lines"
+         );
+-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d); // 括弧閉 → depth=0
++        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d, &names); // 括弧閉 → depth=0
+         assert_eq!(d, 0);
+-        let (outside, _) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d); // 括弧外 → は スキップ
++        let (outside, _) =
++            h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d, &names); // 括弧外 → は スキップ
+         assert_eq!(
+             outside.len(),
+             0,
+@@ -815,23 +964,26 @@ mod tests {
+     fn test_nested_brackets_depth() {
+         // ネストした括弧でdepthが正しく管理される
+         let h = Highlighter::new();
+-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「").unwrap(), 0); // depth=1
+-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「").unwrap(), d); // depth=2
++        let names = no_names();
++        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「").unwrap(), 0, &names); // depth=1
++        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「").unwrap(), d, &names); // depth=2
+         assert_eq!(d, 2);
+-        let (inner, d) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d); // depth=2 → は=string
++        let (inner, d) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d, &names); // depth=2 → は=string
+         assert_eq!(inner.len(), 2, "should be in bracket mode at depth 2");
+         assert_eq!(inner[1].token_type, SemanticTokenType::String as u32);
+-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d); // depth=1
+-        let (still_inside, d) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d); // depth=1 → は=string
++        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d, &names); // depth=1
++        let (still_inside, d) =
++            h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d, &names); // depth=1 → は=string
+         assert_eq!(
+             still_inside.len(),
+             2,
+             "should still be in bracket mode at depth 1"
+         );
+         assert_eq!(still_inside[1].token_type, SemanticTokenType::String as u32);
+-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d); // depth=0
++        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d, &names); // depth=0
+         assert_eq!(d, 0);
+-        let (outside, _) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d); // depth=0 → は スキップ
++        let (outside, _) =
++            h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d, &names); // depth=0 → は スキップ
+         assert_eq!(
+             outside.len(),
+             0,
+diff --git a/lsp/src/llm.rs b/lsp/src/llm.rs
+index 5e16bc1..a68a2d2 100644
+--- a/lsp/src/llm.rs
++++ b/lsp/src/llm.rs
+@@ -139,10 +139,10 @@ impl Provider {
+         use ReasoningEffort::*;
+         // 低→高 の順。空 = reasoning 非対応。
+         let ladder: &[ReasoningEffort] = match self {
+-            Provider::OpenAI(_)    => &[Low, Medium, High, XHigh],
++            Provider::OpenAI(_) => &[Low, Medium, High, XHigh],
+             Provider::Anthropic(_) => &[Low, Medium, High, XHigh, Max],
+-            Provider::Google(_)    => &[Low, Medium, High],
+-            Provider::XAi(_)       => &[Low, High],
++            Provider::Google(_) => &[Low, Medium, High],
++            Provider::XAi(_) => &[Low, High],
+             Provider::Cloudflare(_) | Provider::LMStudio(..) | Provider::Undefined => &[],
+         };
+         let n = norm.clamp(0.0, 1.0);
+@@ -554,7 +554,7 @@ impl LlmInterface for LlmClient {
+ 
+     fn add_tool(&mut self, tool: Box<dyn LlmTool>) {
+         self.tools.insert(tool.as_ref().name().to_string(), tool);
+-        debug!("Tool added to backend {:?}", self.tools);
++        debug!("Tool added to backend {:?}", self.tools.keys());
+     }
+ 
+     async fn with_model(&mut self, model: &str) -> Result<String, LlmError> {
+@@ -985,24 +985,46 @@ where
+ mod tests_reasoning {
+     use super::*;
+ 
+-    fn openai() -> Provider { Provider::OpenAI("gpt-5.3".to_string()) }
+-    fn anthropic() -> Provider { Provider::Anthropic("claude-opus-4-8".to_string()) }
+-    fn google() -> Provider { Provider::Google("gemini-3.1-pro-preview".to_string()) }
+-    fn xai() -> Provider { Provider::XAi("grok-4.1".to_string()) }
+-    fn lmstudio() -> Provider { Provider::LMStudio("model".to_string(), None) }
++    fn openai() -> Provider {
++        Provider::OpenAI("gpt-5.3".to_string())
++    }
++    fn anthropic() -> Provider {
++        Provider::Anthropic("claude-opus-4-8".to_string())
++    }
++    fn google() -> Provider {
++        Provider::Google("gemini-3.1-pro-preview".to_string())
++    }
++    fn xai() -> Provider {
++        Provider::XAi("grok-4.1".to_string())
++    }
++    fn lmstudio() -> Provider {
++        Provider::LMStudio("model".to_string(), None)
++    }
+ 
+     #[test]
+     fn test_zero_is_none() {
+         assert!(matches!(openai().map_reasoning(0.0), ReasoningEffort::None));
+-        assert!(matches!(anthropic().map_reasoning(0.0), ReasoningEffort::None));
++        assert!(matches!(
++            anthropic().map_reasoning(0.0),
++            ReasoningEffort::None
++        ));
+         assert!(matches!(google().map_reasoning(0.0), ReasoningEffort::None));
+-        assert!(matches!(lmstudio().map_reasoning(0.0), ReasoningEffort::None));
++        assert!(matches!(
++            lmstudio().map_reasoning(0.0),
++            ReasoningEffort::None
++        ));
+     }
+ 
+     #[test]
+     fn test_one_is_max_per_provider() {
+-        assert!(matches!(openai().map_reasoning(1.0), ReasoningEffort::XHigh));
+-        assert!(matches!(anthropic().map_reasoning(1.0), ReasoningEffort::Max));
++        assert!(matches!(
++            openai().map_reasoning(1.0),
++            ReasoningEffort::XHigh
++        ));
++        assert!(matches!(
++            anthropic().map_reasoning(1.0),
++            ReasoningEffort::Max
++        ));
+         assert!(matches!(google().map_reasoning(1.0), ReasoningEffort::High));
+         assert!(matches!(xai().map_reasoning(1.0), ReasoningEffort::High));
+     }
+@@ -1013,17 +1035,29 @@ mod tests_reasoning {
+         // 0.25 -> ceil(1.0)=1 -> idx=0 -> Low
+         assert!(matches!(openai().map_reasoning(0.25), ReasoningEffort::Low));
+         // 0.5  -> ceil(2.0)=2 -> idx=1 -> Medium
+-        assert!(matches!(openai().map_reasoning(0.5), ReasoningEffort::Medium));
++        assert!(matches!(
++            openai().map_reasoning(0.5),
++            ReasoningEffort::Medium
++        ));
+         // 0.75 -> ceil(3.0)=3 -> idx=2 -> High
+-        assert!(matches!(openai().map_reasoning(0.75), ReasoningEffort::High));
++        assert!(matches!(
++            openai().map_reasoning(0.75),
++            ReasoningEffort::High
++        ));
+     }
+ 
+     #[test]
+     fn test_clamp_out_of_range() {
+         // 1.0超 -> clamp to 1.0 -> 最上位
+-        assert!(matches!(openai().map_reasoning(1.5), ReasoningEffort::XHigh));
++        assert!(matches!(
++            openai().map_reasoning(1.5),
++            ReasoningEffort::XHigh
++        ));
+         // 負数 -> None
+-        assert!(matches!(anthropic().map_reasoning(-0.3), ReasoningEffort::None));
++        assert!(matches!(
++            anthropic().map_reasoning(-0.3),
++            ReasoningEffort::None
++        ));
+     }
+ 
+     #[test]
+@@ -1047,14 +1081,23 @@ mod tests_capabilities {
+         let anthropic = Provider::Anthropic("claude-4.6-sonnet".to_string());
+         let expected = ModelCapability::STRUCTURED_OUTPUT | ModelCapability::TOOL_CALLING;
+         assert_eq!(openai.default_capabilities("gpt-5.3"), expected);
+-        assert_eq!(google.default_capabilities("gemini-3.1-pro-preview"), expected);
+-        assert_eq!(anthropic.default_capabilities("claude-4.6-sonnet"), expected);
++        assert_eq!(
++            google.default_capabilities("gemini-3.1-pro-preview"),
++            expected
++        );
++        assert_eq!(
++            anthropic.default_capabilities("claude-4.6-sonnet"),
++            expected
++        );
+     }
+ 
+     #[test]
+     fn test_xai_tool_calling_only() {
+         let xai = Provider::XAi("grok-4.1".to_string());
+-        assert_eq!(xai.default_capabilities("grok-4.1"), ModelCapability::TOOL_CALLING);
++        assert_eq!(
++            xai.default_capabilities("grok-4.1"),
++            ModelCapability::TOOL_CALLING
++        );
+     }
+ 
+     #[test]
+diff --git a/lsp/src/main.rs b/lsp/src/main.rs
+index 75ca48c..719afb7 100644
+--- a/lsp/src/main.rs
++++ b/lsp/src/main.rs
+@@ -5,6 +5,7 @@ mod assets;
+ mod backend;
+ mod chat_context;
+ mod character;
++mod character_ast;
+ mod character_updater;
+ mod code_action;
+ mod cursor_context;
+diff --git a/lsp/src/text.rs b/lsp/src/text.rs
+index b4c5496..2ac23eb 100644
+--- a/lsp/src/text.rs
++++ b/lsp/src/text.rs
+@@ -318,7 +318,7 @@ mod tests {
+         let hl = Highlighter::new();
+         // 各行とも括弧は行内で閉じるので、深さ0起点の行単位 tokenize で足りる
+         ls.iter_mut().for_each(|l| {
+-            hl.tokenize(l);
++            hl.tokenize(l, &std::collections::HashSet::new());
+         });
+ 
+         assert_eq!(ls.len(), 2);
+diff --git a/lsp/src/tools.rs b/lsp/src/tools.rs
+index 549ebac..c4c6196 100644
+--- a/lsp/src/tools.rs
++++ b/lsp/src/tools.rs
+@@ -1,6 +1,4 @@
+-use crate::character::{
+-    CharacterAttribute, CharacterCache, FileCacheEntry, find_character_file_path, parse_all_content,
+-};
++use crate::character::{CharacterAttribute, CharacterStore};
+ use crate::llm::{LlmError, LlmTool};
+ use crate::text::shorten_middle;
+ use async_trait::async_trait;
+@@ -45,7 +43,7 @@ pub(crate) fn parse_plot_md(content: &str) -> Vec<(String, String)> {
+ #[derive(Debug)]
+ pub(crate) struct CharacterInfoTool {
+     workspace: PathBuf,
+-    cache: CharacterCache,
++    store: CharacterStore,
+ }
+ 
+ #[async_trait]
+@@ -86,102 +84,34 @@ impl LlmTool for CharacterInfoTool {
+         _args: &serde_json::Map<String, Value>,
+     ) -> std::result::Result<String, LlmError> {
+         let name = _args["character_name"].as_str().unwrap_or("");
+-        let tags: Vec<String> = _args
++        let tags: Vec<CharacterAttribute> = _args
+             .get("tags")
+             .and_then(|v| v.as_array())
+             .map(|arr| {
+                 arr.iter()
+-                    .filter_map(|v| v.as_str().map(str::to_string))
++                    .filter_map(|v| v.as_str().and_then(|s| CharacterAttribute::try_from(s).ok()))
+                     .collect()
+             })
+             .unwrap_or_default();
+ 
+         debug!("CharacterInfoTool({}, {:?})", name, tags);
+ 
+-        let path = self.find_character_file_path(name)?;
+-
+-        let modified = std::fs::metadata(&path)
+-            .and_then(|m| m.modified())
+-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+-
+-        // キャッシュ確認（ロックは HashMap lookup の間だけ保持）
+-        // {
+-        //     let cache = self.cache.0.lock();
+-        //     if let Some(entry) = cache.get(&path)
+-        //         && entry.modified == modified
+-        //     {
+-        //         let result = Self::search_cache(entry, name, &tags);
+-        //         debug!("\t{:?}", result.map(|r| shorten_middle(&r, 40)))
+-        //     }
+-        // }
+-
+-        // キャッシュミス: ファイルを読んでパース
+-        let content =
+-            tokio::fs::read_to_string(&path)
+-                .await
+-                .map_err(|e| LlmError::GenericError {
+-                    message: format!("Failed to read {:?}: {}", &path, e),
+-                })?;
+-        debug!("{}", shorten_middle(&content, 40));
+-
+-        let characters = parse_all_content(&content);
+-        let file_entry = FileCacheEntry {
+-            modified,
+-            characters,
+-        };
+-
+-        let result = Self::search_cache(&file_entry, name, &tags);
+-        self.cache.0.lock().insert(path, file_entry);
++        // character_store はワークスペース全ファイルをメモリに保持しているため、
++        // 1ファイルへの決め打ちをせず全件横断で検索する
++        // (呼称が複数ありうる問題は store 側の全件検索で解消済み)。
++        let result = self.store.search(&self.workspace, name, &tags);
+         debug!("\t{:?}", result.as_ref().map(|r| shorten_middle(r, 40)));
+         result
+     }
+ }
+ 
+ impl CharacterInfoTool {
+-    pub(crate) fn new(workspace: &Path, cache: CharacterCache) -> Box<dyn LlmTool> {
++    pub(crate) fn new(workspace: &Path, store: CharacterStore) -> Box<dyn LlmTool> {
+         Box::new(Self {
+             workspace: workspace.to_path_buf(),
+-            cache,
++            store,
+         })
+     }
+-
+-    fn find_character_file_path(&self, name: &str) -> std::result::Result<PathBuf, LlmError> {
+-        find_character_file_path(&self.workspace, name) // TODO: キャラクタの呼び方は複数ありうるので、キャラ設定全部をなめないといけない
+-    }
+-
+-    pub(crate) fn search_cache(
+-        entry: &FileCacheEntry,
+-        name: &str,
+-        tags: &[String],
+-    ) -> std::result::Result<String, LlmError> {
+-        // キャラクター名は部分一致で検索
+-        let Some((_, char_entry)) = entry.characters.iter().find(|(k, _)| k.contains(name)) else {
+-            return Err(LlmError::GenericError {
+-                message: format!("Character '{}' not found", name),
+-            });
+-        };
+-
+-        let tag_attrs = tags
+-            .iter()
+-            .filter_map(|t| CharacterAttribute::try_from(t.as_str()).ok())
+-            .collect::<Vec<_>>();
+-
+-        let matched = char_entry
+-            .sections
+-            .iter()
+-            .filter(|s| tag_attrs.iter().any(|t| s.tags.contains(t)))
+-            .map(|s| s.text.trim())
+-            .filter(|t| !t.is_empty())
+-            .collect::<Vec<_>>();
+-
+-        if matched.is_empty() {
+-            Err(LlmError::GenericError {
+-                message: format!("No sections matching tags {:?} for '{}'", tags, name),
+-            })
+-        } else {
+-            Ok(matched.join("\n\n"))
+-        }
+-    }
+ }
+ 
+ // ─── PlotInfoTool ────────────────────────────────────────────────────────────
