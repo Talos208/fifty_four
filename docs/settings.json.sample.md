@@ -10,6 +10,12 @@ Zed の settings.json(`%APPDATA%\Zed\settings.json`)に書く設定のサンプ�
 API キーの環境変数(`GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `XAI_API_KEY` 等。
 `lmstudio` は認証不要)。API キーは settings.json ではなく OS のユーザー環境変数に設定すること。
 
+`capabilities`(サンプルの `deferred.capabilities` を参照)は `structured_output` / `tool_calling` /
+`reasoning_effort` / `stop_sequences` の4値を指定でき、指定すると provider ごとの自動導出結果を
+完全に置き換える。xAI (`grok-4.20-0309-reasoning` 等)はモデルによって `reasoning_effort` 非対応で
+明示しないと 400 になることがあるので、対応表は [lsp-handlers.md](lsp-handlers.md) の
+「xAI (Grok) の `reasoning_effort` 対応」を参照。
+
 ```json
 {
   "lsp": {

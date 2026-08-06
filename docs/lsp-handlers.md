@@ -139,10 +139,47 @@ LSP バイナリの起動コマンドを指示する(Zed 拡張側、`extension/
 
 | provider | 自動導出結果 |
 |---|---|
-| `google` / `openai` / `anthropic` | 常に `structured_output` + `tool_calling`(両対応前提) |
-| `xai` | `tool_calling` のみ |
+| `google` / `openai` / `anthropic` | 常に `structured_output` + `tool_calling` + `reasoning_effort` + `stop_sequences`(`reasoning_effort` の段数はモデル依存。下記参照) |
+| `xai` | 常に `structured_output` + `tool_calling`。`reasoning_effort` はモデル名依存(下表参照) |
 | `cloudflare` | モデル名に `instruct`/`hermes`/`qwen`/`mistral` を含む場合のみ `tool_calling`、それ以外は空 |
 | `lmstudio` | 常に空(ローカルモデルは多様なため自動判定しない。構造化出力に対応したモデルを使うなら `capabilities` で明示すること) |
+
+`capabilities` に指定できる値は `structured_output` / `tool_calling` / `reasoning_effort` / `stop_sequences` の4つ。
+**`capabilities` を明示すると上記の自動導出結果は完全に置き換わる**(マージではない)。一部だけ足したい場合も
+必要な値を全て書くこと。
+
+##### xAI (Grok) の `reasoning_effort` 対応(2026-08 時点)
+
+xAI はモデルによって `reasoning_effort` の対応が大きく割れており、非対応モデルに送ると
+`Model <name> does not support parameter reasoningEffort.` という 400 が返ってチャット全体が失敗する。
+このサーバは `lsp/src/llm.rs` の `Provider::xai_capabilities`/`Provider::map_reasoning` で
+モデル名から自動判定しているが、静的表が実際の xAI 仕様に追いついていない場合に備え、
+400 の本文から未対応パラメータ名を検出して1回だけ自動的に外して再送するフォールバックも入っている。
+
+| モデル | `reasoning_effort` | 備考 |
+|---|---|---|
+| `grok-4.20-0309-reasoning` / `-non-reasoning` | 非対応(送ると 400) | reasoning 深度がスナップショットに固定 |
+| `grok-4.20-multi-agent-*` | 対応(low/medium/high/xhigh) | 値の意味は「エージェント数(4 or 16)」であり reasoning 深度ではない |
+| `grok-4.3` / `grok-4.5` | 対応(low/medium/high) | `grok-4.5` は無効化(`none`)不可 |
+| 上記以外(未知のモデル) | 非対応扱い(安全側) | 400 が出ても自己修復リトライで吸収される |
+
+##### Google (Gemini) の `reasoning_effort` 段数
+
+Gemini 3 系は `thinkingLevel` の対応段数がモデルで異なり、対応外の段を送ると
+`Thinking level MEDIUM is not supported for this model.` という 400 が返る
+(xAI の 400 とは文言が異なるため、xAI 用の自己修復リトライでは救えない点に注意)。
+このサーバは `Provider::map_reasoning` で `gemini-3-pro-preview`(`.1` 無しの旧世代)のみ
+2段ラダー(`[low, high]`)に倒し、`medium` を送らないようにしている。
+
+| モデル | `reasoning_effort` 段数 |
+|---|---|
+| `gemini-3-pro-preview`(`.1` 無し) | low / high の2段のみ(medium 非対応) |
+| `gemini-3.1-pro-preview` 等(`.1` 系)・旧 gemini-2.5系 | low / medium / high |
+
+なお `gemini-3.1-pro-preview` / `gemini-2.5-pro` 等は thinking 自体を無効化できない仕様だが、
+`reasoning_effort: 0.0` を送ってもエラーにはならず、genai アダプタが `thinkingConfig` を単に
+省略するだけ(＝モデル既定の thinking がそのまま有効になる)。エラーは出ないが、
+「effort を下げたのにレイテンシ/コストが変わらない」という体感になりうる。
 
 #### provider 別の追加要件(provider + model 以外に必要なもの)
 

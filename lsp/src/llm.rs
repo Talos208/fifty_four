@@ -17,6 +17,14 @@ bitflags! {
         const STRUCTURED_OUTPUT = 1 << 0;
         /// Tool calling
         const TOOL_CALLING      = 1 << 1;
+        /// reasoning_effort を送ってよい
+        /// (xAI の grok-4.20-0309-* のように reasoning 深度がスナップショットに
+        ///  固定されているモデルは非対応。送ると 400 "does not support parameter
+        ///  reasoningEffort" が返る)
+        const REASONING_EFFORT  = 1 << 2;
+        /// stop シーケンスを送ってよい
+        /// (一部プロバイダの reasoning モデルは `stop` パラメータ自体が非対応)
+        const STOP_SEQUENCES    = 1 << 3;
     }
 }
 #[allow(unused_imports)]
@@ -45,7 +53,7 @@ impl Provider {
             "google" => Ok(Provider::Google("gemini-3.1-pro-preview".to_string())),
             "openai" => Ok(Provider::OpenAI("gpt-5.3".to_string())),
             "anthropic" => Ok(Provider::Anthropic("claude-4.6-sonnet".to_string())),
-            "xai" => Ok(Provider::XAi("grok-4.1".to_string())),
+            "xai" => Ok(Provider::XAi("grok-4.5".to_string())),
             "lmstudio" => Ok(Provider::LMStudio(
                 "qwen3.5-2b".to_string(),
                 Some("http://localhost:1234/v1/".to_string()),
@@ -109,10 +117,14 @@ impl Provider {
         match self {
             // Anthropic の構造化出力(output_config.format)は genai 0.6.5 の
             // Anthropic adapter が ChatResponseFormat::JsonSpec を通じて対応済み。
+            // reasoning_effort / stop はどちらも各社ドキュメント上サポート対象。
             Provider::Google(_) | Provider::OpenAI(_) | Provider::Anthropic(_) => {
-                ModelCapability::STRUCTURED_OUTPUT | ModelCapability::TOOL_CALLING
+                ModelCapability::STRUCTURED_OUTPUT
+                    | ModelCapability::TOOL_CALLING
+                    | ModelCapability::REASONING_EFFORT
+                    | ModelCapability::STOP_SEQUENCES
             }
-            Provider::XAi(_) => ModelCapability::TOOL_CALLING,
+            Provider::XAi(_) => Self::xai_capabilities(model),
             Provider::Cloudflare(_) => Self::cloudflare_capabilities(model),
             Provider::LMStudio(..) | Provider::Undefined => ModelCapability::empty(),
         }
@@ -133,16 +145,60 @@ impl Provider {
         }
     }
 
-    /// 正規化 effort (0.0..=1.0) をこのプロバイダの ReasoningEffort 段階へ写像する。
-    /// 0.0 (以下) または reasoning 非対応プロバイダ => None。1.0 => 最上位段。
-    pub fn map_reasoning(&self, norm: f64) -> ReasoningEffort {
+    /// xAI (Grok) はモデルごとに reasoning_effort の対応が大きく割れているため、
+    /// モデル名から判定する。2026-08 時点の x.ai 公式ドキュメント準拠:
+    /// - `grok-4.20-0309-reasoning` / `-non-reasoning`: reasoning 深度がスナップショット
+    ///   に固定されており reasoning_effort 自体が非対応(送ると 400)。
+    /// - `grok-4.20-multi-agent`: reasoning_effort は「エージェント数(4 or 16)」の指定に
+    ///   転用されており、値の意味が他モデルと異なる点に注意。
+    /// - `grok-4.3` / `grok-4.5`: 通常どおり reasoning 深度として対応(grok-4.5 は
+    ///   none 不可＝無効化できない)。
+    ///
+    /// 未知のモデル名は安全側に倒し reasoning_effort を送らない
+    /// (静的表が古くなった場合は 400 の自己修復リトライ(`unsupported_param_from_error_body`)で吸収する)。
+    ///
+    /// 判定順序に注意: "grok-4.20-multi-agent" は "grok-4.20" のプレフィックスにも
+    /// マッチするため、multi-agent の判定を先に行う。
+    fn xai_capabilities(model: &str) -> ModelCapability {
+        let base = ModelCapability::STRUCTURED_OUTPUT | ModelCapability::TOOL_CALLING;
+        let m = model.to_lowercase();
+        if m.contains("grok-4.20-multi-agent") {
+            base | ModelCapability::REASONING_EFFORT
+        } else if m.contains("grok-4.20") {
+            base
+        } else if m.contains("grok-4.3") || m.contains("grok-4.5") {
+            base | ModelCapability::REASONING_EFFORT
+        } else {
+            base
+        }
+    }
+
+    /// 正規化 effort (0.0..=1.0) をこのプロバイダ・モデルの ReasoningEffort 段階へ
+    /// 写像する。0.0 (以下) または reasoning 非対応 => None。1.0 => 最上位段。
+    pub fn map_reasoning(&self, model: &str, norm: f64) -> ReasoningEffort {
         use ReasoningEffort::*;
+        let m = model.to_lowercase();
         // 低→高 の順。空 = reasoning 非対応。
         let ladder: &[ReasoningEffort] = match self {
             Provider::OpenAI(_) => &[Low, Medium, High, XHigh],
             Provider::Anthropic(_) => &[Low, Medium, High, XHigh, Max],
+            // `gemini-3-pro-preview`(`.1` 無し)は thinkingLevel が low/high の2段のみで、
+            // medium を送ると 400 "Thinking level MEDIUM is not supported for this model."
+            // が返る。`gemini-3.1-pro-preview` 等の `.1` 系や旧 gemini-2.5系は
+            // low/medium/high に対応しているため、プレフィックス一致で bare な
+            // "gemini-3-pro-preview" のみ2段のラダーに倒す。
+            Provider::Google(_) if m.starts_with("gemini-3-pro-preview") => &[Low, High],
             Provider::Google(_) => &[Low, Medium, High],
-            Provider::XAi(_) => &[Low, High],
+            Provider::XAi(_) if m.contains("grok-4.20-multi-agent") => {
+                // multi-agent モデルでは reasoning 深度ではなく
+                // エージェント数(4 or 16)の指定に転用される。
+                &[Low, Medium, High, XHigh]
+            }
+            Provider::XAi(_) if m.contains("grok-4.20") => &[],
+            Provider::XAi(_) if m.contains("grok-4.3") || m.contains("grok-4.5") => {
+                &[Low, Medium, High]
+            }
+            Provider::XAi(_) => &[],
             Provider::Cloudflare(_) | Provider::LMStudio(..) | Provider::Undefined => &[],
         };
         let n = norm.clamp(0.0, 1.0);
@@ -178,6 +234,58 @@ impl Provider {
             Provider::Cloudflare(s) => Provider::Cloudflare(s.clone()),
             _ => Provider::Undefined,
         }
+    }
+}
+
+/// xAI 等が返す 400 のエラー本文から「対応していないパラメータ名」を抽出する。
+///
+/// 例: `"Model grok-4.20-0309-reasoning does not support parameter reasoningEffort."`
+/// → `Some("reasoning_effort")`
+///
+/// 静的な capability 表(`Provider::xai_capabilities` 等)が実際の API 仕様に
+/// 追いついていない場合の保険。パラメータ名は camelCase で返ってくるため
+/// snake_case に正規化する。
+fn unsupported_param_from_error_body(body: &str) -> Option<String> {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        // JSON エラー本文では引用符がバックスラッシュエスケープされて
+        // `\"stop\"` のように来ることがあるため、`\`・`"` を任意個読み飛ばす。
+        regex::Regex::new(r#"does not support parameter[\s\\"]+([A-Za-z][A-Za-z0-9_]*)"#).unwrap()
+    });
+    let raw = RE.captures(body)?.get(1)?.as_str();
+    Some(camel_to_snake(raw))
+}
+
+/// camelCase を snake_case へ正規化する(既に snake_case の場合はそのまま)。
+fn camel_to_snake(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 正規化済みパラメータ名に対応する `ChatOptions` のフィールドを落とす。
+/// 実際に値が入っていて外せた場合のみ `true` を返す(既に空なら再送しても
+/// 同じ 400 が繰り返されるだけなので、無限リトライを避けるため `false`)。
+fn strip_unsupported_option(options: &mut ChatOptions, param: &str) -> bool {
+    match param {
+        "reasoning_effort" => options.reasoning_effort.take().is_some(),
+        "stop" | "stop_sequences" => {
+            if options.stop_sequences.is_empty() {
+                false
+            } else {
+                options.stop_sequences.clear();
+                true
+            }
+        }
+        _ => false,
     }
 }
 
@@ -353,6 +461,8 @@ impl LlmClientBuilder {
                     match item.as_str().unwrap_or("") {
                         "structured_output" => acc | ModelCapability::STRUCTURED_OUTPUT,
                         "tool_calling" => acc | ModelCapability::TOOL_CALLING,
+                        "reasoning_effort" => acc | ModelCapability::REASONING_EFFORT,
+                        "stop_sequences" => acc | ModelCapability::STOP_SEQUENCES,
                         _ => acc,
                     }
                 })
@@ -587,6 +697,12 @@ impl LlmInterface for LlmClient {
                     .with_schema(t.schema())
             }));
 
+        // 静的な capability 表が古くなっていた場合の保険。400 の本文に
+        // "does not support parameter <name>" があれば、そのパラメータを
+        // options から落として1回だけ再送する(同じパラメータは二度と外さない
+        // ので、想定外の応答が来ても無限ループにはならない)。
+        let mut stripped_params: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         let content = loop {
             let res = self
                 .inner_client
@@ -611,6 +727,20 @@ impl LlmInterface for LlmClient {
                                 .map(|v| v.to_str().unwrap_or("0").parse::<u32>().unwrap())
                                 .unwrap_or(0u32);
                             return Err(LlmError::LlmBusy { retry_after: after });
+                        }
+                        genai::webc::Error::ResponseFailedStatus { status, body, .. } => {
+                            if let Some(param) = unsupported_param_from_error_body(body)
+                                && !stripped_params.contains(&param)
+                                && strip_unsupported_option(&mut self.options, &param)
+                            {
+                                warn!(
+                                    "model {} ({:?}) rejected parameter '{}'; retrying without it. body={}",
+                                    self.model, status, param, body
+                                );
+                                stripped_params.insert(param);
+                                continue;
+                            }
+                            error!("Web error{:?} body={}", status, body);
                         }
                         _ => {
                             error!("{:?}", e)
@@ -794,6 +924,13 @@ impl LlmInterface for LlmClient {
     }
 
     fn stop_sequences(&mut self, seqs: Vec<String>) {
+        if !self.capabilities.contains(ModelCapability::STOP_SEQUENCES) {
+            debug!(
+                "model {} does not support stop_sequences; skipping",
+                self.model
+            );
+            return;
+        }
         self.options = std::mem::take(&mut self.options).with_stop_sequences(seqs);
     }
 
@@ -802,11 +939,27 @@ impl LlmInterface for LlmClient {
     }
 
     fn reasoning_effort(&mut self, effort: ReasoningEffort) {
+        if !self.capabilities.contains(ModelCapability::REASONING_EFFORT) {
+            debug!(
+                "model {} does not support reasoning_effort; skipping",
+                self.model
+            );
+            return;
+        }
         self.options = std::mem::take(&mut self.options).with_reasoning_effort(effort);
     }
 
     fn reasoning_level(&mut self, level: f64) {
-        let effort = self.provider.map_reasoning(level);
+        if !self.capabilities.contains(ModelCapability::REASONING_EFFORT) {
+            debug!(
+                "model {} does not support reasoning_effort; skipping (level={})",
+                self.model, level
+            );
+            return;
+        }
+        // モデル名は builder 側で上書き済みの self.model を見る(self.provider が
+        // 内部に保持する既定モデル名ではなく、実際に送信するモデル名で判定する)。
+        let effort = self.provider.map_reasoning(&self.model, level);
         self.options = std::mem::take(&mut self.options).with_reasoning_effort(effort);
     }
 
@@ -995,7 +1148,7 @@ mod tests_reasoning {
         Provider::Google("gemini-3.1-pro-preview".to_string())
     }
     fn xai() -> Provider {
-        Provider::XAi("grok-4.1".to_string())
+        Provider::XAi("grok-4.5".to_string())
     }
     fn lmstudio() -> Provider {
         Provider::LMStudio("model".to_string(), None)
@@ -1003,14 +1156,20 @@ mod tests_reasoning {
 
     #[test]
     fn test_zero_is_none() {
-        assert!(matches!(openai().map_reasoning(0.0), ReasoningEffort::None));
         assert!(matches!(
-            anthropic().map_reasoning(0.0),
+            openai().map_reasoning("gpt-5.3", 0.0),
             ReasoningEffort::None
         ));
-        assert!(matches!(google().map_reasoning(0.0), ReasoningEffort::None));
         assert!(matches!(
-            lmstudio().map_reasoning(0.0),
+            anthropic().map_reasoning("claude-opus-4-8", 0.0),
+            ReasoningEffort::None
+        ));
+        assert!(matches!(
+            google().map_reasoning("gemini-3.1-pro-preview", 0.0),
+            ReasoningEffort::None
+        ));
+        assert!(matches!(
+            lmstudio().map_reasoning("model", 0.0),
             ReasoningEffort::None
         ));
     }
@@ -1018,30 +1177,39 @@ mod tests_reasoning {
     #[test]
     fn test_one_is_max_per_provider() {
         assert!(matches!(
-            openai().map_reasoning(1.0),
+            openai().map_reasoning("gpt-5.3", 1.0),
             ReasoningEffort::XHigh
         ));
         assert!(matches!(
-            anthropic().map_reasoning(1.0),
+            anthropic().map_reasoning("claude-opus-4-8", 1.0),
             ReasoningEffort::Max
         ));
-        assert!(matches!(google().map_reasoning(1.0), ReasoningEffort::High));
-        assert!(matches!(xai().map_reasoning(1.0), ReasoningEffort::High));
+        assert!(matches!(
+            google().map_reasoning("gemini-3.1-pro-preview", 1.0),
+            ReasoningEffort::High
+        ));
+        assert!(matches!(
+            xai().map_reasoning("grok-4.5", 1.0),
+            ReasoningEffort::High
+        ));
     }
 
     #[test]
     fn test_openai_midpoints() {
         // ladder=[Low,Medium,High,XHigh], len=4
         // 0.25 -> ceil(1.0)=1 -> idx=0 -> Low
-        assert!(matches!(openai().map_reasoning(0.25), ReasoningEffort::Low));
+        assert!(matches!(
+            openai().map_reasoning("gpt-5.3", 0.25),
+            ReasoningEffort::Low
+        ));
         // 0.5  -> ceil(2.0)=2 -> idx=1 -> Medium
         assert!(matches!(
-            openai().map_reasoning(0.5),
+            openai().map_reasoning("gpt-5.3", 0.5),
             ReasoningEffort::Medium
         ));
         // 0.75 -> ceil(3.0)=3 -> idx=2 -> High
         assert!(matches!(
-            openai().map_reasoning(0.75),
+            openai().map_reasoning("gpt-5.3", 0.75),
             ReasoningEffort::High
         ));
     }
@@ -1050,12 +1218,12 @@ mod tests_reasoning {
     fn test_clamp_out_of_range() {
         // 1.0超 -> clamp to 1.0 -> 最上位
         assert!(matches!(
-            openai().map_reasoning(1.5),
+            openai().map_reasoning("gpt-5.3", 1.5),
             ReasoningEffort::XHigh
         ));
         // 負数 -> None
         assert!(matches!(
-            anthropic().map_reasoning(-0.3),
+            anthropic().map_reasoning("claude-opus-4-8", -0.3),
             ReasoningEffort::None
         ));
     }
@@ -1063,8 +1231,87 @@ mod tests_reasoning {
     #[test]
     fn test_lmstudio_always_none() {
         for v in [0.0, 0.5, 1.0, 2.0] {
-            assert!(matches!(lmstudio().map_reasoning(v), ReasoningEffort::None));
+            assert!(matches!(
+                lmstudio().map_reasoning("model", v),
+                ReasoningEffort::None
+            ));
         }
+    }
+
+    #[test]
+    fn test_xai_grok_4_20_reasoning_never_supports_effort() {
+        // grok-4.20-0309-reasoning / -non-reasoning は reasoning 深度が
+        // スナップショットに固定されており、reasoning_effort 自体が非対応。
+        // 送ると xAI が 400 "does not support parameter reasoningEffort" を返す
+        // (このバグの元になった実際のエラー)。
+        for v in [0.0, 0.5, 1.0] {
+            assert!(matches!(
+                xai().map_reasoning("grok-4.20-0309-reasoning", v),
+                ReasoningEffort::None
+            ));
+            assert!(matches!(
+                xai().map_reasoning("grok-4.20-0309-non-reasoning", v),
+                ReasoningEffort::None
+            ));
+        }
+    }
+
+    #[test]
+    fn test_xai_grok_4_5_supports_effort() {
+        assert!(matches!(
+            xai().map_reasoning("grok-4.5", 1.0),
+            ReasoningEffort::High
+        ));
+    }
+
+    #[test]
+    fn test_xai_grok_4_20_multi_agent_is_not_mistaken_for_grok_4_20() {
+        // "grok-4.20-multi-agent" は "grok-4.20" のプレフィックスにもマッチしうるため、
+        // multi-agent の判定を先に行う必要がある。ここでは reasoning_effort が
+        // 「エージェント数」に転用され、1.0 で最上位(XHigh)に到達することを確認する。
+        assert!(matches!(
+            xai().map_reasoning("grok-4.20-multi-agent-0309", 1.0),
+            ReasoningEffort::XHigh
+        ));
+        assert!(matches!(
+            xai().map_reasoning("grok-4.20-multi-agent-0309", 0.0),
+            ReasoningEffort::None
+        ));
+    }
+
+    #[test]
+    fn test_google_gemini_3_pro_preview_bare_has_no_medium() {
+        // 実際に確認された回帰: gemini-3-pro-preview(`.1` 無し)に thinkingLevel=MEDIUM
+        // を送ると 400 "Thinking level MEDIUM is not supported for this model." になる
+        // (xAI の reasoningEffort 400 と同じ「プロバイダ単位で決め打ちしていた」型のバグ)。
+        // 0.5 は 3段ラダーなら Medium だが、2段ラダー([Low, High])では Low 側に丸まる
+        // (ceil(0.5*2)=1 -> idx=0)。0.5 超で初めて High に切り上がる。
+        assert!(matches!(
+            google().map_reasoning("gemini-3-pro-preview", 0.5),
+            ReasoningEffort::Low
+        ));
+        assert!(matches!(
+            google().map_reasoning("gemini-3-pro-preview", 0.51),
+            ReasoningEffort::High
+        ));
+        assert!(matches!(
+            google().map_reasoning("gemini-3-pro-preview", 1.0),
+            ReasoningEffort::High
+        ));
+        assert!(matches!(
+            google().map_reasoning("gemini-3-pro-preview", 0.0),
+            ReasoningEffort::None
+        ));
+    }
+
+    #[test]
+    fn test_google_gemini_3_1_pro_preview_still_has_medium() {
+        // "gemini-3-pro-preview" への前方一致が誤って "gemini-3.1-pro-preview" にまで
+        // 波及していないこと("." の位置が違うので前方一致しないはず)。
+        assert!(matches!(
+            google().map_reasoning("gemini-3.1-pro-preview", 0.5),
+            ReasoningEffort::Medium
+        ));
     }
 }
 
@@ -1074,12 +1321,15 @@ mod tests_capabilities {
 
     #[test]
     fn test_openai_google_anthropic_always_full() {
-        // OpenAI/Google/Anthropic はモデル名に依らず structured_output + tool_calling
+        // OpenAI/Google/Anthropic はモデル名に依らず全capability対応
         // (Anthropic は genai の adapter が output_config.format 経由で対応済み)
         let openai = Provider::OpenAI("gpt-5.3".to_string());
         let google = Provider::Google("gemini-3.1-pro-preview".to_string());
         let anthropic = Provider::Anthropic("claude-4.6-sonnet".to_string());
-        let expected = ModelCapability::STRUCTURED_OUTPUT | ModelCapability::TOOL_CALLING;
+        let expected = ModelCapability::STRUCTURED_OUTPUT
+            | ModelCapability::TOOL_CALLING
+            | ModelCapability::REASONING_EFFORT
+            | ModelCapability::STOP_SEQUENCES;
         assert_eq!(openai.default_capabilities("gpt-5.3"), expected);
         assert_eq!(
             google.default_capabilities("gemini-3.1-pro-preview"),
@@ -1092,11 +1342,43 @@ mod tests_capabilities {
     }
 
     #[test]
-    fn test_xai_tool_calling_only() {
-        let xai = Provider::XAi("grok-4.1".to_string());
+    fn test_xai_reasoning_models_get_reasoning_effort() {
+        let xai = Provider::XAi("grok-4.5".to_string());
+        let with_reasoning = ModelCapability::STRUCTURED_OUTPUT
+            | ModelCapability::TOOL_CALLING
+            | ModelCapability::REASONING_EFFORT;
+        assert_eq!(xai.default_capabilities("grok-4.5"), with_reasoning);
+        assert_eq!(xai.default_capabilities("grok-4.3"), with_reasoning);
         assert_eq!(
-            xai.default_capabilities("grok-4.1"),
-            ModelCapability::TOOL_CALLING
+            xai.default_capabilities("grok-4.20-multi-agent-0309"),
+            with_reasoning
+        );
+    }
+
+    #[test]
+    fn test_xai_grok_4_20_snapshot_has_no_reasoning_effort() {
+        // 実際の回帰: grok-4.20-0309-reasoning に reasoning_effort を送ると
+        // xAI が 400 "does not support parameter reasoningEffort" を返す。
+        let xai = Provider::XAi("grok-4.20-0309-reasoning".to_string());
+        let without_reasoning = ModelCapability::STRUCTURED_OUTPUT | ModelCapability::TOOL_CALLING;
+        assert_eq!(
+            xai.default_capabilities("grok-4.20-0309-reasoning"),
+            without_reasoning
+        );
+        assert_eq!(
+            xai.default_capabilities("grok-4.20-0309-non-reasoning"),
+            without_reasoning
+        );
+    }
+
+    #[test]
+    fn test_xai_unknown_model_defaults_conservative() {
+        // 静的表に無い未知の Grok モデルは reasoning_effort を送らない
+        // (400 の場合は Step 5 の自己修復リトライが吸収する)。
+        let xai = Provider::XAi("grok-4.5".to_string());
+        assert_eq!(
+            xai.default_capabilities("grok-9-mystery"),
+            ModelCapability::STRUCTURED_OUTPUT | ModelCapability::TOOL_CALLING
         );
     }
 
@@ -1135,6 +1417,66 @@ mod tests_capabilities {
             cf.default_capabilities("@cf/qwen/qwen1.5-14b-chat"),
             ModelCapability::TOOL_CALLING // "qwen" キーワードにマッチ
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_unsupported_param_retry {
+    use super::*;
+
+    #[test]
+    fn test_extracts_reasoning_effort_from_actual_xai_error() {
+        // このバグ報告の実際のエラー本文(そのまま)
+        let body = "Model grok-4.20-0309-reasoning does not support parameter reasoningEffort.";
+        assert_eq!(
+            unsupported_param_from_error_body(body).as_deref(),
+            Some("reasoning_effort")
+        );
+    }
+
+    #[test]
+    fn test_extracts_from_quoted_json_style_body() {
+        let body = r#"{"code":"Invalid request","error":"does not support parameter \"stop\""}"#;
+        assert_eq!(
+            unsupported_param_from_error_body(body).as_deref(),
+            Some("stop")
+        );
+    }
+
+    #[test]
+    fn test_unrelated_body_returns_none() {
+        let body = "Internal server error";
+        assert_eq!(unsupported_param_from_error_body(body), None);
+    }
+
+    #[test]
+    fn test_camel_to_snake() {
+        assert_eq!(camel_to_snake("reasoningEffort"), "reasoning_effort");
+        assert_eq!(camel_to_snake("stop"), "stop");
+        assert_eq!(camel_to_snake("stopSequences"), "stop_sequences");
+    }
+
+    #[test]
+    fn test_strip_unsupported_option_reasoning_effort() {
+        let mut options = ChatOptions::default().with_reasoning_effort(ReasoningEffort::High);
+        assert!(strip_unsupported_option(&mut options, "reasoning_effort"));
+        assert!(options.reasoning_effort.is_none());
+        // 既に外れている場合は false (無限リトライを避けるためのガード)
+        assert!(!strip_unsupported_option(&mut options, "reasoning_effort"));
+    }
+
+    #[test]
+    fn test_strip_unsupported_option_stop_sequences() {
+        let mut options = ChatOptions::default().with_stop_sequences(vec!["STOP".to_string()]);
+        assert!(strip_unsupported_option(&mut options, "stop"));
+        assert!(options.stop_sequences.is_empty());
+        assert!(!strip_unsupported_option(&mut options, "stop_sequences"));
+    }
+
+    #[test]
+    fn test_strip_unsupported_option_unknown_param_is_noop() {
+        let mut options = ChatOptions::default();
+        assert!(!strip_unsupported_option(&mut options, "top_logprobs"));
     }
 }
 
