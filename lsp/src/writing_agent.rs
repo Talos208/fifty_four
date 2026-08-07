@@ -112,6 +112,10 @@ pub(crate) struct ClaudeAgent {
     client: tokio::sync::Mutex<ClaudeSDKClient>,
     /// 要約の一発問い合わせで使い回すワークスペースルート。
     root: PathBuf,
+    /// `--resume` で起動されたか(`session/load`、またはモデル/effort変更による
+    /// 再起動)。`Message::Result{is_error:true}` の文言選びに使う
+    /// ([`Self::result_error`] 参照)。
+    resumed: bool,
 }
 
 impl std::fmt::Debug for ClaudeAgent {
@@ -175,6 +179,7 @@ impl ClaudeAgent {
         Ok(Self {
             client: tokio::sync::Mutex::new(client),
             root: root.to_path_buf(),
+            resumed: resume,
         })
     }
 
@@ -208,10 +213,18 @@ impl ClaudeAgent {
             };
             match message {
                 Message::Assistant { message, .. } => append_text(&mut out, &message.content),
-                Message::Result { is_error, .. } => {
+                Message::Result {
+                    is_error,
+                    subtype,
+                    errors,
+                    result,
+                    ..
+                } => {
                     if is_error {
+                        let detail = describe_result_error(&subtype, &errors, &result);
+                        warn!("acp: chat digest 生成が失敗結果を返しました: {}", detail);
                         return Err(AgentError {
-                            message: "claude reported an error result".to_string(),
+                            message: format!("claude reported an error result ({})", detail),
                         });
                     }
                     break;
@@ -220,6 +233,35 @@ impl ClaudeAgent {
             }
         }
         Ok(out)
+    }
+
+    /// `Message::Result{is_error:true}` を分かりやすい `AgentError` へ変換する。
+    ///
+    /// `--resume` で起動したセッションが実は `claude` CLI 側に存在しない場合、
+    /// `ClaudeSDKClient::new()` の接続自体は成功してしまい、`friendly_agent_error` の
+    /// `Transport` 検出では捕まえられない。実際の失敗は最初の応答がこの形
+    /// (`Message::Result{is_error:true}`)で返ってきたときに初めて分かる
+    /// (`claude` CLI 自身は stderr に "No conversation found with session ID: ..." を
+    /// 出すが、こちらのプロセスからは見えない)。`--resume` 起動だった場合は
+    /// `friendly_agent_error` の `Transport` と同じ文言に寄せ、詳細はログにだけ残す。
+    /// 新規セッションでの失敗は本当に別の理由(実際のAPIエラー等)の可能性があるため、
+    /// 詳細をそのままユーザーへ返す。
+    fn result_error(&self, subtype: &str, errors: &[String], result: &Option<String>) -> AgentError {
+        let detail = describe_result_error(subtype, errors, result);
+        warn!(
+            "acp: claude reported an error result (resumed={}): {}",
+            self.resumed, detail
+        );
+        if self.resumed {
+            AgentError {
+                message: "セッションの再開に失敗しました。新しい会話を開始してください。"
+                    .to_string(),
+            }
+        } else {
+            AgentError {
+                message: format!("claude reported an error result ({})", detail),
+            }
+        }
     }
 }
 
@@ -313,6 +355,20 @@ fn friendly_agent_error(e: anthropic_agent_sdk::ClaudeError) -> AgentError {
     }
 }
 
+/// `subtype`/`errors`/`result` から `Message::Result{is_error:true}` の詳細文字列を組み立てる。
+///
+/// `errors` が空でも `result`(成功時用のフィールドだが、実運用では失敗時にも
+/// メッセージが入ることがある)があればそちらを使う。どちらも無ければ `subtype` のみ。
+fn describe_result_error(subtype: &str, errors: &[String], result: &Option<String>) -> String {
+    if !errors.is_empty() {
+        format!("{} ({})", subtype, errors.join("; "))
+    } else if let Some(r) = result.as_deref().filter(|r| !r.is_empty()) {
+        format!("{} ({})", subtype, r)
+    } else {
+        subtype.to_string()
+    }
+}
+
 /// 応答ブロックからテキストだけを取り出して連結する。
 fn append_text(out: &mut String, blocks: &[ContentBlock]) {
     for block in blocks {
@@ -359,12 +415,14 @@ impl WritingAgent for ClaudeAgent {
                     }
                 }
                 Message::Result {
-                    is_error, subtype, ..
+                    is_error,
+                    subtype,
+                    errors,
+                    result,
+                    ..
                 } => {
                     if is_error {
-                        return Err(AgentError {
-                            message: format!("claude reported an error result ({})", subtype),
-                        });
+                        return Err(self.result_error(&subtype, &errors, &result));
                     }
                     break;
                 }

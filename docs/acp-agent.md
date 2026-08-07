@@ -260,6 +260,33 @@ chat digest updated (N chars)
 `RUST_LOG=debug` にすると ACP ライブラリのメッセージダンプが大量に混ざるので、
 `fifty_four_lsp=debug` に絞るとよい。
 
+**`RUST_LOG` を渡す手段が無い場合(Zed から `agent_servers` 経由で起動している等)。**
+Zed はこのバイナリを直接起動するため、ターミナルから環境変数を渡す方法が事実上無い。
+そのため `--acp` 起動時、`RUST_LOG` が未設定なら ACP 関連モジュール
+(`acp`/`acp_config`/`writing_agent`/`session_log`)に限って自動的に debug 相当になる
+(`lsp/src/main.rs` の `default_acp_log_level()`)。上記のようなログは特に何も設定しなくても
+Zed のログ(`~/.local/share/zed/logs/Zed.log` 等、stderr を拾う経路)に出るはず。
+明示的に別のレベルを見たい場合は `agent_servers` の設定に `env` で `RUST_LOG` を書けば
+そちらが優先される:
+
+```json
+{
+  "agent_servers": {
+    "fifty-four": {
+      "command": "/path/to/fifty_four/target/debug/fifty_four_lsp",
+      "args": ["--acp"],
+      "env": { "RUST_LOG": "fifty_four_lsp=trace" }
+    }
+  }
+}
+```
+
+**クラッシュ(panic)した場合。** stderr にpanicメッセージが流れるのに加えて、
+`<実行ファイルの隣>/logs/acp_panic.log` へタイムスタンプ・panic内容・バックトレースが
+追記される(`lsp/src/main.rs` の `install_acp_panic_hook()`)。Zed がstderrを拾わない・
+拾っても見つけにくい場合はこのファイルを確認する。TTLや自動削除は無いので、
+古いエントリが溜まっていたら手動で消してよい。
+
 ## モデル・思考レベルの変更
 
 Agent Panel にモデルと思考レベル(effort)のセレクタが出る。中身は ACP の
@@ -351,6 +378,20 @@ supported by this agent.」というエラーになる。
 UUID形式しか受け付けないため、こうした旧IDでの `session/load` は
 `session/load` の時点で明示的にエラーを返す(`lsp/src/acp.rs` のUUID形式検証)。
 この場合はZed上で手動で新しい会話を開始すること。
+
+**UUID形式でも、`claude` CLI 側に実体が無いセッションは再開できない。** `session/load`
+はUUID形式の検証はするが、そのセッションが `claude` CLI 側に実在するかは
+接続時点では確認していない(`ClaudeSDKClient::new()` は `--resume` 先が無くても
+接続自体は成功してしまう)。実際の失敗は最初の `session/prompt` で
+`Message::Result{is_error:true}` として返ってきて初めて分かる。`claude` CLI 自身は
+このとき stderr に `No conversation found with session ID: ...` を出す
+(Zedの `agent stderr:` ログに出る。こちらのプロセスからは見えないログなので
+`RUST_LOG` を上げても出てこない)。この場合、応答は
+「セッションの再開に失敗しました。新しい会話を開始してください。」という
+分かりやすい文言になる(`--resume` 起動時のみこの文言に寄せる。新規セッションでの
+同種のエラーは実際のAPIエラー等の可能性があるため詳細をそのまま返す。
+`lsp/src/writing_agent.rs` の `ClaudeAgent::result_error`)。詳細(`errors`/`result`)は
+`WARN` ログにだけ残る。
 
 ## スコープ外
 

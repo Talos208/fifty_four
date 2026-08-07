@@ -100,6 +100,15 @@ struct Session {
     /// プロセスを起こし直すタイミングを会話の切れ目まで遅らせている。
     /// [`crate::acp_config`] のモジュールdoc参照)。
     pending: Option<SessionConfig>,
+    /// このセッションの `claude` プロセスが一度でも応答を完了したか。
+    ///
+    /// `false` のうちは `claude` CLI 側にそのセッションIDの会話記録が
+    /// まだ存在しない(`session/new` で起こしたプロセスがまだ一度も
+    /// ターンを終えていない)。設定変更の再起動(`session/prompt` 冒頭)で
+    /// このときに `--resume` してしまうと、記録の無いIDを再開しようとして
+    /// 「No conversation found」で失敗する。`session/load` は再開対象として
+    /// 読み込む以上ここに会話がある前提で `true` から始める。
+    has_replied: bool,
 }
 
 /// ハンドラ間で共有する状態。
@@ -228,6 +237,7 @@ pub(crate) async fn run() -> Result<(), String> {
                         turns: Vec::new(),
                         config,
                         pending: None,
+                        has_replied: false,
                     },
                 );
                 responder.respond(NewSessionResponse::new(id).config_options(config_options))
@@ -355,6 +365,7 @@ pub(crate) async fn run() -> Result<(), String> {
                         turns,
                         config,
                         pending: None,
+                        has_replied: true,
                     },
                 );
                 responder.respond(LoadSessionResponse::new().config_options(config_options))
@@ -388,13 +399,18 @@ pub(crate) async fn run() -> Result<(), String> {
                                 warn!("acp: failed to persist turn: {}", e);
                             }
                             s.turns.push(turn);
-                            Some((s.root.clone(), s.agent.clone(), s.pending.clone()))
+                            Some((
+                                s.root.clone(),
+                                s.agent.clone(),
+                                s.pending.clone(),
+                                s.has_replied,
+                            ))
                         }
                         None => None,
                     }
                 };
 
-                let Some((root, mut agent, pending)) = session else {
+                let Some((root, mut agent, pending, has_replied)) = session else {
                     warn!("acp session/prompt: unknown session {}", session_id);
                     return responder
                         .respond_with_internal_error(format!("unknown session: {}", session_id));
@@ -404,12 +420,23 @@ pub(crate) async fn run() -> Result<(), String> {
                 // `claude` プロセスを起こし直す。`anthropic-agent-sdk` はセッション途中の
                 // 切替を非対応なので、同じセッションIDで `--resume` することで
                 // 会話の文脈を保ったまま設定だけ変える(`session/load` と同じ経路)。
+                // まだ一度も応答していないセッションでは `claude` CLI 側にそのIDの
+                // 会話記録が無いため、`--resume` ではなく `--session-id`(新規扱い)で
+                // 起動する(`has_replied` 参照。無条件に `--resume` すると
+                // 「No conversation found」で失敗する)。
                 if let Some(new_config) = pending {
                     let prompt = match system_prompt() {
                         Ok(p) => p,
                         Err(e) => return responder.respond_with_internal_error(e),
                     };
-                    match ClaudeAgent::start(&root, prompt, &session_id.0, true, &new_config).await
+                    match ClaudeAgent::start(
+                        &root,
+                        prompt,
+                        &session_id.0,
+                        has_replied,
+                        &new_config,
+                    )
+                    .await
                     {
                         Ok(new_agent) => {
                             agent = Arc::new(new_agent);
@@ -489,6 +516,10 @@ pub(crate) async fn run() -> Result<(), String> {
                     let mut sessions = prompt_state.sessions.lock().await;
                     match sessions.get_mut(&session_id) {
                         Some(s) => {
+                            // ここに来た時点で agent.prompt() は成功している
+                            // (エラーは手前で早期returnしている)。つまり
+                            // `claude` CLI 側にこのセッションIDの会話記録ができた。
+                            s.has_replied = true;
                             let reply_text = reply.text.trim();
                             if !reply_text.is_empty() {
                                 let turn = ChatTurn {
