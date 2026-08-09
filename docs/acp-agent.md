@@ -161,6 +161,24 @@ Read, Write, Edit, Glob, Grep, WebSearch, WebFetch
 （`anthropic-agent-sdk` は `which claude` で探し、見つからなければ
 `~/.npm-global/bin`, `/usr/local/bin`, `~/.local/bin` 等も探す）。
 
+> ⚠️ **Windows での注意。** `anthropic-agent-sdk` のフォールバック探索
+> (`~/.npm-global/bin` 等)は完全にPOSIX前提で、Windows専用の分岐が無い。
+> Windowsでは実質 `which claude`(= PATH)一本勝負になるため、`fifty_four_lsp`
+> 側で `which::which("claude")` に加えて `%APPDATA%\npm\claude.cmd`
+> (npmのグローバルインストール既定先)も明示的にチェックしている
+> (`lsp/src/writing_agent.rs` の `resolve_cli_path`)。
+>
+> **さらに、`npm install -g @anthropic-ai/claude-code` で入れた `claude.cmd`
+> ラッパー自体はACP連携から起動できない。** Rust標準ライブラリの
+> 引数エスケープ制限(`.bat`/`.cmd`向け、CVE-2024-24576対策)により、
+> 長いシステムプロンプトを渡すと「batch file arguments are invalid」という
+> 原因の分からないOSエラーで落ちる。`fifty_four_lsp` 側でこの形式を検出し、
+> 分かりやすい理由で早期に失敗させるようにはしてあるが(`unsupported_cli_reason`)、
+> 回避策ではなく検出でしかない。**Windowsでは Anthropic のネイティブ
+> インストーラ(`.exe` が生成される方)で `claude` を入れること。**
+> npm経由でインストール済みの場合は `npm uninstall -g @anthropic-ai/claude-code`
+> のうえ入れ直す。
+
 ### 補完側の設定
 
 要約をプロンプトへ埋め込む挙動は LSP 側の `initialization_options.chat_context` で調整する。

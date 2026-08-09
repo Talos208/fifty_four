@@ -701,7 +701,8 @@ impl LlmInterface for LlmClient {
         // "does not support parameter <name>" があれば、そのパラメータを
         // options から落として1回だけ再送する(同じパラメータは二度と外さない
         // ので、想定外の応答が来ても無限ループにはならない)。
-        let mut stripped_params: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stripped_params: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         let content = loop {
             let res = self
@@ -939,7 +940,10 @@ impl LlmInterface for LlmClient {
     }
 
     fn reasoning_effort(&mut self, effort: ReasoningEffort) {
-        if !self.capabilities.contains(ModelCapability::REASONING_EFFORT) {
+        if !self
+            .capabilities
+            .contains(ModelCapability::REASONING_EFFORT)
+        {
             debug!(
                 "model {} does not support reasoning_effort; skipping",
                 self.model
@@ -950,7 +954,10 @@ impl LlmInterface for LlmClient {
     }
 
     fn reasoning_level(&mut self, level: f64) {
-        if !self.capabilities.contains(ModelCapability::REASONING_EFFORT) {
+        if !self
+            .capabilities
+            .contains(ModelCapability::REASONING_EFFORT)
+        {
             debug!(
                 "model {} does not support reasoning_effort; skipping (level={})",
                 self.model, level

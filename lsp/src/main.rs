@@ -11,10 +11,10 @@ mod acp;
 mod acp_config;
 mod assets;
 mod backend;
-mod chat_context;
 mod character;
 mod character_ast;
 mod character_updater;
+mod chat_context;
 mod code_action;
 mod cursor_context;
 mod flight_recorder;
@@ -296,7 +296,10 @@ mod tests {
         append_to_acp_panic_log(&format!("{marker}\n"));
 
         let after = std::fs::read_to_string(&log_path).unwrap();
-        assert!(after.starts_with(&before), "既存の内容を上書きしていないこと");
+        assert!(
+            after.starts_with(&before),
+            "既存の内容を上書きしていないこと"
+        );
         assert!(after.contains(&marker), "追記した内容が読めること");
     }
 }

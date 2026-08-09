@@ -364,7 +364,22 @@ pub fn before_sentences_upto(
         .iter()
         .position(|tkn| tkn.byte_start <= last_byte && last_byte < tkn.byte_end)
         .map(|ix| ix as i64)
-        .unwrap_or(text[line_no].tokens.len() as i64);
+        .unwrap_or_else(|| {
+            // last_byte を含むトークンが無い場合(行頭の空白の直前、行末など)。
+            // last_byte 以前に完全に収まっているトークンの数を数えれば、それが
+            // 「カーソルの直前にあるトークンの次のインデックス」になる。
+            // カーソルが最初のトークンより前(行頭の空白等)なら 0 に、
+            // 最後のトークンより後(行末)なら tokens.len() になり、どちらの端でも
+            // 正しく振る舞う。以前は無条件に tokens.len()(行末扱い)へ倒していたため、
+            // 行頭で一致しないケースを行末と誤認し、後段のスライスで
+            // `line.text[行末トークンのbyte_start..last_byte(=0)]` という
+            // 逆転レンジを作ってpanicしていた。
+            text[line_no]
+                .tokens
+                .iter()
+                .filter(|tkn| tkn.byte_end <= last_byte)
+                .count() as i64
+        });
 
     let mut ln = line_no as i64;
     let mut result = vec![];
@@ -393,7 +408,11 @@ pub fn before_sentences_upto(
             line_buf.push_str(&line.text[tkn.byte_start..last_byte]);
             tkn.byte_start
         } else {
-            line.text.len()
+            // ここに来るのは tkn_ix が 0 のとき(`before_token_inline` は
+            // token_index=0 の場合のみ None を返す)。この時点で last_byte は
+            // 既に正しい値になっている(行頭でのカーソル位置、または直前の
+            // 行またぎ時のクランプによる line.text.len())ので上書きしない。
+            last_byte
         };
         tkn_ix = token_index as i64;
         trace!("\t{},({} / {})", ln, tkn_ix, line.tokens.len() as i64);
@@ -823,6 +842,19 @@ mod tests {
         assert_eq!(result.len(), 2, "{:?}", result);
         // 直近の2文だけが返る
         assert_eq!(result.concat(), "二文目。三文目。");
+    }
+
+    #[test]
+    fn sentences_upto_cursor_at_start_of_line_with_leading_space() {
+        // カーソルが行頭(全角スペースの直前)にあり、その行の実質的な最初の
+        // トークンが byte_start=0 でない場合、last_byte(=0)を含むトークンが
+        // 見つからない。以前はこれを「行末」と誤認し、行の最後のトークンとの
+        // 逆転レンジでpanicしていた(実機で確認されたクラッシュの再現)。
+        let td = TestData::new();
+        let texts = dash("前の行の文。\n　艦艇類別等級表には、ただ「戦艦」とある。");
+        let result = sentences(&td, &texts, 1, 0, 10);
+        // 行頭カーソルなので2行目からは何も取れず、1行目の内容だけが返る
+        assert_eq!(result.concat(), "前の行の文。", "{:?}", result);
     }
 
     #[test]

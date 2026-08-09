@@ -589,7 +589,27 @@ fn character_entry_to_markdown(heading_key: &str, entry: &CharacterEntry) -> Str
         if text.is_empty() {
             continue;
         }
-        out.push_str(&format!("\n\n{}", text));
+        if section.tags.is_empty() {
+            // 未知の属性名で分類できなかったセクション。見出しを復元できないので
+            // 従来通り本文だけを出す(壊れた入力でパースそのものを失敗させない)。
+            out.push_str(&format!("\n\n{}", text));
+        } else {
+            // 見出しを `canonical_heading()` で復元する。「描写・視点」のように
+            // 複数タグが同じ属性へマップされることがあるため、出現順を保ったまま
+            // 重複除去してから「・」で結合する。
+            let mut seen: Vec<&CharacterAttribute> = Vec::new();
+            for t in &section.tags {
+                if !seen.contains(&t) {
+                    seen.push(t);
+                }
+            }
+            let heading = seen
+                .iter()
+                .map(|t| t.canonical_heading())
+                .collect::<Vec<_>>()
+                .join("・");
+            out.push_str(&format!("\n\n## {}\n{}", heading, text));
+        }
     }
 
     out

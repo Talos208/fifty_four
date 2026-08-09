@@ -170,11 +170,16 @@ impl ClaudeAgent {
             options.max_thinking_tokens = Some(tokens);
         }
 
-        let client = ClaudeSDKClient::new(options, None)
+        let cli_path = resolve_cli_path();
+        if let Some(path) = &cli_path
+            && let Some(reason) = unsupported_cli_reason(path)
+        {
+            return Err(reason);
+        }
+
+        let client = ClaudeSDKClient::new(options, cli_path)
             .await
-            .map_err(|e| AgentError {
-                message: format!("failed to start claude: {}", e),
-            })?;
+            .map_err(cli_error)?;
 
         Ok(Self {
             client: tokio::sync::Mutex::new(client),
@@ -199,9 +204,7 @@ impl ClaudeAgent {
             .max_turns(1)
             .build();
 
-        let stream = query(prompt, Some(options)).await.map_err(|e| AgentError {
-            message: format!("failed to start claude: {}", e),
-        })?;
+        let stream = query(prompt, Some(options)).await.map_err(cli_error)?;
         let mut stream = Box::pin(stream);
 
         let mut out = String::new();
@@ -268,6 +271,101 @@ impl ClaudeAgent {
 /// [`ALLOWED_TOOLS`] をビルダーが受け取る形へ変換する。
 fn tool_names() -> Vec<anthropic_agent_sdk::ToolName> {
     ALLOWED_TOOLS.iter().map(|t| (*t).into()).collect()
+}
+
+/// `claude` CLI の実行ファイルパスを解決する。
+///
+/// SDK自身も内部で `which::which("claude")` を試すが、それに失敗した場合の
+/// フォールバックが完全にPOSIX前提(`HOME`環境変数、`/usr/local/bin` 等)で、
+/// `#[cfg(windows)]` 分岐が無いため Windows では実質機能しない
+/// (`anthropic-agent-sdk` の `transport/subprocess.rs` の `find_cli()` 参照)。
+/// ここで先に `which` を試し、それでも見つからなければ Windows のnpmグローバル
+/// インストール先を明示的にチェックする。どちらも失敗したら `None` を返し、
+/// SDK自身の探索(従来通りの挙動)に委ねる — 新たな失敗モードを増やさない。
+fn resolve_cli_path() -> Option<PathBuf> {
+    if let Ok(path) = which::which("claude") {
+        return Some(path);
+    }
+    windows_npm_fallback()
+}
+
+/// npm がWindowsでグローバルインストールする既定の場所(`%APPDATA%\npm\claude.cmd`)を
+/// 明示的にチェックする。`which` がPATHから見つけられなかった場合の最後の手段。
+/// `resolve_cli_path` から切り出してあるのは、`which` の成否に依らずこの部分だけを
+/// 単体テストできるようにするため。
+#[cfg(windows)]
+fn windows_npm_fallback() -> Option<PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    let candidate = PathBuf::from(appdata).join("npm").join("claude.cmd");
+    candidate.is_file().then_some(candidate)
+}
+
+#[cfg(not(windows))]
+fn windows_npm_fallback() -> Option<PathBuf> {
+    None
+}
+
+/// 解決した `cli_path` がそのまま起動できない形式なら理由を返す。
+///
+/// `npm install -g @anthropic-ai/claude-code` はWindowsでは `claude.cmd` という
+/// バッチラッパーを生成する(ネイティブインストーラの `claude.exe` とは別物)。
+/// `.cmd`/`.bat` を `std::process::Command` へ渡すと、Rust標準ライブラリの
+/// 引数エスケープ制限(CVE-2024-24576対策。バッチファイルは `cmd.exe` 経由で
+/// 実行されるため、`"`/`&`/`^` 等を含む複雑な引数を安全にエスケープできない場合に
+/// 拒否する)に引っかかり、`claude` へ渡す長いシステムプロンプトが原因で
+/// 「batch file arguments are invalid」という原因の分からないOSエラーになる
+/// (実機で確認済み)。起動を試みる前にこの形式を検出し、分かりやすい理由で
+/// 早期に失敗させる。
+#[cfg(windows)]
+fn unsupported_cli_reason(path: &Path) -> Option<AgentError> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if ext != "cmd" && ext != "bat" {
+        return None;
+    }
+    warn!(
+        "acp: claude CLIがバッチラッパー形式で見つかりました(起動不可): {:?}",
+        path
+    );
+    Some(AgentError {
+        message: format!(
+            "claude CLI が npm 経由のラッパースクリプト({})として見つかりましたが、\
+             この形式は ACP 連携から起動できません(Windows の引数エスケープの制限のため)。\
+             `npm uninstall -g @anthropic-ai/claude-code` のうえ、\
+             Anthropic のネイティブインストーラで入れ直してください。",
+            path.display()
+        ),
+    })
+}
+
+#[cfg(not(windows))]
+fn unsupported_cli_reason(_path: &Path) -> Option<AgentError> {
+    None
+}
+
+/// `ClaudeSDKClient::new`/`query` の起動失敗を分かりやすい `AgentError` へ変換する。
+///
+/// `ClaudeError::CliNotFound` のSDK既定メッセージは
+/// `npm install -g @anthropic-ai/claude-code` の案内のあと
+/// `export PATH=...` という完全にPOSIX向けの文面で、Windowsでは誤誘導になる
+/// (`resolve_cli_path` 参照)。OSごとに案内し直す。
+fn cli_error(e: anthropic_agent_sdk::ClaudeError) -> AgentError {
+    if let anthropic_agent_sdk::ClaudeError::CliNotFound(detail) = &e {
+        warn!("acp: claude CLIが見つかりません: {}", detail);
+        #[cfg(windows)]
+        let message = "claude CLI が見つかりません。`npm install -g @anthropic-ai/claude-code` \
+            でインストールしたうえで Zed を再起動してください(PATH の変更は既に起動中の \
+            プロセスには反映されないため)。"
+            .to_string();
+        #[cfg(not(windows))]
+        let message =
+            "claude CLI が見つかりません。`npm install -g @anthropic-ai/claude-code` \
+            でインストールしてください。"
+                .to_string();
+        return AgentError { message };
+    }
+    AgentError {
+        message: format!("failed to start claude: {}", e),
+    }
 }
 
 /// 1行分のパース結果。
@@ -444,5 +542,123 @@ impl WritingAgent for ClaudeAgent {
             .map_err(|e| AgentError {
                 message: e.to_string(),
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// `APPDATA` は process-wide なので、テスト同士が並行実行されても
+    /// 競合しないよう1本の Mutex で直列化する(`main.rs` の `RUST_LOG` テストと同じ方針)。
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_npm_fallback_finds_claude_cmd() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join("ff_writing_agent_appdata_hit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("npm")).unwrap();
+        std::fs::write(dir.join("npm").join("claude.cmd"), "@echo off\n").unwrap();
+
+        let original = std::env::var_os("APPDATA");
+        unsafe { std::env::set_var("APPDATA", &dir) };
+
+        let found = windows_npm_fallback();
+
+        match original {
+            Some(v) => unsafe { std::env::set_var("APPDATA", v) },
+            None => unsafe { std::env::remove_var("APPDATA") },
+        }
+
+        assert_eq!(found, Some(dir.join("npm").join("claude.cmd")));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_npm_fallback_returns_none_when_absent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join("ff_writing_agent_appdata_miss");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // `npm/claude.cmd` を作らない。
+
+        let original = std::env::var_os("APPDATA");
+        unsafe { std::env::set_var("APPDATA", &dir) };
+
+        let found = windows_npm_fallback();
+
+        match original {
+            Some(v) => unsafe { std::env::set_var("APPDATA", v) },
+            None => unsafe { std::env::remove_var("APPDATA") },
+        }
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_windows_npm_fallback_is_noop_on_non_windows() {
+        assert_eq!(windows_npm_fallback(), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_unsupported_cli_reason_rejects_cmd_and_bat() {
+        let err = unsupported_cli_reason(Path::new(r"C:\npm\claude.cmd")).unwrap();
+        assert!(err.message.contains("ネイティブインストーラ"));
+        let err = unsupported_cli_reason(Path::new(r"C:\npm\claude.BAT")).unwrap();
+        assert!(err.message.contains("ネイティブインストーラ"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_unsupported_cli_reason_accepts_exe_and_extensionless() {
+        assert!(unsupported_cli_reason(Path::new(r"C:\bin\claude.exe")).is_none());
+        assert!(unsupported_cli_reason(Path::new(r"C:\bin\claude")).is_none());
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_unsupported_cli_reason_is_noop_on_non_windows() {
+        assert!(unsupported_cli_reason(Path::new("/usr/bin/claude.cmd")).is_none());
+    }
+
+    #[test]
+    fn test_cli_error_maps_cli_not_found_to_actionable_message() {
+        let e = anthropic_agent_sdk::ClaudeError::CliNotFound("raw sdk message".to_string());
+        let err = cli_error(e);
+        assert!(err.message.contains("npm install -g @anthropic-ai/claude-code"));
+        // SDK既定の(POSIX前提の)文面は出さない。
+        assert!(!err.message.contains("export PATH"));
+    }
+
+    #[test]
+    fn test_cli_error_passes_through_other_errors() {
+        let e = anthropic_agent_sdk::ClaudeError::Transport("pipe closed".to_string());
+        let err = cli_error(e);
+        assert!(err.message.contains("failed to start claude"));
+        assert!(err.message.contains("pipe closed"));
+    }
+
+    #[test]
+    fn test_describe_result_error_prefers_errors_over_result() {
+        let s = describe_result_error(
+            "error_during_execution",
+            &["boom".to_string()],
+            &Some("fallback".to_string()),
+        );
+        assert_eq!(s, "error_during_execution (boom)");
+    }
+
+    #[test]
+    fn test_describe_result_error_falls_back_to_result_then_subtype() {
+        let s = describe_result_error("error_during_execution", &[], &Some("fallback".to_string()));
+        assert_eq!(s, "error_during_execution (fallback)");
+
+        let s = describe_result_error("error_during_execution", &[], &None);
+        assert_eq!(s, "error_during_execution");
     }
 }
