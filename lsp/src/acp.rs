@@ -44,6 +44,7 @@ use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::instrument;
 
 /// 要約に渡す過去ターン数の上限。
 ///
@@ -87,6 +88,7 @@ pub(crate) struct ChatTurn {
 }
 
 /// セッションごとの状態。
+#[derive(Debug)]
 struct Session {
     /// `session/new` で渡されたワークスペースルート。要約の書き出し先の決定に使う。
     root: PathBuf,
@@ -112,6 +114,7 @@ struct Session {
 }
 
 /// ハンドラ間で共有する状態。
+#[derive(Debug)]
 struct AgentState {
     sessions: tokio::sync::Mutex<HashMap<SessionId, Session>>,
     /// 実行中の要約タスク。切断時に待ち合わせるため保持する([`DIGEST_DRAIN_TIMEOUT`])。
@@ -130,6 +133,7 @@ impl AgentState {
 }
 
 /// ACP エージェントとして stdio で待ち受ける。
+#[instrument]
 pub(crate) async fn run() -> Result<(), String> {
     // 起動時に読めないと全セッションが失敗するので、ここで確かめておく。
     let _ = system_prompt()?;
@@ -429,14 +433,8 @@ pub(crate) async fn run() -> Result<(), String> {
                         Ok(p) => p,
                         Err(e) => return responder.respond_with_internal_error(e),
                     };
-                    match ClaudeAgent::start(
-                        &root,
-                        prompt,
-                        &session_id.0,
-                        has_replied,
-                        &new_config,
-                    )
-                    .await
+                    match ClaudeAgent::start(&root, prompt, &session_id.0, has_replied, &new_config)
+                        .await
                     {
                         Ok(new_agent) => {
                             agent = Arc::new(new_agent);
@@ -590,6 +588,7 @@ pub(crate) async fn run() -> Result<(), String> {
 }
 
 /// 実行中の要約タスクを待ち合わせる。上限を超えたら諦めてログに残す。
+#[instrument]
 async fn drain_digests(state: &AgentState) {
     let mut digests = state.digests.lock().await;
     if digests.is_empty() {
@@ -613,12 +612,14 @@ async fn drain_digests(state: &AgentState) {
 /// Claude Code の既定プロンプトを**置き換える**中身なので、執筆支援としての役割・
 /// 原稿ディレクトリの約束事(characters.md / plot.md / memo/*.md)・要約ファイルの
 /// 維持義務は全てここに書いてある。
+#[instrument]
 fn system_prompt() -> Result<String, String> {
     crate::assets::load("system_chat.md")
         .ok_or_else(|| "system_chat.md not found on disk nor in embedded assets".to_string())
 }
 
 /// `PromptRequest` からテキストだけを取り出して連結する。
+#[instrument]
 pub(crate) fn prompt_text(req: &PromptRequest) -> String {
     req.prompt
         .iter()
@@ -631,6 +632,7 @@ pub(crate) fn prompt_text(req: &PromptRequest) -> String {
 }
 
 /// 会話履歴を新しい方から `max_turns` 件だけ要約プロンプト用に整形する。
+#[instrument(skip(turns))]
 pub(crate) fn render_history(turns: &[ChatTurn], max_turns: usize) -> String {
     let start = turns.len().saturating_sub(max_turns);
     turns[start..]
@@ -645,6 +647,7 @@ pub(crate) fn render_history(turns: &[ChatTurn], max_turns: usize) -> String {
 /// 対話用とは別セッションの一発問い合わせで回す。会話側のクライアントを占有しないので、
 /// 要約中でも次のターンを受けられる。失敗はログに落とすだけで握りつぶす —
 /// 要約が無くても補完は `{{CHAT}}` が空になるだけで動く。
+#[instrument(skip(turns))]
 async fn update_digest(root: &std::path::Path, turns: &[ChatTurn], session_id: &str) {
     let Some((template, _options)) = crate::frontmatter::load_prompt("prompt_chat_digest.md")
     else {

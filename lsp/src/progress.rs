@@ -1,9 +1,10 @@
 //! `main.rs` から切り出したモジュール。completion 実行中の LSP WorkDoneProgress 表示を扱う。
 
-use tower_lsp_server::lsp_types::*;
-use tower_lsp_server::Client;
 #[allow(unused_imports)]
 use log::debug;
+use tower_lsp_server::Client;
+use tower_lsp_server::lsp_types::*;
+use tracing::instrument;
 
 /// completion 実行中に LSP WorkDoneProgress を表示するためのガード。
 /// LLM 応答待ちの間、Zed の activity indicator(左下ステータスバー)に「処理中」を出す。
@@ -20,6 +21,7 @@ impl CompletionProgress {
     /// - クライアントがリクエストに workDoneToken を付けてきた場合はそれを使う(create 不要)
     /// - 無ければ window/workDoneProgress/create でサーバ発トークンを登録する
     ///   (クライアントが window.workDoneProgress 非対応、または create 拒否なら None)
+    #[instrument(skip(client, title, message))]
     pub(crate) async fn begin(
         client: &Client,
         supported: bool,
@@ -68,11 +70,13 @@ impl CompletionProgress {
     }
 
     /// End 通知を送って進捗表示を消す(正常終了経路)。
+    #[instrument(skip(self))]
     pub(crate) async fn finish(mut self) {
         self.finished = true;
         Self::send_end(&self.client, self.token.clone()).await;
     }
 
+    #[instrument(skip(client))]
     async fn send_end(client: &Client, token: ProgressToken) {
         client
             .send_notification::<notification::Progress>(ProgressParams {
@@ -86,8 +90,8 @@ impl CompletionProgress {
 }
 
 impl Drop for CompletionProgress {
+    #[instrument(skip(self))]
     fn drop(&mut self) {
-        debug!("CompletionProgress::drop");
         if !self.finished {
             // キャンセル等で future ごと drop された場合。Drop 内では await できないため
             // 別タスクで End を送る(送らないと Zed 側の進捗表示が残留し続ける)。

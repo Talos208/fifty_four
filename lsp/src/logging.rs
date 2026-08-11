@@ -1,24 +1,49 @@
 use std::env;
 
+#[cfg(feature = "otel")]
+use opentelemetry_sdk::{
+    logs::SdkLoggerProvider, metrics::SdkMeterProvider, trace::SdkTracerProvider,
+};
+
 #[allow(unused)]
 pub struct Logger {
-    pub tracer_provider: Option<SdkTracerProvider>,
-    pub tracer: Option<BoxedTracer>,
-    pub logger_provider: Option<SdkLoggerProvider>,
+    #[cfg(feature = "otel")]
+    tracer_provider: Option<SdkTracerProvider>,
+    #[cfg(feature = "otel")]
+    logger_provider: Option<SdkLoggerProvider>,
+    #[cfg(feature = "otel")]
+    meter_provider: Option<SdkMeterProvider>,
 }
 
 #[allow(unused)]
 impl Logger {
-    pub fn new() -> Self {
-        if true {
-            prepare_tracing()
-        } else {
+    /// `acp` は ACP モード(`--acp`)かどうか。otel 有効時、`service.name` を
+    /// LSP/ACP で分けるのに使う(otel 無効時は無視する)。
+    pub fn new(acp: bool) -> Self {
+        #[cfg(feature = "otel")]
+        {
+            prepare_tracing(acp)
+        }
+        #[cfg(not(feature = "otel"))]
+        {
             prepare_env_logger();
-            Logger {
-                tracer_provider: None,
-                tracer: None,
-                logger_provider: None,
-            }
+            Logger {}
+        }
+    }
+}
+
+#[cfg(feature = "otel")]
+impl Drop for Logger {
+    fn drop(&mut self) {
+        // shutdown() がバッチをフラッシュする。プロセス終了直前なのでエラーは握りつぶす。
+        if let Some(provider) = self.tracer_provider.take() {
+            let _ = provider.shutdown();
+        }
+        if let Some(provider) = self.logger_provider.take() {
+            let _ = provider.shutdown();
+        }
+        if let Some(provider) = self.meter_provider.take() {
+            let _ = provider.shutdown();
         }
     }
 }
@@ -39,102 +64,216 @@ fn prepare_env_logger() {
     lb.init();
 }
 
-use opentelemetry::KeyValue;
-use opentelemetry::global::{self, BoxedTracer};
-// use opentelemetry::logs::{LoggerProvider, NoopLoggerProvider};
-// use opentelemetry::trace::TracerProvider;
-// use opentelemetry_appender_log::OpenTelemetryLogBridge;
-use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-// use opentelemetry_otlp;
-use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::Resource;
-#[allow(unused_imports)]
-use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
-use opentelemetry_sdk::trace::SdkTracerProvider;
-// use opentelemetry_stdout::{LogExporter, SpanExporter};
-use tracing::debug;
-// use tracing::instrument::WithSubscriber;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, fmt};
+#[cfg(all(feature = "otel", debug_assertions))]
+use tracing_subscriber::fmt;
+#[cfg(feature = "otel")]
+use {
+    opentelemetry::{KeyValue, global, trace::TracerProvider as _},
+    opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge,
+    opentelemetry_sdk::Resource,
+    tracing::debug,
+    tracing_subscriber::{
+        EnvFilter, Layer, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
+    },
+};
 
-impl Drop for Logger {
-    fn drop(&mut self) {
-        if let Some(tracer) = self.tracer.take() {
-            drop(tracer);
-        }
-        if let Some(provider) = self.tracer_provider.take() {
-            provider.shutdown().unwrap();
-        }
-        if let Some(provider) = self.logger_provider.take() {
-            provider.shutdown().unwrap();
-        }
-    }
+/// LSP/ACP で service.name を分ける(ACPは別プロセスとして起動されるため、
+/// コレクタ側でどちらの出力か区別できるようにする)。
+#[cfg(feature = "otel")]
+const SERVICE_NAME_LSP: &str = "fifty_four_lsp";
+#[cfg(feature = "otel")]
+const SERVICE_NAME_ACP: &str = "fifty_four_acp";
+
+/// tonic/h2/hyper/tower が出す gRPC フレーム単位の低レベルログと、
+/// OTel SDK 自身のバッチ処理スレッドが定期タイマーで吐く内部housekeepingログ
+/// (`BatchLogProcessor.ExportingDueToTimer` 等、データの有無に関わらず一定間隔で発火する)
+/// を抑制する。どちらもエクスポータの内部動作そのものであり、stderr・OTel 向けレイヤの
+/// どちらで見てもノイズにしかならないため両方で外す。`opentelemetry_sdk` は完全な off では
+/// なく warn までに留め、実際のエクスポート失敗など有用な情報は残す。
+/// `EnvFilter` は `Clone` できないため、呼び出し側で都度これを起点に組み立てる。
+#[cfg(feature = "otel")]
+fn suppress_transport_noise(filter: EnvFilter) -> EnvFilter {
+    filter
+        .add_directive("hyper=off".parse().unwrap())
+        .add_directive("h2=off".parse().unwrap())
+        .add_directive("tonic=off".parse().unwrap())
+        .add_directive("tower=off".parse().unwrap())
+        .add_directive("opentelemetry_sdk=warn".parse().unwrap())
 }
 
-#[allow(unused)]
-fn prepare_tracing() -> Logger {
-    let span_exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint("http://localhost:4317")
-        .build()
-        .expect("Failed to create spen exporter");
+/// OTel エクスポータ用レイヤ限定のフィルタ。上記に加え `reqwest`/`opentelemetry` も外すのは、
+/// 「エクスポート → そのログもエクスポート」というフィードバックループを断つため
+/// (stderr はどこにも再送されないのでこの心配は無い)。
+#[cfg(feature = "otel")]
+fn otel_filter() -> EnvFilter {
+    suppress_transport_noise(
+        EnvFilter::builder()
+            .with_default_directive(LevelFilter::INFO.into())
+            .from_env_lossy(),
+    )
+    .add_directive("reqwest=off".parse().unwrap())
+    .add_directive("opentelemetry=off".parse().unwrap())
+}
 
-    // let span_exporter_stderr = SpanExporter::builder().with_writer(std::io::stderr).build();
+/// `RUST_LOG=off`(または `fifty_four_lsp=off` 等)でログ出力が明示的に無効化されて
+/// いるかどうか。`from_default_env()` は未設定時 ERROR 相当を返すため、「未設定」と
+/// 「明示的な off」を正しく区別できる。
+#[cfg(feature = "otel")]
+fn logging_disabled() -> bool {
+    EnvFilter::from_default_env().max_level_hint() == Some(LevelFilter::OFF)
+}
 
-    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-        .with_resource(Resource::builder().with_service_name("g_sync_now").build())
-        .with_batch_exporter(span_exporter)
+#[cfg(feature = "otel")]
+fn prepare_tracing(acp: bool) -> Logger {
+    // 明示的に無効化されていれば、エクスポータもプロバイダも一切作らずに即終了する。
+    if logging_disabled() {
+        return Logger {
+            tracer_provider: None,
+            logger_provider: None,
+            meter_provider: None,
+        };
+    }
+
+    let service_name = if acp { SERVICE_NAME_ACP } else { SERVICE_NAME_LSP };
+
+    let resource = Resource::builder()
+        .with_service_name(service_name)
+        .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
         .build();
 
-    global::set_tracer_provider(tracer_provider.clone());
-
-    let log_exporter = opentelemetry_otlp::LogExporter::builder()
+    // エンドポイントは明示せず、opentelemetry-otlp 自身の解決順(シグナル別 env var →
+    // 汎用 OTEL_EXPORTER_OTLP_ENDPOINT → 既定値 http://localhost:4317)に任せる。
+    let tracer_provider = match opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
-        .with_endpoint("http://localhost:4317")
         .build()
-        .expect("Failed to create log exporter");
-
-    // let log_exporter_stderr = opentelemetry_stdout::LogExporter::builder()
-    //     .with_writer(std::io::stderr)
-    //     .build();
-
-    let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
-        .with_batch_exporter(log_exporter)
-        .with_resource(
-            Resource::builder()
-                .with_service_name("g_sync_now")
-                .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
+    {
+        Ok(span_exporter) => Some(
+            SdkTracerProvider::builder()
+                .with_resource(resource.clone())
+                .with_batch_exporter(span_exporter)
                 .build(),
-        )
-        .build();
+        ),
+        Err(e) => {
+            eprintln!("Failed to create span exporter: {e}");
+            None
+        }
+    };
 
-    let otel_trace_layer = OpenTelemetryTracingBridge::new(&logger_provider);
-    // let otel_log_layer = OpenTelemetryLogBridge::new(&logger_provider);
+    let logger_provider = match opentelemetry_otlp::LogExporter::builder()
+        .with_tonic()
+        .build()
+    {
+        Ok(log_exporter) => Some(
+            SdkLoggerProvider::builder()
+                .with_resource(resource.clone())
+                .with_batch_exporter(log_exporter)
+                .build(),
+        ),
+        Err(e) => {
+            eprintln!("Failed to create log exporter: {e}");
+            None
+        }
+    };
 
-    let otel_filter = EnvFilter::from_default_env()
-        .add_directive("hyper=off".parse().unwrap())
-        .add_directive("tonic=off".parse().unwrap())
-        .add_directive("h2=off".parse().unwrap())
-        .add_directive("reqwest=off".parse().unwrap());
+    let meter_provider = match opentelemetry_otlp::MetricExporter::builder().with_tonic().build()
+    {
+        Ok(metric_exporter) => Some(
+            SdkMeterProvider::builder()
+                .with_resource(resource)
+                .with_periodic_exporter(metric_exporter)
+                .build(),
+        ),
+        Err(e) => {
+            eprintln!("Failed to create metric exporter: {e}");
+            None
+        }
+    };
 
-    let ls = logging_subscriber::LoggingSubscriberBuilder::default()
-        .with_file(true)
-        .with_line_number(true)
-        .build();
+    if let Some(tracer_provider) = &tracer_provider {
+        global::set_tracer_provider(tracer_provider.clone());
+    }
+    if let Some(meter_provider) = &meter_provider {
+        global::set_meter_provider(meter_provider.clone());
+    }
 
+    let otel_log_layer = logger_provider
+        .as_ref()
+        .map(|p| OpenTelemetryTracingBridge::new(p).with_filter(otel_filter()));
+
+    let otel_trace_layer = tracer_provider.as_ref().map(|p| {
+        tracing_opentelemetry::layer()
+            .with_tracer(p.tracer(service_name))
+            .with_filter(otel_filter())
+    });
+
+    // 標準入出力を JSON-RPC チャネルとして使うため、可読ログは stderr 限定。
+    // stderr へのミラーは開発時のみ(配布バイナリでは省く)。
+    #[cfg(debug_assertions)]
     tracing_subscriber::registry()
+        .with(otel_log_layer)
         .with(otel_trace_layer)
-        .with(ls)
-        .with(otel_filter)
-        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(suppress_transport_noise(EnvFilter::from_default_env())),
+        )
+        .init();
+    #[cfg(not(debug_assertions))]
+    tracing_subscriber::registry()
+        .with(otel_log_layer)
+        .with(otel_trace_layer)
         .init();
 
     debug!("Tracing initialized");
 
     Logger {
-        tracer: None,
-        tracer_provider: None,
-        logger_provider: Some(logger_provider),
+        tracer_provider,
+        logger_provider,
+        meter_provider,
+    }
+}
+
+#[cfg(all(test, feature = "otel"))]
+mod tests {
+    use super::*;
+
+    use crate::RUST_LOG_TEST_LOCK as ENV_LOCK;
+
+    #[test]
+    fn test_logging_disabled_when_rust_log_is_off() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_LOG", "off") };
+
+        assert!(logging_disabled());
+
+        unsafe { std::env::remove_var("RUST_LOG") };
+    }
+
+    #[test]
+    fn test_logging_disabled_when_rust_log_scopes_off_to_this_crate() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_LOG", "fifty_four_lsp=off") };
+
+        assert!(logging_disabled());
+
+        unsafe { std::env::remove_var("RUST_LOG") };
+    }
+
+    #[test]
+    fn test_logging_not_disabled_when_rust_log_is_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("RUST_LOG") };
+
+        assert!(!logging_disabled());
+    }
+
+    #[test]
+    fn test_logging_not_disabled_when_rust_log_has_a_real_level() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("RUST_LOG", "debug") };
+
+        assert!(!logging_disabled());
+
+        unsafe { std::env::remove_var("RUST_LOG") };
     }
 }

@@ -6,12 +6,14 @@ use async_trait::async_trait;
 use log::debug;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use tracing::instrument;
 
 // ─── parse_plot_md ───────────────────────────────────────────────────────────
 
 /// plot.md の全文テキストを解析し、(章名, プロット本文) のリストを返す。
 /// `# 章名` (level-1 見出し) を章の区切りとし、本文は trim 済みで返す。
 /// level-2 以上の見出し・コード・その他コンテンツは本文として扱う。
+#[instrument]
 pub(crate) fn parse_plot_md(content: &str) -> Vec<(String, String)> {
     let mut chapters: Vec<(String, String)> = Vec::new();
     let mut current_chapter: Option<String> = None;
@@ -48,6 +50,7 @@ pub(crate) struct CharacterInfoTool {
 
 #[async_trait]
 impl LlmTool for CharacterInfoTool {
+    #[instrument]
     fn schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -71,14 +74,17 @@ impl LlmTool for CharacterInfoTool {
         })
     }
 
+    #[instrument]
     fn name(&self) -> &str {
         "character_info"
     }
 
+    #[instrument]
     fn description(&self) -> &str {
         "キャラクターの設定を取得する"
     }
 
+    #[instrument(skip(_args))]
     async fn invoke(
         &self,
         _args: &serde_json::Map<String, Value>,
@@ -89,7 +95,10 @@ impl LlmTool for CharacterInfoTool {
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().and_then(|s| CharacterAttribute::try_from(s).ok()))
+                    .filter_map(|v| {
+                        v.as_str()
+                            .and_then(|s| CharacterAttribute::try_from(s).ok())
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -131,6 +140,7 @@ impl PlotInfoTool {
 
 #[async_trait]
 impl LlmTool for PlotInfoTool {
+    #[instrument(skip(self))]
     fn schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -144,13 +154,16 @@ impl LlmTool for PlotInfoTool {
         })
     }
 
+    #[instrument(skip(self))]
     fn name(&self) -> &str {
         "plot_info"
     }
+    #[instrument(skip(self))]
     fn description(&self) -> &str {
         "章のプロット情報を取得する"
     }
 
+    #[instrument(skip(self))]
     async fn invoke(
         &self,
         args: &serde_json::Map<String, Value>,
@@ -167,7 +180,10 @@ impl LlmTool for PlotInfoTool {
                 })?;
 
         let chapters = parse_plot_md(&content);
-        debug!("PlotInfoTool: {} chapter(s) parsed from plot.md", chapters.len());
+        debug!(
+            "PlotInfoTool: {} chapter(s) parsed from plot.md",
+            chapters.len()
+        );
 
         let result = match chapter_name {
             Some(name) => chapters

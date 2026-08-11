@@ -7,13 +7,13 @@
 //! 記録先のパス解決もこのモジュール内に閉じ込めてあるため、release では
 //! パスの組み立ても `db/` の作成も一切行わない(`assets.rs` と同じ方針)。
 
-#[cfg(debug_assertions)]
-use std::path::{Path, PathBuf};
-use tower_lsp_server::lsp_types::TextDocumentContentChangeEvent;
 #[allow(unused_imports)]
 use indoc::indoc;
 #[allow(unused_imports)]
 use log::debug;
+#[cfg(debug_assertions)]
+use std::path::{Path, PathBuf};
+use tower_lsp_server::lsp_types::TextDocumentContentChangeEvent;
 
 #[cfg(debug_assertions)]
 mod migrations {

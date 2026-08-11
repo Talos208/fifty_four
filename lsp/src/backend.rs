@@ -25,6 +25,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tower_lsp_server::lsp_types::*;
 use tower_lsp_server::{Client, LanguageServer, UriExt};
+use tracing::instrument;
 
 /// `Backend` はサーバの状態を保持する構造体です。
 ///
@@ -92,7 +93,7 @@ impl LanguageServer for Backend {
     /// LSP クライアントからの `initialize` リクエストに応答します。
     ///
     /// 返却する `InitializeResult` でサーバの機能（capabilities）をクライアントに伝えます。
-    // #[instrument(ret, err)]
+    #[instrument(skip(self))]
     async fn initialize(
         &self,
         _param: InitializeParams,
@@ -334,7 +335,7 @@ impl LanguageServer for Backend {
 
     /// `initialized` はクライアントが初期化完了を通知した際に呼ばれます。
     ///
-    // #[instrument(ret)]
+    #[instrument(skip(self))]
     async fn initialized(&self, _params: InitializedParams) {
         debug!("LSP server initialized");
 
@@ -386,12 +387,12 @@ impl LanguageServer for Backend {
     /// サーバのシャットダウン要求を処理します。
     ///
     /// 現在は特別なクリーンアップを行わず、即座に成功を返します。
-    // #[instrument(ret, err)]
+    #[instrument(skip(self))]
     async fn shutdown(&self) -> tower_lsp_server::jsonrpc::Result<()> {
         Ok(())
     }
 
-    // #[instrument(ret)]
+    #[instrument(skip(self))]
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         debug!("file opened!");
 
@@ -410,6 +411,7 @@ impl LanguageServer for Backend {
     /// (b) キャラクター設定ファイル保存時、character_store を調和(reconcile)する。
     /// 保存直後の内容をディスクから読み直し、自己書き込みのエコーでなければ(＝内容が
     /// character_updater による直前の書き込みと一致しなければ)取り込んで許可名集合へ反映する。
+    #[instrument(skip(self))]
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri.as_str();
         if !self.is_character_file(uri) {
@@ -441,6 +443,7 @@ impl LanguageServer for Backend {
     /// (c) workspace/didChangeWatchedFiles: エディタ外(他プログラム・git等)での
     /// キャラクター設定ファイル変更を検知し character_store を調和(reconcile)する。
     /// `initialized` で動的登録した watcher からの通知を受ける。
+    #[instrument(skip(self))]
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         let mut any_changed = false;
         for change in params.changes {
@@ -492,7 +495,7 @@ impl LanguageServer for Backend {
         }
     }
 
-    // #[instrument]
+    #[instrument(skip(self))]
     async fn did_change(&self, param: DidChangeTextDocumentParams) {
         debug!("did_change");
 
@@ -543,7 +546,7 @@ impl LanguageServer for Backend {
         let _ = self.client.semantic_tokens_refresh().await;
     }
 
-    // #[instrument(ret)]
+    #[instrument(skip(self))]
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         debug!("file closed!");
 
@@ -555,7 +558,7 @@ impl LanguageServer for Backend {
 
     /// ドキュメント全体に対する semantic tokens の問い合わせに応答します。
     ///
-    // #[instrument(ret, err)]
+    #[instrument(skip(self))]
     async fn semantic_tokens_full(
         &self,
         params: SemanticTokensParams,
@@ -601,6 +604,7 @@ impl LanguageServer for Backend {
 
     /// キャラ名にカーソルを合わせた際、そのキャラの設定(全セクション)をMarkdownで表示する。
     /// 対象語が未登録のキャラ名でなければ `Ok(None)` を返し、何も表示しない。
+    #[instrument(skip(self))]
     async fn hover(&self, params: HoverParams) -> tower_lsp_server::jsonrpc::Result<Option<Hover>> {
         let pos = params.text_document_position_params;
         let uri = pos.text_document.uri.as_str();
@@ -654,7 +658,7 @@ impl LanguageServer for Backend {
         }))
     }
 
-    // #[instrument(ret, err)]
+    #[instrument(skip(self))]
     async fn completion(
         &self,
         params: CompletionParams,
@@ -967,6 +971,7 @@ impl LanguageServer for Backend {
     ///    ある場合のみ先へ進む(`AUTOMATIC`、または未送信でカーソルのみは `Ok(None)`)。
     /// 2. 前回 LLM まで進んだ呼び出しから `CODE_ACTION_DEBOUNCE` 未満なら `Ok(None)` で
     ///    弾く(sleep せず、前回呼び出し時刻との比較のみ)。
+    #[instrument(skip(self))]
     async fn code_action(
         &self,
         params: CodeActionParams,
@@ -1170,7 +1175,7 @@ impl LanguageServer for Backend {
         }
     }
 
-    // #[instrument(ret)]
+    #[instrument(skip(self))]
     async fn did_change_configuration(&self, param: DidChangeConfigurationParams) {
         info!("did_change_configuration: {:?}", param.settings);
 
@@ -1188,54 +1193,7 @@ impl LanguageServer for Backend {
         });
     }
 
-    // #[instrument(ret, err)]
-    // async fn document_highlight(
-    //     &self,
-    //     params: DocumentHighlightParams,
-    // ) -> Result<Option<Vec<DocumentHighlight>>> {
-    //     self.client
-    //         .log_message(MessageType::LOG, "document_highlight")
-    //         .await;
-
-    //     let uri = params
-    //         .text_document_position_params
-    //         .text_document
-    //         .uri
-    //         .as_str();
-    //     let pos = params.text_document_position_params.position;
-    //     let (lineno, offset) = (pos.line, pos.character);
-
-    //     let line = {
-    //         let kv = self.text.get(uri).unwrap();
-    //         let text = kv.value();
-    //         text.get(lineno as usize).unwrap_or(&"".to_string()).clone()
-    //     };
-    //     let result = {
-    //         let (_, subline) = line.split_at(offset as usize);
-    //         let tokens = tokenize_conversation(subline);
-    //         Some(
-    //             tokens
-    //                 .iter()
-    //                 .map(|token| DocumentHighlight {
-    //                     range: Range {
-    //                         start: Position {
-    //                             line: lineno,
-    //                             character: offset + token.start,
-    //                         },
-    //                         end: Position {
-    //                             line: lineno,
-    //                             character: offset + token.start + token.length,
-    //                         },
-    //                     },
-    //                     kind: Some(DocumentHighlightKind::TEXT),
-    //                 })
-    //                 .collect(),
-    //         )
-    //     };
-
-    //     Ok(result)
-    // }
-
+    #[instrument(skip(self))]
     async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
         debug!("did_change_workspace_folders");
         debug!("\t before {:?}", self.workspace.lock().await);
@@ -1273,6 +1231,7 @@ impl LanguageServer for Backend {
 impl Backend {
     /// `Backend` を構築する。フィールドを private のまま保つため、
     /// `main()` はこのコンストラクタ経由で `LspService::build` へ渡す。
+    #[instrument]
     pub(crate) fn new(client: Client) -> Self {
         Self {
             client,
@@ -1304,6 +1263,7 @@ impl Backend {
     }
 
     #[allow(unused)]
+    #[instrument(skip(self, proc))]
     async fn use_llm<F>(&self, proc: F) -> core::result::Result<String, LlmError>
     where
         F: for<'b, 'a> AsyncFnOnce(
@@ -1330,6 +1290,7 @@ impl Backend {
     /// 見出しごと組み立てて返すのは、要約が無いときにテンプレート側へ
     /// 空の見出しだけが残らないようにするため(テンプレートは `{{CHAT}}` を
     /// 1行置くだけでよい)。
+    #[instrument(skip(self))]
     fn chat_digest(&self, workspace: &Path) -> String {
         use std::sync::atomic::Ordering::Relaxed;
 
@@ -1350,6 +1311,7 @@ impl Backend {
     ///
     /// 実体は [`crate::llm::use_llm_with_option`]。ACP エージェントも同じ処理を
     /// 使うため、`Backend` に依存しない自由関数として `llm.rs` に置いてある。
+    #[instrument(skip(proc))]
     async fn use_llm_with_option<F>(
         &self,
         option: HashMap<String, String>,
@@ -1363,6 +1325,7 @@ impl Backend {
         crate::llm::use_llm_with_option(&self.llm, option, proc).await
     }
 
+    #[instrument(skip(self))]
     fn update_all(&self, uri: &str, _offset: u32, texts: Vec<String>) {
         self.text.insert(
             uri.to_string(),
@@ -1373,7 +1336,13 @@ impl Backend {
         );
     }
 
-    fn update_partial(&self, uri: &str, texts: &[impl AsRef<str>], changes: &[Range]) {
+    #[instrument(skip(self))]
+    fn update_partial(
+        &self,
+        uri: &str,
+        texts: &[impl AsRef<str> + std::fmt::Debug],
+        changes: &[Range],
+    ) {
         if !self.text.contains_key(uri) {
             return;
         }
@@ -1389,6 +1358,7 @@ impl Backend {
             });
     }
 
+    #[instrument]
     fn ctx_to_prompt_name(ctx: CursorContext) -> &'static str {
         match ctx {
             CursorContext::AfterClosingBracket => "prompt_completion_after_bracket.md",
@@ -1399,46 +1369,8 @@ impl Backend {
             CursorContext::Other => "prompt_completion.md",
         }
     }
-    /*
-       pub fn tokenize_line(&self, url: &str, line_no: usize) {
-           debug!("Backend::tokenize_line({:?}, {:?})", url, line_no);
-           let tmp = self.text.try_get_mut(url); // ここで2重ロック
-           let mut t: RefMut<_, _> = match tmp {
-               TryResult::Locked => {
-                   error!("text is locked");
-                   return;
-               }
-               TryResult::Absent => {
-                   warn!("URL not found in text: {}", url);
-                   return;
-               }
-               TryResult::Present(tmp2) => {
-                   if !tmp2[line_no].tokens.is_empty() {
-                       return;
-                   }
-                   tmp2
-               }
-           };
-           // let mut t: &mut Vec<LineData> = tmp2.as_mut();
-           let mut l = t
-               // .as_mut()
-               // .value_mut()   // この辺で参照でなく値になってしまってる疑い
-               .get_mut(line_no)
-               .unwrap(); //.clone();
-           self.highlighter.tokenize(&mut l);
-           // debug!(
-           //     "\t{:?}",
-           //     l
-           //         .tokens
-           //         .iter()
-           //         .take(1),
-           // );
-       }
 
-       pub fn tokenize_line2(&self, line: &mut LineData) {
-           self.highlighter.tokenize(line);
-       }
-    */
+    #[instrument(skip(self))]
     async fn init_workspace(&self, workspaces: Vec<WorkspaceFolder>) {
         debug!("init_workspace: {:?}", workspaces);
         let mut paths: Vec<PathBuf> = Vec::with_capacity(workspaces.len());
@@ -1456,12 +1388,14 @@ impl Backend {
 
     /// URI がキャラクター設定ファイルかどうかを判定する。
     /// characters/*.md または characters.md は更新タスクの対象外とする(自己ループ防止)。
+    #[instrument(skip(self))]
     fn is_character_file(&self, uri: &str) -> bool {
         uri.contains("/characters/") || uri.ends_with("/characters.md")
     }
 
     /// URIから、それを含む最長一致のワークスペースrootを解決する。
     /// マッチしない場合は最初のワークスペース(あれば)へフォールバックする。
+    #[instrument(skip(self))]
     async fn resolve_workspace(&self, uri: &Uri) -> Option<PathBuf> {
         let doc_path = uri.to_file_path()?.into_owned();
         let roots = self.workspace.lock().await;
@@ -1474,6 +1408,7 @@ impl Backend {
     /// クライアントへ semanticTokens の再取得を要求する。トークナイズ品質の担保だけが
     /// 目的で、どのワークスペースの名前かはここでは区別しない
     /// (ハイライト・hoverの最終判定はワークスペーススコープの許可名集合で別途行う)。
+    #[instrument(skip(self))]
     async fn refresh_highlight_names(&self) {
         let names = self.character_store.all_allowed_names();
         debug!(
@@ -1491,6 +1426,7 @@ impl Backend {
 
     /// 全バッファの Lindera トークンキャッシュを破棄する(次回アクセス時に遅延再トークナイズされる)。
     /// ユーザー辞書の差し替え後、旧辞書による分割結果を捨てるために使う。
+    #[instrument(skip(self))]
     fn invalidate_token_caches(&self) {
         for mut entry in self.text.iter_mut() {
             for line in entry.value_mut().iter_mut() {
@@ -1506,6 +1442,7 @@ impl Backend {
     /// - 現在の変更を取り込んだ後、`max_chars` 以上なら即時発火。
     /// 発火時に spawn する非同期タスクは `crate::character_updater::run` だけ。
     /// ワークスペース解決(`resolve_workspace`)を伴うため async。
+    #[instrument(skip(self))]
     async fn record_change(&self, doc_uri: &Uri, changes: &[TextDocumentContentChangeEvent]) {
         use std::sync::atomic::Ordering::Relaxed;
 
@@ -1627,7 +1564,7 @@ impl Backend {
                 uri,
                 text.chars().count()
             );
-            tokio::spawn(crate::character_updater::run(
+            let fut = crate::character_updater::run(
                 uri.to_string(),
                 workspace,
                 self.character_store.clone(),
@@ -1635,7 +1572,17 @@ impl Backend {
                 self.background_llm.clone(),
                 self.db.clone(),
                 state_arc.clone(),
-            ));
+            );
+            // tokio::spawn は別タスクとして切り離すため、tracing のスパンコンテキストは
+            // 明示的に運ばないと引き継がれない(このままだと character_updater::run の
+            // #[instrument] が新しい独立したトレースを作ってしまい、did_change 側の
+            // トレースから辿れなくなる)。
+            #[cfg(feature = "otel")]
+            let fut = {
+                use tracing::Instrument;
+                fut.instrument(tracing::Span::current())
+            };
+            tokio::spawn(fut);
         }
     }
 }

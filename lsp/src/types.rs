@@ -1,6 +1,7 @@
 use log::debug;
 use std::fmt::Debug;
 use std::str::FromStr;
+use tracing::instrument;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TokenStatus {
@@ -9,6 +10,7 @@ pub enum TokenStatus {
 }
 
 impl Debug for TokenStatus {
+    #[instrument(skip(self, f))]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TokenStatus::Normal => write!(f, "Normal"),
@@ -42,6 +44,7 @@ pub struct LineData {
 impl FromStr for LineData {
     type Err = std::convert::Infallible;
 
+    #[instrument]
     fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
         // debug!("LineData::from_str");
         Ok(Self {
@@ -54,6 +57,7 @@ impl FromStr for LineData {
 
 impl LineData {
     #[allow(dead_code)]
+    #[instrument]
     pub fn surface(&self, ptr: &CachedLinderaToken) -> &str {
         self.text[ptr.byte_start..ptr.byte_end].as_ref()
     }
@@ -66,6 +70,7 @@ impl LineData {
 /// オフセットが行末を超える場合は `text.len()` にクランプする。
 /// サロゲートペアの中間を指す場合はその文字の直後に丸める
 /// (LSP仕様上、正当な Position はペア中間を指さない)。
+#[instrument]
 pub fn utf16_to_byte_offset(text: &str, utf16_offset: usize) -> usize {
     let mut u16_count = 0;
     for (byte_ix, c) in text.char_indices() {
@@ -81,6 +86,7 @@ pub fn utf16_to_byte_offset(text: &str, utf16_offset: usize) -> usize {
 ///
 /// バイトオフセットから LSP の character 値(positionEncoding=utf-16)を
 /// 算出する際、`&text[..byte_offset]` を渡して使う。
+#[instrument]
 pub fn utf16_len(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
 }

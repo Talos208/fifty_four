@@ -18,8 +18,10 @@
 use crate::character::{CharacterAttribute, comrak_options, heading_text};
 use comrak::Arena;
 use comrak::nodes::{AstNode, NodeHeading, NodeValue};
+use tracing::instrument;
 
 /// 見出しノードのレベル(1〜6)を返す。見出しでなければ `None`。
+#[instrument]
 fn heading_level(node: &AstNode) -> Option<u8> {
     match node.data.borrow().value {
         NodeValue::Heading(NodeHeading { level, .. }) => Some(level),
@@ -30,6 +32,7 @@ fn heading_level(node: &AstNode) -> Option<u8> {
 /// 見出しテキストを区切り文字（「・」「、」「,」「/」半角スペース）で分割し、
 /// `CharacterAttribute` として解釈できるものだけを返す。
 /// `replace_section`(旧実装)が使っていたのと同じ規則。
+#[instrument]
 fn heading_attribute_tags(text: &str) -> Vec<CharacterAttribute> {
     text.split(['・', '、', ',', '/', ' '])
         .filter_map(|s| CharacterAttribute::try_from(s).ok())
@@ -47,6 +50,7 @@ fn find_char_heading<'a>(root: &'a AstNode<'a>, char_name: &str) -> Option<(&'a 
 
 /// `start` の次の兄弟から走査し、レベルが `max_level` 以下の見出しに最初に出会ったノードを返す。
 /// 見つからなければ `None`(＝ドキュメント末尾までがセクション)。
+#[instrument]
 fn next_heading_at_or_above<'a>(start: &'a AstNode<'a>, max_level: u8) -> Option<&'a AstNode<'a>> {
     let mut cur = start.next_sibling();
     while let Some(n) = cur {
@@ -62,6 +66,7 @@ fn next_heading_at_or_above<'a>(start: &'a AstNode<'a>, max_level: u8) -> Option
 
 /// `start`(exclusive)から `end`(exclusive、`None` ならドキュメント末尾まで)の間にある
 /// 兄弟ノードを出現順に集める。
+#[instrument]
 fn siblings_between<'a>(
     start: &'a AstNode<'a>,
     end: Option<&'a AstNode<'a>>,
@@ -90,6 +95,7 @@ pub struct FileDoc<'a> {
 
 impl<'a> FileDoc<'a> {
     /// 既存ファイルの内容(または新規ファイル用の空文字列)をパースする。
+    #[instrument(skip(arena))]
     pub fn parse(arena: &'a Arena<'a>, text: &str) -> Self {
         let mut options = comrak_options();
         // 行ベース時代の互換のためインデント型ではなくフェンス型でコードブロックを保持する。
@@ -104,11 +110,13 @@ impl<'a> FileDoc<'a> {
 
     /// テキスト断片を、このドキュメントと同じ `arena` に追記パースする。
     /// 返り値の子ノード群は `self.root` へ `insert_before`/`append` でそのまま繋ぎ替えられる。
+    #[instrument(skip(self))]
     fn parse_fragment(&self, text: &str) -> &'a AstNode<'a> {
         comrak::parse_document(self.arena, text, &self.options)
     }
 
     /// ドキュメント全体をCommonMarkとしてレンダリングする。
+    #[instrument(skip(self))]
     pub fn render(&self) -> String {
         let mut buf = String::new();
         comrak::format_commonmark(self.root, &self.options, &mut buf)
@@ -119,6 +127,7 @@ impl<'a> FileDoc<'a> {
     /// 指定キャラクター・属性のセクション本文を丸ごと差し替える。
     /// 対象(キャラクター見出し、または属性見出し)が見つからない場合は `false`。
     /// `new_body` が空(trim後)の場合は本文を空にする(旧 `replace_section` と同じ)。
+    #[instrument(skip(self))]
     pub fn replace_section(
         &self,
         char_name: &str,
@@ -142,8 +151,7 @@ impl<'a> FileDoc<'a> {
         };
 
         // このセクションの終端: 属性見出し自身と同レベル以上の見出み、無ければキャラブロック終端。
-        let section_end =
-            next_heading_at_or_above(attr_heading, char_level + 1).or(char_block_end);
+        let section_end = next_heading_at_or_above(attr_heading, char_level + 1).or(char_block_end);
 
         for n in siblings_between(attr_heading, section_end) {
             n.detach();
@@ -165,6 +173,7 @@ impl<'a> FileDoc<'a> {
 
     /// 指定キャラクターの見出しブロック末尾に、新しい属性セクションを追記する。
     /// キャラクター見出しが見つからない場合は `false`。
+    #[instrument(skip(self))]
     pub fn append_attribute_section(
         &self,
         char_name: &str,
@@ -193,6 +202,7 @@ impl<'a> FileDoc<'a> {
     /// ドキュメント末尾に、新規キャラクターのブロックを全属性まとめて追記する。
     /// 見出しレベルは既存ドキュメントから推測し、不明な場合は `#`/`##` を使用する
     /// (`character::detect_char_level` に委譲)。
+    #[instrument(skip(self))]
     pub fn append_new_character(&self, char_name: &str, sections: &[(&'static str, String)]) {
         let cl = crate::character::detect_char_level(self.root);
         let (cl, al) = if cl == 0 { (1, 2) } else { (cl, cl + 1) };
@@ -201,7 +211,12 @@ impl<'a> FileDoc<'a> {
 
         let mut text = format!("{} {}\n", char_prefix, char_name);
         for (heading, body) in sections {
-            text.push_str(&format!("\n{} {}\n{}\n", attr_prefix, heading, body.trim_end()));
+            text.push_str(&format!(
+                "\n{} {}\n{}\n",
+                attr_prefix,
+                heading,
+                body.trim_end()
+            ));
         }
 
         let fragment = self.parse_fragment(&text);

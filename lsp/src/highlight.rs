@@ -9,6 +9,7 @@ use lindera::mode::Mode;
 use lindera::tokenizer::TokenizerBuilder;
 use parking_lot::RwLock;
 use strum_macros::EnumIter;
+use tracing::instrument;
 
 use crate::types::{CachedLinderaToken, LineData, TokenStatus};
 #[allow(unused_imports)]
@@ -78,6 +79,7 @@ pub enum SemanticTokenType {
 impl SemanticToken {
     /// 新しいトークンを作成する簡易コンストラクタ
     #[allow(dead_code)]
+    #[instrument]
     pub fn new(start: u32, length: u32, token_type: u32, modifier: u32) -> Self {
         Self {
             start,
@@ -87,6 +89,7 @@ impl SemanticToken {
         }
     }
 
+    #[instrument]
     pub fn from_kind(start: u32, length: u32, kind: &str) -> Self {
         let (token_type, modifier) = Self::kind2token(kind);
         Self {
@@ -97,6 +100,7 @@ impl SemanticToken {
         }
     }
 
+    #[instrument]
     pub fn kind2token(kind: &str) -> (u32, u32) {
         match kind {
             "namespace" => (SemanticTokenType::Namespace as u32, 0),
@@ -137,6 +141,7 @@ pub struct Highlighter {
 }
 
 impl std::fmt::Debug for crate::highlight::Highlighter {
+    #[instrument(skip(self, f))]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "Highlight tokenizer using Lindera")?;
         Ok(())
@@ -166,7 +171,12 @@ impl Highlighter {
     /// 表示されるという食い違いを防ぐため)。
     /// `allowed` は呼び出し側が対象ドキュメントのワークスペースに応じて渡す
     /// (`CharacterStore::allowed_names`)。
-    pub fn is_recognized_name(details: &[String], surface: &str, allowed: &HashSet<String>) -> bool {
+    #[instrument]
+    pub fn is_recognized_name(
+        details: &[String],
+        surface: &str,
+        allowed: &HashSet<String>,
+    ) -> bool {
         Self::is_recognized_person_name(details, surface, allowed)
     }
 
@@ -178,6 +188,8 @@ impl Highlighter {
     /// lindera 2.3.2 はCSVファイル経由でしかユーザー辞書を構築できないため、一時ファイルに
     /// 書き出してロード後に削除する。`Tokenizer.segmenter.user_dictionary` が pub なので、
     /// 埋め込みIPADIC の再ロードなしに辞書だけを差し替えられる。
+    #[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
+    #[instrument]
     pub fn rebuild_user_dictionary(&self, names: &HashSet<String>) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind};
 
@@ -241,6 +253,7 @@ impl Highlighter {
     /// 誤分割を招くため避ける。
     /// 原形=表層形とし(`text_to_lindera_token` の d[6]=="*" 除外フィルタを回避)、読み/発音は "*"。
     /// 組織(固有名詞,組織,*)・地域(固有名詞,地域,一般)のサポート追加時は subcategory を変えて呼ぶ。
+    #[instrument]
     fn user_dict_csv_row(surface: &str, subcategory2: &str, subcategory3: &str) -> String {
         format!(
             "{s},0,0,2000,名詞,固有名詞,{c2},{c3},*,*,{s},*,*",
@@ -250,6 +263,7 @@ impl Highlighter {
         )
     }
 
+    #[instrument]
     pub fn text_to_lindera_token(&self, text: &str) -> Vec<CachedLinderaToken> {
         let tokenizer = self.tokenizer.read();
         tokenizer
@@ -289,6 +303,7 @@ impl Highlighter {
     /// 括弧開閉トークン自身の扱い:
     /// - 括弧開: 自身はまだ外側(処理前の深さで判定) → その後 depth+1
     /// - 括弧閉: depth-1 → 自身はもう外側(処理後の深さで判定)
+    #[instrument]
     fn tag_line_depth(&self, line: &mut LineData, start_depth: u32) -> u32 {
         // 遅延解析
         if line.tokens.is_empty() {
@@ -342,6 +357,7 @@ impl Highlighter {
     /// `apply_changes` が編集行以降の `bracket_depth_after` を一括 None にする規約
     /// (前方累積量の無効化)と対になっており、定常の打鍵(編集行=カーソル行)では
     /// 再計算は1行分だけで済む。
+    #[instrument]
     pub fn ensure_bracket_depth(&self, lines: &mut [LineData], line_no: usize) -> u32 {
         if lines.is_empty() {
             return 0;
@@ -373,6 +389,7 @@ impl Highlighter {
     ///
     /// `tag_line_depth` でタグ付けした後、語種と括弧内外に基づいて
     /// ハイライト用のトークン種別を生成する。
+    #[instrument]
     pub fn tokenize_with_depth(
         &self,
         line: &mut LineData,
@@ -415,6 +432,7 @@ impl Highlighter {
     /// 本体コードは深さを明示する `tokenize_with_depth`/`ensure_bracket_depth` を使うため、
     /// 現在はテスト専用。
     #[allow(dead_code)]
+    #[instrument]
     pub fn tokenize(&self, line: &mut LineData, allowed: &HashSet<String>) -> Vec<SemanticToken> {
         self.tokenize_with_depth(line, 0, allowed).0
     }
@@ -426,6 +444,7 @@ impl Highlighter {
     /// hover等ハイライト以外の箇所からも同一基準で判定できるよう公開している
     /// (`Highlighter::is_recognized_name` 経由)。
     /// ここでの判定が変わらない限り hover とハイライトは常に一致する。
+    #[instrument]
     fn is_recognized_person_name(
         details: &[String],
         surface: &str,
@@ -442,6 +461,7 @@ impl Highlighter {
     /// 人名(固有名詞・人名)は `allowed` (キャラ一覧の名前+aliases) に含まれる場合のみ
     /// ハイライトする。組織名・地域名の判定は無効化(コメントアウト)しているが、
     /// 将来再度有効化できるようロジックは残してある。
+    #[instrument]
     fn classify_normal(
         details: &[String],
         surface: &str,
@@ -479,6 +499,7 @@ impl Highlighter {
     /// 括弧内モードでの品詞→トークン種別マッピング。
     ///
     /// 人名の絞り込みは `classify_normal` と同様。組織名・地域名の判定は無効化(コメントアウト)。
+    #[instrument]
     fn classify_bracket(
         details: &[String],
         surface: &str,
@@ -515,6 +536,7 @@ impl Highlighter {
 
     /// ハイライト用トークン列をLSP用に変換する。
     ///
+    #[instrument(skip(tokens))]
     pub fn to_semantic_tokens(
         tokens: impl IntoIterator<Item = impl IntoIterator<Item = crate::highlight::SemanticToken>>,
     ) -> Vec<EncodedSemanticToken> {
@@ -670,7 +692,8 @@ mod tests {
             "ジョサイア".to_string(),
             "コンドル".to_string(),
         ]);
-        h.rebuild_user_dictionary(&allowed).expect("辞書再構築に失敗");
+        h.rebuild_user_dictionary(&allowed)
+            .expect("辞書再構築に失敗");
 
         let text = "ジョサイア・コンドルの手による";
         let tokens = h.text_to_lindera_token(text);
@@ -706,7 +729,8 @@ mod tests {
         // 単独トークンに切り出され、許可名一致で keyword になる。
         let h = Highlighter::new();
         let allowed = HashSet::from(["原".to_string(), "原顕三郎".to_string()]);
-        h.rebuild_user_dictionary(&allowed).expect("辞書再構築に失敗");
+        h.rebuild_user_dictionary(&allowed)
+            .expect("辞書再構築に失敗");
 
         let tokens = h.tokenize(&mut LineData::from_str("原は独りごちた").unwrap(), &allowed);
         assert_eq!(
@@ -734,7 +758,8 @@ mod tests {
         // 引き続き1トークンでkeywordになること(コスト緩和による回帰確認)。
         let h = Highlighter::new();
         let allowed = HashSet::from(["シルビア".to_string()]);
-        h.rebuild_user_dictionary(&allowed).expect("辞書再構築に失敗");
+        h.rebuild_user_dictionary(&allowed)
+            .expect("辞書再構築に失敗");
 
         let tokens = h.tokenize(&mut LineData::from_str("シルビア").unwrap(), &allowed);
         assert_eq!(tokens.len(), 1, "{:?}", tokens);
@@ -747,7 +772,8 @@ mod tests {
         // 誤って分割してハイライトしないこと。
         let h = Highlighter::new();
         let allowed = HashSet::from(["原".to_string()]);
-        h.rebuild_user_dictionary(&allowed).expect("辞書再構築に失敗");
+        h.rebuild_user_dictionary(&allowed)
+            .expect("辞書再構築に失敗");
 
         for word in ["高原", "原因", "原則"] {
             let tokens = h.tokenize(&mut LineData::from_str(word).unwrap(), &allowed);
@@ -833,7 +859,11 @@ mod tests {
             ["これはテストです。", "", "これはテストです。"]
                 .iter()
                 .map(|s| {
-                    tokenize_in_bracket(&hilighter, &mut LineData::from_str(s).unwrap(), &no_names())
+                    tokenize_in_bracket(
+                        &hilighter,
+                        &mut LineData::from_str(s).unwrap(),
+                        &no_names(),
+                    )
                 })
                 .collect::<Vec<_>>(),
         );

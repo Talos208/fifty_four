@@ -5,11 +5,13 @@
 //! 文字列(JSON)として一度フラット化してから利用側へ渡す。
 
 use std::collections::HashMap;
+use tracing::instrument;
 
 /// アセットからプロンプトを読み込み、YAML frontmatter を本文と分離して返す。
 ///
 /// - アセットが見つからない場合は `None`(欠如時の扱いは呼び出し側に委ねる)。
 /// - frontmatter が無い・パースに失敗した場合は本文をそのまま・空の data を返す。
+#[instrument]
 pub(crate) fn load_prompt(name: &str) -> Option<(String, HashMap<String, String>)> {
     let template = crate::assets::load(name)?;
     let matter = gray_matter::Matter::<gray_matter::engine::YAML>::new();
@@ -37,6 +39,7 @@ pub(crate) fn load_prompt(name: &str) -> Option<(String, HashMap<String, String>
 ///
 /// スカラーはそのまま文字列化し、配列・オブジェクト(JSON schema 等)は JSON 文字列に変換する。
 /// Null のみ `None`(マップから除外)。
+#[instrument]
 pub(crate) fn pod_to_string(pod: &gray_matter::Pod) -> Option<String> {
     use gray_matter::Pod;
     match pod {
@@ -58,6 +61,7 @@ pub(crate) fn pod_to_string(pod: &gray_matter::Pod) -> Option<String> {
 /// 構築せず、置換後の文字列を再走査しないためその心配がない。
 ///
 /// 未知のプレースホルダ(`vars` に無いキー)は `{{NAME}}` の形のまま残す。
+#[instrument]
 pub(crate) fn expand(template: &str, vars: &HashMap<&str, &str>) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -89,6 +93,7 @@ pub(crate) fn expand(template: &str, vars: &HashMap<&str, &str>) -> String {
     out
 }
 
+#[instrument]
 pub(crate) fn pod_to_json_value(pod: &gray_matter::Pod) -> serde_json::Value {
     use gray_matter::Pod;
     match pod {
@@ -211,10 +216,7 @@ mod tests {
         let mut vars = HashMap::new();
         vars.insert("CHAPTER", "5");
         vars.insert("TEXT", "本文");
-        assert_eq!(
-            expand("第{{CHAPTER}}章: {{TEXT}}", &vars),
-            "第5章: 本文"
-        );
+        assert_eq!(expand("第{{CHAPTER}}章: {{TEXT}}", &vars), "第5章: 本文");
     }
 
     #[test]
@@ -235,7 +237,10 @@ mod tests {
     #[test]
     fn test_expand_leaves_unknown_placeholder_untouched() {
         let vars = HashMap::new();
-        assert_eq!(expand("見出し{{UNKNOWN}}続き", &vars), "見出し{{UNKNOWN}}続き");
+        assert_eq!(
+            expand("見出し{{UNKNOWN}}続き", &vars),
+            "見出し{{UNKNOWN}}続き"
+        );
     }
 
     #[test]

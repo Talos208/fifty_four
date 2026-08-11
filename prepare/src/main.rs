@@ -1,4 +1,4 @@
-//! 開発用タスクランナー。`cargo prepare package [--release]` で
+//! 開発用タスクランナー。`cargo prepare package [--release|--debug]` で
 //! `fifty_four_lsp` をビルドし、配布用の 1 ディレクトリ `dist/fifty-four/` に
 //! 拡張一式(extension.toml / extension.wasm / languages/)+ LSP バイナリ + data/ を
 //! まとめる。利用マシンでは任意の場所へコピーし、Zed の Extensions ページから
@@ -21,6 +21,22 @@ const EXTENSION_ID: &str = "fifty-four";
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let release = args.iter().any(|a| a == "--release");
+    let debug = args.iter().any(|a| a == "--debug");
+    if release && debug {
+        eprintln!("--release と --debug は同時に指定できません");
+        std::process::exit(1);
+    }
+    // `--debug` は既定と同じ意味(明示のためのフラグ)。認識しない不明なフラグは
+    // 黙って無視せず弾く(--release のタイプミス等で意図せず debug ビルドが
+    // 出来上がる事故を防ぐ)。
+    for a in &args {
+        if a.starts_with("--") && a != "--release" && a != "--debug" && !a.starts_with("--target")
+        {
+            eprintln!("不明なオプション: {}", a);
+            eprintln!("Usage: cargo prepare <package|wasm> [--release|--debug] [--target <triple>]");
+            std::process::exit(1);
+        }
+    }
     let target = parse_target(&args);
     match args.first().map(|s| s.as_str()) {
         Some("package") => package(release, target.as_deref()),
@@ -32,7 +48,7 @@ fn main() {
             build_extension_wasm(&repo_root().join("extension"), release);
         }
         _ => {
-            eprintln!("Usage: cargo prepare <package|wasm> [--release] [--target <triple>]");
+            eprintln!("Usage: cargo prepare <package|wasm> [--release|--debug] [--target <triple>]");
             std::process::exit(1);
         }
     }

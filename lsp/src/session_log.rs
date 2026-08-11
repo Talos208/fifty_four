@@ -32,11 +32,13 @@ use std::path::{Path, PathBuf};
 
 #[allow(unused_imports)]
 use log::warn;
+use tracing::instrument;
 
 /// セッションログを置くサブディレクトリ名(`.fifty_four/` 直下)。
 const SESSIONS_DIR: &str = "sessions";
 
 /// セッションログのファイルパスを返す。
+#[instrument]
 fn log_path(root: &Path, session_id: &str) -> PathBuf {
     root.join(crate::chat_context::DIR_NAME)
         .join(SESSIONS_DIR)
@@ -50,6 +52,7 @@ fn log_path(root: &Path, session_id: &str) -> PathBuf {
 /// 失敗しても呼び出し側は `warn!` に落として会話自体は止めない
 /// (`chat_context::write_digest` の失敗時と同じ扱い)。
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
+#[instrument]
 pub(crate) fn append_turn(root: &Path, session_id: &str, turn: &ChatTurn) -> std::io::Result<()> {
     let dir = root.join(crate::chat_context::DIR_NAME).join(SESSIONS_DIR);
     std::fs::create_dir_all(&dir)?;
@@ -75,6 +78,7 @@ pub(crate) fn append_turn(root: &Path, session_id: &str, turn: &ChatTurn) -> std
 /// 壊れた行が混ざっていても、その行だけ読み飛ばして残りは返す
 /// (`parse_rate_limit_event` と同じ「取れなければ諦めて続行する」方針)。
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
+#[instrument]
 pub(crate) fn read_turns(root: &Path, session_id: &str) -> Vec<ChatTurn> {
     let path = log_path(root, session_id);
     let Ok(file) = std::fs::File::open(&path) else {

@@ -20,6 +20,7 @@
 //! 明示的に切り替える方式にした。
 
 use std::path::{Path, PathBuf};
+use tracing::instrument;
 
 /// ワークスペース直下に掘る作業ディレクトリ名。
 ///
@@ -55,6 +56,7 @@ fn owner_path(root: &Path) -> PathBuf {
 /// 無条件でこのファイルを読むため、書きかけの内容を読ませないことが重要。
 /// 同一ディレクトリ内の `rename` は同一ファイルシステム上なので原子的に行われる。
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
+#[instrument]
 fn write_atomic(dir: &Path, file_name: &str, content: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
 
@@ -81,6 +83,8 @@ fn write_atomic(dir: &Path, file_name: &str, content: &str) -> std::io::Result<(
 ///
 /// 書き手は `writing_agent`(debugビルド限定)のみなので、releaseビルドでは未使用になる。
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
+#[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
+#[instrument]
 pub(crate) fn write_digest(root: &Path, digest: &str, session_id: &str) -> std::io::Result<()> {
     let dir = root.join(DIR_NAME);
     write_atomic(&dir, FILE_NAME, digest)?;
@@ -99,6 +103,8 @@ pub(crate) fn write_digest(root: &Path, digest: &str, session_id: &str) -> std::
 /// 以前は「最終更新から一定時間(TTL)を過ぎたら無効」という鮮度チェックもあったが、
 /// [`owner`] によるセッション単位の明示的な切り替え([`crate::acp`] 参照)に
 /// 置き換えたため廃止した。
+#[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
+#[instrument]
 pub(crate) fn read_digest(root: &Path, max_chars: usize) -> Option<String> {
     let path = digest_path(root);
     let body = std::fs::read_to_string(&path).ok()?;
@@ -111,6 +117,8 @@ pub(crate) fn read_digest(root: &Path, max_chars: usize) -> Option<String> {
 
 /// 要約を現在所有しているセッションIDを読む。無ければ `None`。
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
+#[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
+#[instrument]
 pub(crate) fn owner(root: &Path) -> Option<String> {
     let body = std::fs::read_to_string(owner_path(root)).ok()?;
     let body = body.trim();
@@ -127,6 +135,8 @@ pub(crate) fn owner(root: &Path) -> Option<String> {
 /// 「復元先セッションに要約の材料が無いので古い所有者のものを残さない」
 /// (`session/load`)の両方で使う。ファイルが元から無い場合はエラーにしない。
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
+#[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
+#[instrument]
 pub(crate) fn clear(root: &Path) -> std::io::Result<()> {
     for path in [digest_path(root), owner_path(root)] {
         if let Err(e) = std::fs::remove_file(&path)
@@ -141,6 +151,7 @@ pub(crate) fn clear(root: &Path) -> std::io::Result<()> {
 /// 末尾から `max_chars` 文字を残して返す。`max_chars` 以下ならそのまま。
 ///
 /// バイト単位ではなく文字単位で切るため、日本語でも文字境界を壊さない。
+#[instrument]
 fn tail_chars(s: &str, max_chars: usize) -> String {
     let total = s.chars().count();
     if total <= max_chars {

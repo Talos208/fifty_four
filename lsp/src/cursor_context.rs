@@ -5,23 +5,29 @@ use log::{debug, error, trace};
 use std::cmp::max;
 use std::cmp::min;
 use tower_lsp_server::lsp_types::{Position, Range};
+use tracing::instrument;
 
+#[instrument]
 fn is_bracket_open(token: &CachedLinderaToken) -> bool {
     token.details[0] == "記号" && token.details.get(1).map(|s| s.as_str()) == Some("括弧開")
 }
 
+#[instrument]
 fn is_bracket_close(token: &CachedLinderaToken) -> bool {
     token.details[0] == "記号" && token.details.get(1).map(|s| s.as_str()) == Some("括弧閉")
 }
 
+#[instrument]
 fn is_sentence_end(token: &CachedLinderaToken) -> bool {
     token.details[0] == "記号" && token.details.get(1).map(|s| s.as_str()) == Some("句点")
 }
 
+#[instrument]
 fn is_whitespace(token: &CachedLinderaToken) -> bool {
     token.details[0] == "記号" && token.details.get(1).map(|s| s.as_str()) == Some("空白")
 }
 
+#[instrument(skip(predicate))]
 fn before_token_inline(
     line: &LineData,
     token_index: usize,
@@ -48,6 +54,7 @@ fn before_token_inline(
     (0, None)
 }
 
+#[instrument(skip(texts, tokenize_line_no, predicate))]
 fn before_token(
     texts: &mut [LineData],
     line_no: usize,
@@ -81,6 +88,7 @@ fn before_token(
     }
 }
 
+#[instrument(skip(texts, tokenize_line_no, predicate))]
 fn next_token(
     texts: &mut [LineData],
     line_no: usize,
@@ -115,6 +123,7 @@ fn next_token(
     }
 }
 
+#[instrument(skip(texts, tokenize_line_no))]
 pub fn classify_complesion_mode(
     texts: &mut [LineData],
     line_no: usize,
@@ -189,6 +198,7 @@ pub fn classify_complesion_mode(
 /// - 開始: カーソルより前方の直近の文末トークンの直後(無ければ文書先頭)
 /// - 終了: カーソル位置以降(カーソル自身のトークンを含む)の最初の文末トークンの直後、
 ///   その記号自体を含む(無ければ文書末尾)
+#[instrument(skip(texts, tokenize_line_no))]
 pub(crate) fn sentence_range_at(
     texts: &mut [LineData],
     line_no: usize,
@@ -258,6 +268,7 @@ pub(crate) fn sentence_range_at(
 ///
 /// 見つからなければ `None`。次のトークンへのフォールバックが必要な呼び出し元(補完)は
 /// `cursor_tkn` を使うこと。
+#[instrument(skip(texts, tokenize_line_no))]
 pub fn token_at(
     texts: &mut [LineData],
     line_no: usize,
@@ -287,6 +298,7 @@ pub fn token_at(
         .map(|(ix, tkn)| (ix, tkn.clone()))
 }
 
+#[instrument(skip(texts, tokenize_line_no))]
 fn cursor_tkn(
     texts: &mut [LineData],
     line_no: usize,
@@ -313,6 +325,7 @@ fn cursor_tkn(
     (line_no, cursor_ix, cursor_tkn)
 }
 
+#[instrument]
 fn is_end_of_sentence(tkn: &CachedLinderaToken) -> bool {
     tkn.details[0] == "記号"
         && match tkn.details.get(1).map(|s| s.as_str()) {
@@ -322,6 +335,7 @@ fn is_end_of_sentence(tkn: &CachedLinderaToken) -> bool {
         }
 }
 
+#[instrument(skip(texts, tokenize_line_no))]
 pub fn before_sentences_upto(
     texts: &DashMap<String, Vec<LineData>>,
     uri: &str,
@@ -464,6 +478,7 @@ pub fn before_sentences_upto(
 /// 空行で区切る、という観測された振る舞いに対する経験則)。空行が無い、または
 /// 空行の後ろに実質的な行が無い(末尾の空行のみ等)場合は、全体から空行だけを
 /// 除いたものを返す。
+#[instrument]
 pub(crate) fn extract_candidate_lines(response: &str) -> Vec<&str> {
     let lines: Vec<&str> = response.lines().collect();
     let last_blank = lines.iter().rposition(|l| l.trim().is_empty());
@@ -484,6 +499,7 @@ pub(crate) fn extract_candidate_lines(response: &str) -> Vec<&str> {
 /// 前文の末尾がこの文字なら、続く候補の先頭に句点「。」を前置しない。
 /// 読点・句点・感嘆符等の直後に句点を重ねると不自然になるほか、
 /// 開き括弧の直後(会話の書き出し)にも句点は不要。
+#[instrument]
 fn ends_with_no_period_needed(c: char) -> bool {
     matches!(c, '、' | '。' | '！' | '？' | '…' | '―' | '「' | '『')
 }
@@ -497,6 +513,7 @@ fn ends_with_no_period_needed(c: char) -> bool {
 ///   2. 候補先頭への「。」前置は、前文が読点等で終わっていない場合のみ行う
 /// 以前は if/else if/else の排他分岐だったため、候補が「。」で終わる場合に
 /// 末尾除去が働かず `。わかった。` のような二重句点が生じていた。
+#[instrument]
 pub(crate) fn decorate_candidate(
     context: CursorContext,
     raw: &str,
@@ -1106,7 +1123,12 @@ mod tests {
 
     // ---- sentence_range_at のテスト ----
 
-    fn sentence_range(td: &TestData, texts: &mut Vec<LineData>, line_no: usize, offset: usize) -> Range {
+    fn sentence_range(
+        td: &TestData,
+        texts: &mut Vec<LineData>,
+        line_no: usize,
+        offset: usize,
+    ) -> Range {
         crate::cursor_context::sentence_range_at(texts.as_mut_slice(), line_no, offset, |line| {
             td.tokenize(line)
         })
@@ -1130,7 +1152,10 @@ mod tests {
         let r = sentence_range(&td, &mut text, 0, offset);
         let start = "一文目です。".chars().count() as u32;
         let end = text[0].text.chars().count() as u32;
-        assert_eq!(r, Range::new(Position::new(0, start), Position::new(0, end)));
+        assert_eq!(
+            r,
+            Range::new(Position::new(0, start), Position::new(0, end))
+        );
     }
 
     #[test]
@@ -1168,7 +1193,10 @@ mod tests {
         let r = sentence_range(&td, &mut text, 0, offset);
         let start = "一文目です。".chars().count() as u32;
         let end = text[0].text.chars().count() as u32;
-        assert_eq!(r, Range::new(Position::new(0, start), Position::new(0, end)));
+        assert_eq!(
+            r,
+            Range::new(Position::new(0, start), Position::new(0, end))
+        );
     }
 
     #[test]

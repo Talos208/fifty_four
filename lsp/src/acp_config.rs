@@ -16,10 +16,10 @@
 
 use agent_client_protocol::schema::v1::{
     SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigSelect, SessionConfigSelectOption,
-    SessionConfigValueId,
+    SessionConfigOptionValue, SessionConfigSelect, SessionConfigSelectOption, SessionConfigValueId,
 };
 use anthropic_agent_sdk::ClaudeSDKClient;
+use tracing::instrument;
 
 /// モデル選択の `SessionConfigOption.id`。
 pub(crate) const CONFIG_ID_MODEL: &str = "model";
@@ -67,6 +67,7 @@ pub(crate) struct SessionConfig {
 /// `session/new` / `session/load` / `session/set_config_option` の3箇所で同じ関数を使う。
 /// `SetSessionConfigOptionResponse` は「全オプションの現在値」を返す規約なので、
 /// ここを共通化しないと片方だけ古い値を返しかねない。
+#[instrument]
 pub(crate) fn to_config_options(config: &SessionConfig) -> Vec<SessionConfigOption> {
     let model_current = config.model.as_deref().unwrap_or(DEFAULT_VALUE_ID);
     let model_options: Vec<SessionConfigSelectOption> = model_select_options();
@@ -101,9 +102,12 @@ pub(crate) fn to_config_options(config: &SessionConfig) -> Vec<SessionConfigOpti
 
 /// モデルセレクタの選択肢。エイリアスを先頭に、`supported_models()` の
 /// バージョン固定IDを重複なく続ける。
+#[instrument]
 fn model_select_options() -> Vec<SessionConfigSelectOption> {
-    let mut seen: std::collections::HashSet<String> =
-        MODEL_ALIASES.iter().map(|(id, _)| (*id).to_string()).collect();
+    let mut seen: std::collections::HashSet<String> = MODEL_ALIASES
+        .iter()
+        .map(|(id, _)| (*id).to_string())
+        .collect();
     let mut options: Vec<SessionConfigSelectOption> = MODEL_ALIASES
         .iter()
         .map(|(id, name)| SessionConfigSelectOption::new(SessionConfigValueId::new(*id), *name))
@@ -127,6 +131,7 @@ fn model_select_options() -> Vec<SessionConfigSelectOption> {
 /// 一覧に無い値(将来 GUI 外から設定された等)は "default" 扱いにはせず、
 /// 一番近いラベルを出すよりも「未知」を明示したいので `DEFAULT_VALUE_ID` にはしない。
 /// 現状は `apply()` 経由でしか `thinking_tokens` は変わらないため、常に一致するはず。
+#[instrument]
 fn effort_value_id_for(thinking_tokens: Option<u32>) -> &'static str {
     EFFORT_LEVELS
         .iter()
@@ -307,7 +312,9 @@ mod tests {
         let options = model_select_options();
         for (id, _) in MODEL_ALIASES {
             assert!(
-                options.iter().any(|o| o.value == SessionConfigValueId::new(*id)),
+                options
+                    .iter()
+                    .any(|o| o.value == SessionConfigValueId::new(*id)),
                 "missing alias {}",
                 id
             );

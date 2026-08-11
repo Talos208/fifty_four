@@ -36,6 +36,7 @@ use anthropic_agent_sdk::{
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use std::path::{Path, PathBuf};
+use tracing::instrument;
 
 /// エージェントに許可するツール。
 ///
@@ -120,7 +121,9 @@ pub(crate) struct ClaudeAgent {
 
 impl std::fmt::Debug for ClaudeAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClaudeAgent").field("root", &self.root).finish()
+        f.debug_struct("ClaudeAgent")
+            .field("root", &self.root)
+            .finish()
     }
 }
 
@@ -135,6 +138,7 @@ impl ClaudeAgent {
     /// ACP の `session/new`/`session/load` それぞれに対応する
     /// (`crate::acp` はこのIDをそのまま ACP の `SessionId` として使い回すため、
     /// 呼び出し側で別途IDのマッピングを持つ必要がない)。
+    #[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
     pub(crate) async fn start(
         root: &Path,
         system_prompt: String,
@@ -192,6 +196,7 @@ impl ClaudeAgent {
     ///
     /// ツールを一切許可せず `max_turns(1)` で回すので、応答は素のテキスト1回で返る。
     /// 会話用のクライアントとは独立しているため、要約が進行中の対話へ混ざらない。
+    #[instrument]
     pub(crate) async fn one_shot(
         root: &Path,
         system_prompt: String,
@@ -249,7 +254,13 @@ impl ClaudeAgent {
     /// `friendly_agent_error` の `Transport` と同じ文言に寄せ、詳細はログにだけ残す。
     /// 新規セッションでの失敗は本当に別の理由(実際のAPIエラー等)の可能性があるため、
     /// 詳細をそのままユーザーへ返す。
-    fn result_error(&self, subtype: &str, errors: &[String], result: &Option<String>) -> AgentError {
+    #[instrument]
+    fn result_error(
+        &self,
+        subtype: &str,
+        errors: &[String],
+        result: &Option<String>,
+    ) -> AgentError {
         let detail = describe_result_error(subtype, errors, result);
         warn!(
             "acp: claude reported an error result (resumed={}): {}",
@@ -282,6 +293,7 @@ fn tool_names() -> Vec<anthropic_agent_sdk::ToolName> {
 /// ここで先に `which` を試し、それでも見つからなければ Windows のnpmグローバル
 /// インストール先を明示的にチェックする。どちらも失敗したら `None` を返し、
 /// SDK自身の探索(従来通りの挙動)に委ねる — 新たな失敗モードを増やさない。
+#[instrument]
 fn resolve_cli_path() -> Option<PathBuf> {
     if let Ok(path) = which::which("claude") {
         return Some(path);
@@ -294,6 +306,7 @@ fn resolve_cli_path() -> Option<PathBuf> {
 /// `resolve_cli_path` から切り出してあるのは、`which` の成否に依らずこの部分だけを
 /// 単体テストできるようにするため。
 #[cfg(windows)]
+#[instrument]
 fn windows_npm_fallback() -> Option<PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;
     let candidate = PathBuf::from(appdata).join("npm").join("claude.cmd");
@@ -317,6 +330,7 @@ fn windows_npm_fallback() -> Option<PathBuf> {
 /// (実機で確認済み)。起動を試みる前にこの形式を検出し、分かりやすい理由で
 /// 早期に失敗させる。
 #[cfg(windows)]
+#[instrument]
 fn unsupported_cli_reason(path: &Path) -> Option<AgentError> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     if ext != "cmd" && ext != "bat" {
@@ -348,6 +362,7 @@ fn unsupported_cli_reason(_path: &Path) -> Option<AgentError> {
 /// `npm install -g @anthropic-ai/claude-code` の案内のあと
 /// `export PATH=...` という完全にPOSIX向けの文面で、Windowsでは誤誘導になる
 /// (`resolve_cli_path` 参照)。OSごとに案内し直す。
+#[instrument]
 fn cli_error(e: anthropic_agent_sdk::ClaudeError) -> AgentError {
     if let anthropic_agent_sdk::ClaudeError::CliNotFound(detail) = &e {
         warn!("acp: claude CLIが見つかりません: {}", detail);
@@ -357,10 +372,9 @@ fn cli_error(e: anthropic_agent_sdk::ClaudeError) -> AgentError {
             プロセスには反映されないため)。"
             .to_string();
         #[cfg(not(windows))]
-        let message =
-            "claude CLI が見つかりません。`npm install -g @anthropic-ai/claude-code` \
+        let message = "claude CLI が見つかりません。`npm install -g @anthropic-ai/claude-code` \
             でインストールしてください。"
-                .to_string();
+            .to_string();
         return AgentError { message };
     }
     AgentError {
@@ -385,6 +399,7 @@ enum ParsedLine {
 /// (SDK にも ACP にも対応する型が無いため、`ClaudeError::MessageParse` が
 /// 保持する生JSONから直接読む)。それ以外の未知種別は今まで通り警告1行で捨てる。
 /// SDK が型付けに失敗した以外のエラーはそのまま `AgentError` として伝播させる。
+#[instrument]
 fn parse_line(message: anthropic_agent_sdk::Result<Message>) -> Result<ParsedLine, AgentError> {
     match message {
         Ok(m) => Ok(ParsedLine::Message(m)),
@@ -409,6 +424,7 @@ fn parse_line(message: anthropic_agent_sdk::Result<Message>) -> Result<ParsedLin
 /// `rateLimit`/直下のどちらにキーがあっても拾えるようにしてある。想定した形で
 /// なければ `None` を返して黙って何もしない(要約の欠落と同じく、取れなくても
 /// 会話自体は成立するため)。
+#[instrument]
 fn parse_rate_limit_event(data: &serde_json::Value) -> Option<RateLimit> {
     if data.get("type").and_then(|t| t.as_str()) != Some("rate_limit_event") {
         return None;
@@ -438,6 +454,7 @@ fn parse_rate_limit_event(data: &serde_json::Value) -> Option<RateLimit> {
 /// 引数エラーで終了した等の理由で接続が断たれたことを示す。生のOSエラー文言のままだと
 /// 原因が伝わらないため、分かりやすい文言に置き換える
 /// (自動フォールバックはせず、ユーザーに新しい会話の開始を促すだけに留める)。
+#[instrument]
 fn friendly_agent_error(e: anthropic_agent_sdk::ClaudeError) -> AgentError {
     match e {
         anthropic_agent_sdk::ClaudeError::Transport(detail) => {
@@ -457,6 +474,7 @@ fn friendly_agent_error(e: anthropic_agent_sdk::ClaudeError) -> AgentError {
 ///
 /// `errors` が空でも `result`(成功時用のフィールドだが、実運用では失敗時にも
 /// メッセージが入ることがある)があればそちらを使う。どちらも無ければ `subtype` のみ。
+#[instrument]
 fn describe_result_error(subtype: &str, errors: &[String], result: &Option<String>) -> String {
     if !errors.is_empty() {
         format!("{} ({})", subtype, errors.join("; "))
@@ -468,6 +486,7 @@ fn describe_result_error(subtype: &str, errors: &[String], result: &Option<Strin
 }
 
 /// 応答ブロックからテキストだけを取り出して連結する。
+#[instrument]
 fn append_text(out: &mut String, blocks: &[ContentBlock]) {
     for block in blocks {
         if let ContentBlock::Text { text } = block {
@@ -478,6 +497,7 @@ fn append_text(out: &mut String, blocks: &[ContentBlock]) {
 
 #[async_trait::async_trait]
 impl WritingAgent for ClaudeAgent {
+    #[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
     async fn prompt(
         &self,
         text: &str,
@@ -533,6 +553,8 @@ impl WritingAgent for ClaudeAgent {
         })
     }
 
+    // #[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
+    #[instrument]
     async fn interrupt(&self) -> Result<(), AgentError> {
         self.client
             .lock()
@@ -630,7 +652,10 @@ mod tests {
     fn test_cli_error_maps_cli_not_found_to_actionable_message() {
         let e = anthropic_agent_sdk::ClaudeError::CliNotFound("raw sdk message".to_string());
         let err = cli_error(e);
-        assert!(err.message.contains("npm install -g @anthropic-ai/claude-code"));
+        assert!(
+            err.message
+                .contains("npm install -g @anthropic-ai/claude-code")
+        );
         // SDK既定の(POSIX前提の)文面は出さない。
         assert!(!err.message.contains("export PATH"));
     }

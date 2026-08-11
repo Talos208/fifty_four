@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex as TokioMutex;
+use tracing::instrument;
 
 use crate::types::LineData;
 
@@ -43,6 +44,7 @@ impl Default for UpdateState {
 
 impl UpdateState {
     /// 現在のバーストのカウントをクリアする。`running` は触らない。
+    #[instrument]
     pub fn reset(&mut self) {
         self.accumulated_chars = 0;
         self.first_dirty_at = None;
@@ -62,6 +64,7 @@ pub enum Trigger {
 
 /// 新しい変更を取り込む *前* に、直前バーストの idle 判定を行う。
 /// `gap` は前回変更からの経過時間。
+#[instrument]
 pub fn idle_trigger(
     accumulated: usize,
     gap: Duration,
@@ -80,6 +83,7 @@ pub fn idle_trigger(
 
 /// 指定 URI の全行を "\n" で連結して全文テキストを返す。
 /// LLM に渡す本文テキストとして使用する(発火判定の `accumulated_chars` とは独立)。
+#[instrument]
 pub fn full_text(text: &DashMap<String, Vec<LineData>>, uri: &str) -> String {
     text.get(uri)
         .map(|lines| {
@@ -102,6 +106,7 @@ pub struct UpdateItem {
 
 /// JSON 値をセクション本文向けの可読文字列へフラット化する。
 /// `text` に文字列以外(オブジェクト/配列)を返すスキーマ違反応答の救済に使う。
+#[instrument]
 fn value_to_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -131,6 +136,7 @@ fn value_to_text(v: &Value) -> String {
 
 /// フラット形式 `{name, attribute, text}` の1項目を正規化する。
 /// `text` が文字列以外の場合はフラット化して救済する。
+#[instrument]
 fn update_from_flat(item: &Value) -> Option<UpdateItem> {
     let name = item
         .get("name")
@@ -156,6 +162,7 @@ fn update_from_flat(item: &Value) -> Option<UpdateItem> {
 /// `{"name": ..., "personality": ..., "expression": {...}}` のような
 /// キャラクター単位のネスト形式1件をフラットな更新項目列へ救済変換する。
 /// `CharacterAttribute` として解釈できるキーのみ拾う。
+#[instrument]
 fn updates_from_character(item: &Value) -> Vec<UpdateItem> {
     let Some(obj) = item.as_object() else {
         return Vec::new();
@@ -186,6 +193,7 @@ fn updates_from_character(item: &Value) -> Vec<UpdateItem> {
 /// - 正規形式 `{"updates": [{name, attribute, text}]}` を受理
 /// - `{"characters": [...]}` のようなキャラクター単位のネスト形式も救済変換
 /// - どちらとしても解釈できない場合は `None`(呼び出し側でリトライ)
+#[instrument]
 fn parse_updates(response: &str) -> Option<Vec<UpdateItem>> {
     let json = extract_json(response)?;
     let parsed: Value = serde_json::from_str(json).ok()?;
@@ -207,6 +215,7 @@ fn parse_updates(response: &str) -> Option<Vec<UpdateItem>> {
 /// パースと同じ `comrak_options` を使い、折返しなし(width=0)・箇条書き "-" で出力する。
 /// `character_ast::FileDoc` は既にこの正規化を経た文字列を返すため、通常は冪等な
 /// 安全ネットとしてのみ働く。
+#[instrument]
 fn format_markdown(text: &str) -> String {
     let mut options = crate::character::comrak_options();
     // インデント型ではなくフェンス型でコードブロックを保持する。
@@ -216,6 +225,7 @@ fn format_markdown(text: &str) -> String {
 
 /// `CharacterAttribute` の JSON スキーマ上の英語 enum 値を返す。
 /// `strip_attribute_label` でラベル判定に使う(canonical_heading と合わせて2通り許容)。
+#[instrument]
 fn attr_schema_key(attr: &CharacterAttribute) -> &'static str {
     match attr {
         CharacterAttribute::Appearance => "appearance",
@@ -233,6 +243,7 @@ fn attr_schema_key(attr: &CharacterAttribute) -> &'static str {
 /// 1行の先頭から「<ラベル>：」または「<ラベル>:」を取り除く。
 /// ラベルが `canonical`(日本語見出し)または `english_key`(スキーマ enum 値)と
 /// 完全一致する場合のみ除去し、それ以外(「一人称：」等の情報を持つサブラベル)は素通しする。
+#[instrument]
 fn strip_label_from_line<'a>(line: &'a str, canonical: &str, english_key: &str) -> Option<&'a str> {
     for sep in ['：', ':'] {
         if let Some((label, body)) = line.split_once(sep) {
@@ -248,6 +259,7 @@ fn strip_label_from_line<'a>(line: &'a str, canonical: &str, english_key: &str) 
 /// 抽出/マージ LLM が誤って `text` の先頭に付与した属性ラベル(「口調：」「呼称：」等)を取り除く。
 /// 見出し(`## 口調`)の下にラベルが重複して書かれてしまう問題への対処。
 /// ラベル行が空になった場合(「呼称：\n- 飛騨艦長」のような形)は、その行ごと取り除く。
+#[instrument]
 fn strip_attribute_label(text: &str, attr: &CharacterAttribute) -> String {
     let canonical = attr.canonical_heading();
     let english_key = attr_schema_key(attr);
@@ -281,7 +293,8 @@ fn strip_attribute_label(text: &str, attr: &CharacterAttribute) -> String {
 /// `split_aliases` は「：」「:」を分割文字に含まないため、過去のバグで
 /// 「呼称：飛騨艦長」のように属性ラベルが1トークンに混入したまま保存された旧データが
 /// 残っている場合がある。各トークンに `strip_attribute_label` を適用してから比較することで、
-/// 新しく来た清潔な「飛騨艦長」と同一別名として認識し、重複を防ぎつつ自己修復する。
+/// 新しく来た清潔な「飛騨艦長」と同一別名として認識し、重複を防぀つつ自己修復する。
+#[instrument]
 fn merge_alias_bodies(old_body: &str, new_text: &str, char_name: &str) -> Option<String> {
     let dedup_excluding_self = |raw: Vec<String>| -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
@@ -319,6 +332,7 @@ fn merge_alias_bodies(old_body: &str, new_text: &str, char_name: &str) -> Option
 /// 新規セクション/新規キャラクターの本文を組み立てる。
 /// Alias は箇条書きへ正規化し(`merge_alias_bodies` を空の旧本文で流用)、
 /// 追加すべき別名が無ければ `None`(呼び出し側で "no change" として記録・スキップする)。
+#[instrument]
 fn build_new_section_body(
     attr: &CharacterAttribute,
     new_text: &str,
@@ -357,6 +371,7 @@ struct CharMergeGroup {
 /// バッチマージ結果の JSON スキーマ。
 /// `{"characters": [{"name", "sections": [{"heading", "merged_text"}]}]}` の入れ子で、
 /// name/heading はプロンプトで与えた文字列の復唱を要求する(結果突き合わせキー)。
+#[instrument]
 fn batch_merge_output_schema() -> Value {
     serde_json::json!({
         "type": "object",
@@ -389,6 +404,7 @@ fn batch_merge_output_schema() -> Value {
 
 /// 1キャラぶんのマージ対象をプロンプトのキャラブロックへレンダリングする。
 /// 見出し階層(`##`/`###`/`####`)はテンプレートの「# キャラクター一覧」の下に入れ子になる。
+#[instrument]
 fn render_char_group(group: &CharMergeGroup) -> String {
     let mut out = format!("## キャラクター: {}\n", group.display_name);
     for sec in &group.sections {
@@ -404,6 +420,7 @@ fn render_char_group(group: &CharMergeGroup) -> String {
 
 /// バッチマージ用プロンプトを `data/prompt_semantic_merge_batch.md` から読み込み、
 /// `{{CHARACTERS}}` に全キャラブロックを埋めて返す。テンプレートを読めなければ `None`。
+#[instrument]
 fn build_batch_merge_prompt(groups: &[CharMergeGroup]) -> Option<String> {
     let (template, _) = crate::frontmatter::load_prompt("prompt_semantic_merge_batch.md")?;
     let characters = groups
@@ -417,6 +434,7 @@ fn build_batch_merge_prompt(groups: &[CharMergeGroup]) -> Option<String> {
 /// バッチマージ応答をパースし、`(name, heading) -> merged_text` のマップを返す。
 /// 各 `merged_text` にはコードフェンス除去・前置きラベル除去を適用する。
 /// パース不能・スキーマ不一致の要素は黙って読み飛ばす(欠落分は呼び出し側で old 維持)。
+#[instrument]
 fn extract_batch_merges(raw: &str) -> HashMap<(String, String), String> {
     debug!("raw: {}", raw);
 
@@ -458,6 +476,7 @@ fn extract_batch_merges(raw: &str) -> HashMap<(String, String), String> {
 /// 完全一致で見つからない場合、同名キャラ内で返却見出しを属性正規化して突き合わせる
 /// (LLM が「性格・口調」を「性格」へ縮めて復唱したケースの救済)。
 /// 候補が複数(曖昧)・皆無なら `None`(呼び出し側で old 維持=書かない)。
+#[instrument]
 fn lookup_merged<'a>(
     merged: &'a HashMap<(String, String), String>,
     display_name: &str,
@@ -480,6 +499,7 @@ fn lookup_merged<'a>(
     }
 }
 
+#[instrument]
 fn sanitize_merged_section_text(response: &str) -> String {
     let trimmed = response.trim();
     if let Some(stripped) = trimmed
@@ -500,6 +520,7 @@ fn sanitize_merged_section_text(response: &str) -> String {
 /// (「マージ後の文章：」等)を、先頭行が既知の語のみで構成される場合に限り取り除く。
 /// 「地の文から推定：〜」のように本文として要求している内容付きのラベルは対象外
 /// (先頭行がラベル語のみ・コロンの後に何も無い場合のみマッチするため誤爆しない)。
+#[instrument]
 fn strip_merge_preamble(text: &str) -> String {
     const PREAMBLE_LABELS: &[&str] = &[
         "マージ後の文章",
@@ -536,6 +557,7 @@ fn strip_merge_preamble(text: &str) -> String {
 /// `run` タスクが完了・中断・panic したとき確実に `running = false` に戻す Drop ガード。
 struct RunningGuard(Arc<parking_lot::Mutex<UpdateState>>);
 impl Drop for RunningGuard {
+    #[instrument(skip_all)]
     fn drop(&mut self) {
         self.0.lock().running = false;
     }
@@ -549,6 +571,7 @@ impl Drop for RunningGuard {
 /// `CharacterStore::resolve_workspace_for` で解決済みのものを渡す(旧: `workspace_arc.first()`
 /// を常に使っていたため、複数ワークスペースを開いていると誤ったワークスペースに書き込む
 /// バグがあった)。
+#[instrument(skip(llm, recorder))]
 pub async fn run(
     uri: String,
     workspace: PathBuf,
@@ -782,6 +805,7 @@ enum ResolvedOp {
 /// 物理セクションの表示見出しをタグ列から再構成する(「性格・口調」等)。
 /// `TaggedContent` は元見出し文字列を保持しないため canonical_heading の「・」結合で代用する。
 /// echo キーは「こちらが与えた文字列との往復一致」だけが要件なので、原文一致は不要。
+#[instrument]
 fn section_display_heading(tags: &[CharacterAttribute]) -> String {
     tags.iter()
         .map(|t| t.canonical_heading())
@@ -792,6 +816,7 @@ fn section_display_heading(tags: &[CharacterAttribute]) -> String {
 /// 未解決(新規)キャラへの更新を、同一キャラにつき1つの CreateFile/AppendCharacter へ集約する。
 /// 既出の新規キャラ名が今回の name を含む場合(「ジェフ・クライン」に対する「ジェフ」)も
 /// 同一キャラとみなし、逐次適用時の見出し部分一致と挙動を揃える。
+#[instrument(skip(rec))]
 fn merge_into_new(
     plan: &mut Vec<ResolvedOp>,
     new_chars: &mut Vec<(Option<PathBuf>, String, usize)>,
@@ -884,6 +909,7 @@ fn merge_into_new(
 /// (A) 計画フェーズ: 生の更新項目列を、解決済み操作の列とバッチマージ対象グループへ変換する。
 /// ファイル内容は `snapshots`(計画時点のスナップショット)から読み、LLM は呼ばない純関数。
 /// キャラ・属性の解決はここで1度だけ確定し、適用フェーズでは再判定しない。
+#[instrument]
 fn plan_updates(
     updates: &[UpdateItem],
     char_files: &[PathBuf],
@@ -1165,6 +1191,7 @@ fn plan_updates(
 /// `(display_name, heading) -> merged_text` の結果マップを返す。
 /// 応答から期待キーが1件も引けない場合のみ、抽出フェーズと同様に1回だけ修正を要求する
 /// (部分欠落は全体リトライせず、適用フェーズで個別に old 維持へフォールバックする)。
+#[instrument(skip(llm_client))]
 async fn run_batch_merge(
     llm_client: &mut dyn LlmInterface,
     groups: &[CharMergeGroup],
@@ -1238,6 +1265,7 @@ async fn run_batch_merge(
 }
 
 /// records 内の全 item を同一の結果で FlightRecorder へ記録する。
+#[instrument(skip(recorder))]
 fn record_all(
     recorder: &FlightRecorder,
     update_id: i64,
@@ -1272,6 +1300,7 @@ struct OpOutcome {
 }
 
 /// `Skip`/`CreateFile` 以外の `ResolvedOp` が対象とする既存ファイルパスを返す。
+#[instrument]
 fn existing_op_file(op: &ResolvedOp) -> Option<&Path> {
     match op {
         ResolvedOp::Merge { file, .. }
@@ -1284,6 +1313,7 @@ fn existing_op_file(op: &ResolvedOp) -> Option<&Path> {
 
 /// `FileDoc` に対して1つの `ResolvedOp` を適用し、結果を `OpOutcome` として返す。
 /// `Skip` はグルーピング前に処理済みのためここには来ない。
+#[instrument(skip(doc))]
 fn apply_one_op(
     doc: &FileDoc,
     op: ResolvedOp,
@@ -1448,6 +1478,7 @@ fn apply_one_op(
 
 /// 1ファイル宛ての `ResolvedOp` 群を、1回の read/parse/write にまとめて適用する。
 /// `is_create` はグループ内の全 op が `CreateFile`(＝対象ファイルがまだ存在しない)であることを示す。
+#[instrument(skip(recorder))]
 async fn apply_ops_to_file(
     file: PathBuf,
     ops: Vec<ResolvedOp>,
@@ -1565,7 +1596,14 @@ async fn apply_ops_to_file(
                     } else {
                         (false, o.note)
                     };
-                    record_all(recorder, update_id, &o.records, o.old.as_deref(), success, note);
+                    record_all(
+                        recorder,
+                        update_id,
+                        &o.records,
+                        o.old.as_deref(),
+                        success,
+                        note,
+                    );
                 }
                 return;
             }
@@ -1589,6 +1627,7 @@ async fn apply_ops_to_file(
 /// ファイルごとに1回だけ read → AST 構築 → 全op適用 → render → write する
 /// (旧: opごとに read-fresh して行ベースで部分差し替え)。
 /// `merged_map` が `None` の場合はバッチマージ自体が失敗している(全 Merge を old 維持で記録)。
+#[instrument(skip(recorder))]
 async fn apply_plan(
     plan: Vec<ResolvedOp>,
     merged_map: Option<&HashMap<(String, String), String>>,
@@ -1678,6 +1717,7 @@ async fn apply_plan(
 /// (A) 計画: 全項目を解決済み操作へ変換(同一物理宛先は合流) →
 /// (B) バッチマージ: 既存セクションへの意味マージを1回の LLM 呼び出しで実行 →
 /// (C) 適用: 操作を逐次適用し、FlightRecorder へ item 単位で記録する。
+#[instrument(skip(recorder, llm_client))]
 async fn apply_updates(
     updates: &[UpdateItem],
     update_id: i64,
@@ -1715,12 +1755,21 @@ async fn apply_updates(
     };
 
     // (C) 適用
-    apply_plan(plan, merged_map.as_ref(), update_id, workspace, character_store, recorder).await;
+    apply_plan(
+        plan,
+        merged_map.as_ref(),
+        update_id,
+        workspace,
+        character_store,
+        recorder,
+    )
+    .await;
 }
 
 /// ファイル一覧からキャラ名に対応するファイルを探す。
 /// - 単一ファイル形式(`characters.md`): 全キャラを束ねる集約ファイルなので、名前に関係なくヒットさせる。
 /// - フォルダ形式(`characters/<名>.md`): ファイル名(stem)の前方一致で個別ファイルを探す。
+#[instrument]
 fn find_character_file<'a>(files: &'a [PathBuf], name: &str) -> Option<&'a PathBuf> {
     files.iter().find(|p| {
         p.file_stem()
@@ -1734,6 +1783,7 @@ fn find_character_file<'a>(files: &'a [PathBuf], name: &str) -> Option<&'a PathB
 
 /// ファイル stem として使えない文字(`/ \ : * ? " < > |` および制御文字)を `_` に置換する。
 /// キャラクター見出し(`# name`)には原名を使うため、このサニタイズはパス生成のみに適用する。
+#[instrument]
 fn sanitize_file_stem(name: &str) -> String {
     name.chars()
         .map(|c| {
@@ -1800,7 +1850,6 @@ mod tests {
 ### 性格
 - 真面目。
 ";
-
 
     #[test]
     fn test_build_batch_merge_prompt_requests_meaningful_merge() {

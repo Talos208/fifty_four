@@ -14,6 +14,7 @@
 | [character-updater.md](character-updater.md) | キャラクター設定自動更新 |
 | [acp-agent.md](acp-agent.md) | ACP エージェント、チャット内容の補完コンテキスト化 |
 | [data-layer.md](data-layer.md) | インメモリ状態、SQLite スキーマ |
+| [observability.md](observability.md) | OpenTelemetry/ログ計装、関連する環境変数 |
 
 ## 概要
 

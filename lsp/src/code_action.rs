@@ -6,6 +6,7 @@
 
 use crate::types::LineData;
 use tower_lsp_server::lsp_types::{Position, Range};
+use tracing::instrument;
 
 /// 対象範囲に応じた code action の種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,13 +24,16 @@ fn line_end_char(text: &str) -> u32 {
 
 /// `Range` が指すテキストを取り出す。複数行にまたがる場合は `\n` で連結する
 /// (`apply_changes` 等が改行を独立した行区切りとして扱う実装と揃える)。
+#[instrument]
 pub(crate) fn slice_range(texts: &[LineData], range: Range) -> String {
     let start_line = range.start.line as usize;
     let end_line = range.end.line as usize;
 
     let mut out = String::new();
     for line_no in start_line..=end_line {
-        let Some(line) = texts.get(line_no) else { break };
+        let Some(line) = texts.get(line_no) else {
+            break;
+        };
 
         let start_char = if line_no == start_line {
             range.start.character as usize
@@ -56,6 +60,7 @@ pub(crate) fn slice_range(texts: &[LineData], range: Range) -> String {
 /// `range` 内で最初に現れる `※` の1文字分の `Range` を返す。
 /// 複数ある場合は先頭のみを対象とする(残りは呼び出し元がログに出す想定。
 /// 1回の code action では1箇所ずつ埋める運用)。
+#[instrument]
 pub(crate) fn find_mark(texts: &[LineData], range: Range) -> Option<Range> {
     let start_line = range.start.line as usize;
     let end_line = range.end.line as usize;
@@ -91,6 +96,7 @@ pub(crate) fn find_mark(texts: &[LineData], range: Range) -> Option<Range> {
 }
 
 /// 対象範囲内に `※` があれば `FillMark`、無ければ `Rephrase` を選ぶ。
+#[instrument]
 pub(crate) fn decide_mode(texts: &[LineData], range: Range) -> ActionMode {
     match find_mark(texts, range) {
         Some(mark) => ActionMode::FillMark { mark },
@@ -108,6 +114,8 @@ pub(crate) fn decide_mode(texts: &[LineData], range: Range) -> ActionMode {
 ///
 /// JSON として読めなかった場合(スキーマを無視するモデル等)は行分割へフォールバック
 /// する。その場合だけは複数行の候補を表現できない。
+#[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
+#[instrument]
 pub(crate) fn parse_candidates(response: &str) -> Vec<String> {
     if let Some(list) = parse_candidates_json(response) {
         return list;
@@ -121,6 +129,7 @@ pub(crate) fn parse_candidates(response: &str) -> Vec<String> {
 
 /// `{"candidates": [...]}` 形式のパース。候補が1件も取れなければ `None`
 /// (呼び出し元が行分割へフォールバックできるようにするため)。
+#[instrument]
 fn parse_candidates_json(response: &str) -> Option<Vec<String>> {
     let json = crate::text::extract_json(response)?;
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
@@ -141,7 +150,9 @@ mod tests {
     use std::str::FromStr;
 
     fn lines(text: &str) -> Vec<LineData> {
-        text.lines().map(|l| LineData::from_str(l).unwrap()).collect()
+        text.lines()
+            .map(|l| LineData::from_str(l).unwrap())
+            .collect()
     }
 
     fn range(sl: u32, sc: u32, el: u32, ec: u32) -> Range {

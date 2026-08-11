@@ -8,6 +8,7 @@ use genai::chat::{
 };
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ModelName, ServiceTarget};
+use tracing::instrument;
 
 bitflags! {
     /// モデルが対応している機能のビットフラグ
@@ -48,6 +49,7 @@ pub enum Provider {
 
 impl Provider {
     /// 文字列からProviderを生成する
+    #[instrument]
     pub fn from_str(s: &str) -> Result<Self, String> {
         match s.to_lowercase().as_str() {
             "google" => Ok(Provider::Google("gemini-3.1-pro-preview".to_string())),
@@ -66,6 +68,7 @@ impl Provider {
     }
 
     #[allow(unused)]
+    #[instrument]
     pub fn from_name(name: &str) -> Result<Self, String> {
         let (mut prov, model) = if let Some((prov, model)) = name.split_once('/') {
             (prov, model)
@@ -113,6 +116,7 @@ impl Provider {
     /// プロバイダ単位で決め打ちできるものはそうしつつ、Cloudflare Workers AI
     /// のようにモデルごとに tool calling 対応が分かれるプロバイダは
     /// モデル名も加味して判定する。
+    #[instrument]
     pub fn default_capabilities(&self, model: &str) -> ModelCapability {
         match self {
             // Anthropic の構造化出力(output_config.format)は genai 0.6.5 の
@@ -133,6 +137,7 @@ impl Provider {
     /// Cloudflare Workers AI のモデル一覧は function calling 対応がモデル依存のため、
     /// モデル名に含まれるファミリー名から簡易判定する。
     /// 対応が確実でないモデルは安全側(空)に倒す。
+    #[instrument]
     fn cloudflare_capabilities(model: &str) -> ModelCapability {
         let m = model.to_lowercase();
         let supports_tool_calling = ["instruct", "hermes", "qwen", "mistral"]
@@ -159,6 +164,7 @@ impl Provider {
     ///
     /// 判定順序に注意: "grok-4.20-multi-agent" は "grok-4.20" のプレフィックスにも
     /// マッチするため、multi-agent の判定を先に行う。
+    #[instrument]
     fn xai_capabilities(model: &str) -> ModelCapability {
         let base = ModelCapability::STRUCTURED_OUTPUT | ModelCapability::TOOL_CALLING;
         let m = model.to_lowercase();
@@ -175,6 +181,7 @@ impl Provider {
 
     /// 正規化 effort (0.0..=1.0) をこのプロバイダ・モデルの ReasoningEffort 段階へ
     /// 写像する。0.0 (以下) または reasoning 非対応 => None。1.0 => 最上位段。
+    #[instrument]
     pub fn map_reasoning(&self, model: &str, norm: f64) -> ReasoningEffort {
         use ReasoningEffort::*;
         let m = model.to_lowercase();
@@ -212,6 +219,7 @@ impl Provider {
     }
 
     #[allow(unused)]
+    #[instrument(skip(self, f))]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Provider::Google(s) => write!(f, "Google({})", s),
@@ -224,6 +232,7 @@ impl Provider {
         }
     }
 
+    #[instrument]
     fn clone(&self) -> Self {
         match self {
             Provider::Google(s) => Provider::Google(s.clone()),
@@ -245,6 +254,7 @@ impl Provider {
 /// 静的な capability 表(`Provider::xai_capabilities` 等)が実際の API 仕様に
 /// 追いついていない場合の保険。パラメータ名は camelCase で返ってくるため
 /// snake_case に正規化する。
+#[instrument]
 fn unsupported_param_from_error_body(body: &str) -> Option<String> {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         // JSON エラー本文では引用符がバックスラッシュエスケープされて
@@ -256,6 +266,7 @@ fn unsupported_param_from_error_body(body: &str) -> Option<String> {
 }
 
 /// camelCase を snake_case へ正規化する(既に snake_case の場合はそのまま)。
+#[instrument]
 fn camel_to_snake(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     for (i, c) in s.chars().enumerate() {
@@ -274,6 +285,7 @@ fn camel_to_snake(s: &str) -> String {
 /// 正規化済みパラメータ名に対応する `ChatOptions` のフィールドを落とす。
 /// 実際に値が入っていて外せた場合のみ `true` を返す(既に空なら再送しても
 /// 同じ 400 が繰り返されるだけなので、無限リトライを避けるため `false`)。
+#[instrument]
 fn strip_unsupported_option(options: &mut ChatOptions, param: &str) -> bool {
     match param {
         "reasoning_effort" => options.reasoning_effort.take().is_some(),
@@ -303,6 +315,7 @@ pub enum Content {
 }
 
 impl Display for Content {
+    #[instrument(skip(self, f))]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Content::Text(s) => write!(f, "{}", s),
@@ -425,6 +438,7 @@ pub struct LlmClientBuilder {
 impl LlmClientBuilder {
     /// LLMビルダーを構築する
     #[allow(unused)]
+    #[instrument]
     fn new(_provider: Provider) -> LlmClientBuilder {
         LlmClientBuilder {
             provider: _provider.clone(),
@@ -438,6 +452,7 @@ impl LlmClientBuilder {
     }
 
     #[allow(unused)]
+    #[instrument]
     pub fn from_name(name: &str) -> Self {
         LlmClientBuilder {
             provider: Provider::from_name(name).unwrap(),
@@ -450,6 +465,7 @@ impl LlmClientBuilder {
         }
     }
 
+    #[instrument]
     pub fn from_value(value: &serde_json::Value) -> Self {
         debug!("value: {:?}", value);
         let provider = Provider::from_str(value["provider"].as_str().unwrap()).unwrap();
@@ -482,18 +498,21 @@ impl LlmClientBuilder {
     }
 
     #[allow(dead_code)]
+    #[instrument]
     pub fn model(&mut self, model: &str) -> &Self {
         self.model = Some(model.to_string());
         self
     }
 
     #[allow(dead_code)]
+    #[instrument]
     pub fn url(&mut self, url: &str) -> &Self {
         self.url = Some(url.to_string());
         self
     }
 
     #[allow(unused)]
+    #[instrument]
     pub fn add_tool(mut self, tool: Box<dyn LlmTool>) -> Self {
         self.tools.push(tool);
         debug!("Tool added to builder {:?}", self.tools);
@@ -501,6 +520,7 @@ impl LlmClientBuilder {
         self
     }
 
+    #[instrument]
     pub fn sys_prompt(mut self, prompt: Option<String>) -> Self {
         if let Some(p) = prompt {
             self.sys_prompt = p;
@@ -509,6 +529,7 @@ impl LlmClientBuilder {
         self
     }
 
+    #[instrument]
     pub fn build(self) -> Box<dyn LlmInterface> {
         let mut u_from_prov = None;
         let (auth, kind, mdl_name) = match &self.provider {
@@ -653,20 +674,24 @@ pub struct LlmClient {
 
 #[async_trait]
 impl LlmInterface for LlmClient {
+    #[instrument]
     async fn chat(&mut self) -> Result<String, LlmError> {
         let model = self.model.clone();
         self.with_model(model.as_str()).await
     }
 
+    #[instrument]
     fn capabilities(&self) -> ModelCapability {
         self.capabilities
     }
 
+    #[instrument]
     fn add_tool(&mut self, tool: Box<dyn LlmTool>) {
         self.tools.insert(tool.as_ref().name().to_string(), tool);
         debug!("Tool added to backend {:?}", self.tools.keys());
     }
 
+    #[instrument]
     async fn with_model(&mut self, model: &str) -> Result<String, LlmError> {
         // TODO AGENTS.mdをfrom_system()で投入
         // 一時プロンプトはここで消費する(take)。この時点で chat_req へ焼き込まれるため、
@@ -796,6 +821,7 @@ impl LlmInterface for LlmClient {
         Ok(content)
     }
 
+    #[instrument]
     async fn respond_tool(&self, tool_calls: &[ToolCall]) -> Result<ChatRequest, LlmError> {
         let mut result_tc = vec![];
         let mut result_tr = vec![];
@@ -852,10 +878,12 @@ impl LlmInterface for LlmClient {
         Ok(chat_req)
     }
 
+    #[instrument]
     fn add(&mut self, prompt: Content) {
         self.prompts.push(prompt);
     }
 
+    #[instrument]
     fn build_content(&self) -> String {
         self.fetch_all()
             .iter()
@@ -865,10 +893,12 @@ impl LlmInterface for LlmClient {
             .join("")
     }
 
+    #[instrument]
     fn get_model(&self) -> &str {
         &self.model
     }
 
+    #[instrument]
     fn cache(&mut self, prompt: Content) -> Result<String, LlmError> {
         match prompt {
             Content::Text(s) => {
@@ -886,22 +916,27 @@ impl LlmInterface for LlmClient {
         }
     }
 
+    #[instrument]
     fn fetch(&self, hash: &str) -> Option<&Content> {
         self.cache.get(hash)
     }
 
+    #[instrument]
     fn fetch_all(&self) -> Vec<Content> {
         self.cache.values().cloned().collect()
     }
 
+    #[instrument]
     fn clear(&mut self) {
         self.cache.clear();
     }
 
+    #[instrument]
     fn remove(&mut self, hash: String) {
         self.cache.remove(&hash);
     }
 
+    #[instrument]
     async fn get_service_target(&self) -> String {
         let st = self
             .inner_client
@@ -912,18 +947,22 @@ impl LlmInterface for LlmClient {
         format!("{:?} {:?}", st.model, st.endpoint)
     }
 
+    #[instrument]
     fn max_tokens(&mut self, n: u32) {
         self.options = std::mem::take(&mut self.options).with_max_tokens(n);
     }
 
+    #[instrument]
     fn temperature(&mut self, v: f64) {
         self.options = std::mem::take(&mut self.options).with_temperature(v);
     }
 
+    #[instrument]
     fn top_p(&mut self, v: f64) {
         self.options = std::mem::take(&mut self.options).with_top_p(v);
     }
 
+    #[instrument]
     fn stop_sequences(&mut self, seqs: Vec<String>) {
         if !self.capabilities.contains(ModelCapability::STOP_SEQUENCES) {
             debug!(
@@ -935,10 +974,12 @@ impl LlmInterface for LlmClient {
         self.options = std::mem::take(&mut self.options).with_stop_sequences(seqs);
     }
 
+    #[instrument]
     fn seed(&mut self, v: u64) {
         self.options = std::mem::take(&mut self.options).with_seed(v);
     }
 
+    #[instrument]
     fn reasoning_effort(&mut self, effort: ReasoningEffort) {
         if !self
             .capabilities
@@ -953,6 +994,7 @@ impl LlmInterface for LlmClient {
         self.options = std::mem::take(&mut self.options).with_reasoning_effort(effort);
     }
 
+    #[instrument]
     fn reasoning_level(&mut self, level: f64) {
         if !self
             .capabilities
@@ -970,18 +1012,22 @@ impl LlmInterface for LlmClient {
         self.options = std::mem::take(&mut self.options).with_reasoning_effort(effort);
     }
 
+    #[instrument]
     fn reset_options(&mut self) {
         self.options = ChatOptions::default();
     }
 
+    #[instrument]
     fn response_format(&mut self, fmt: ChatResponseFormat) {
         self.options = std::mem::take(&mut self.options).with_response_format(fmt);
     }
 
+    #[instrument]
     fn service_tier(&mut self, tier: ServiceTier) {
         self.options = std::mem::take(&mut self.options).with_service_tier(tier);
     }
 
+    #[instrument]
     fn verbosity(&mut self, v: Verbosity) {
         self.options = std::mem::take(&mut self.options).with_verbosity(v);
     }
@@ -993,6 +1039,7 @@ impl LlmInterface for LlmClient {
 /// システムプロンプトの差し替えだけが違う複数の用途(LSP の執筆支援=`system.md`、
 /// ACP のチャット=`system_chat.md`)があるため、アセット名を引数に取る。
 /// アセットが見つからない場合はシステムプロンプト無しで動かし、警告だけ出す。
+#[instrument]
 pub(crate) fn build_client(
     cfg: &serde_json::Value,
     sys_prompt_name: &str,
@@ -1018,6 +1065,7 @@ pub(crate) fn build_client(
 ///
 /// LSP ハンドラ(`Backend::use_llm_with_option`)と ACP エージェント(`crate::acp`)の
 /// 双方から使うため、`Backend` に依存しない自由関数としてここに置いている。
+#[instrument(skip(proc))]
 pub(crate) async fn use_llm_with_option<F>(
     slot: &tokio::sync::Mutex<Option<Box<dyn LlmInterface>>>,
     option: HashMap<String, String>,

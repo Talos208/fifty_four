@@ -157,6 +157,14 @@ Read, Write, Edit, Glob, Grep, WebSearch, WebFetch
 }
 ```
 
+> ⚠️ **`command` は必ず絶対パスで指定する。** `fifty_four_lsp`(拡張子・パス無しの裸の名前)
+> を指定すると、シェルなら `PATH` で解決できる場合でも Zed の `agent_servers` はプロセスを
+> 起動できず、Zed 上には "Server exited with status exit code: 1" とだけ表示される
+> (ACP側は `main()` にすら到達しないため、stderr・ログとも一切出ない)。実行ファイルを
+> 直接叩けば動く場合でも、Zed 経由だと同じ理由で失敗しうる。特に別マシン(ARM64機等)へ
+> ビルド成果物をコピーして使う場合、コピー先で `where`/`Get-Command`(PowerShell)が
+> 見つけられないパスを `command` に書いていないか確認すること。
+
 前提として `claude` CLI がインストールされ、ログイン済みであること
 （`anthropic-agent-sdk` は `which claude` で探し、見つからなければ
 `~/.npm-global/bin`, `/usr/local/bin`, `~/.local/bin` 等も探す）。
@@ -280,12 +288,17 @@ chat digest updated (N chars)
 
 **`RUST_LOG` を渡す手段が無い場合(Zed から `agent_servers` 経由で起動している等)。**
 Zed はこのバイナリを直接起動するため、ターミナルから環境変数を渡す方法が事実上無い。
-そのため `--acp` 起動時、`RUST_LOG` が未設定なら ACP 関連モジュール
-(`acp`/`acp_config`/`writing_agent`/`session_log`)に限って自動的に debug 相当になる
-(`lsp/src/main.rs` の `default_acp_log_level()`)。上記のようなログは特に何も設定しなくても
-Zed のログ(`~/.local/share/zed/logs/Zed.log` 等、stderr を拾う経路)に出るはず。
-明示的に別のレベルを見たい場合は `agent_servers` の設定に `env` で `RUST_LOG` を書けば
-そちらが優先される:
+そのため `--acp` 起動時、`RUST_LOG` にこの crate 名(`fifty_four_lsp`)への言及が
+含まれていなければ、ACP 関連モジュール(`acp`/`acp_config`/`writing_agent`/
+`session_log`)に限って自動的に debug 相当になる(`lsp/src/main.rs` の
+`default_acp_log_level()`)。「未設定なら」ではなく「crate 名を含まなければ」なのは、
+Zed 自身が起動時点で `RUST_LOG`(例: `RUST_LOG=lsp=trace` のような Zed 自身の
+デバッグ用の値)をすでに設定しており、それが子プロセスへそのまま継承されて
+このバイナリのログを黙って全部消してしまうケースがあったため
+(詳細は [observability.md](observability.md) 参照)。上記のようなログは
+特に何も設定しなくても Zed のログ(`~/.local/share/zed/logs/Zed.log` 等、stderr を
+拾う経路)に出るはず。明示的に別のレベルを見たい場合は `agent_servers` の設定に
+`env` で `fifty_four_lsp=...` を含む `RUST_LOG` を書けばそちらが優先される:
 
 ```json
 {
