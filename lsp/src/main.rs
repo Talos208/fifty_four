@@ -22,6 +22,7 @@ mod frontmatter;
 mod highlight;
 mod llm;
 mod logging;
+mod plot;
 mod progress;
 mod references;
 #[cfg(debug_assertions)]

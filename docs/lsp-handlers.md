@@ -44,6 +44,7 @@ flowchart LR
 | `hover` | カーソル位置のキャラ名(表示名・別名とも)に対し、そのキャラの全セクションを Markdown で表示 |
 | `goto_definition` | カーソル位置のキャラ名(表示名・別名とも)から `characters.md` / `characters/*.md` の該当キャラ見出しへジャンプ。同名キャラが複数ファイルにあれば候補一覧を返す。判定基準は `hover` と共通(ハイライトされない語では発動しない)。**カーソルが既に定義位置(キャラ見出し行)にある場合は `references` にフォールバックする**(rust-analyzer / IntelliJ 等と同じ振る舞い) |
 | `references` | カーソル位置のキャラ名(表示名・別名とも)の登場箇所を、ワークスペース直下(非再帰)の本文 `.txt` から横断検索して返す(Find All References)。判定基準は `hover`/`goto_definition` と共通。`characters.md` 等の設定・メモ類はスキャンしない |
+| `inlay_hint` | `plot.md` の各 `# 章名` 見出し行末に「現文字数/予定文字数」を表示する。`plot.md` 以外のドキュメントには何も返さない。現文字数は対応する `<章名>.txt` から算出(開いていればバッファ優先、無ければディスク)。front matter に `episodes`/`average_chars` があれば予定文字数も表示し、front matter を閉じる行に作品全体の合計進捗も出す |
 | `completion` | カーソル文脈に応じた LLM 補完候補生成。`code_action` が置いた保留中の書き換え候補があれば、それを優先して返す(下記参照) |
 | `code_action` | 選択範囲(無ければカーソルの文)を LLM で書き換える。対象に「※」があればそこに当てはまる語、無ければ表現改善の候補を複数提示する。ユーザーが明示的に要求した場合(`trigger_kind == INVOKED`、または未送信で選択範囲あり)のみ LLM を呼ぶ(電球表示のための自動呼び出しでは呼ばない)。`CodeAction.title` は1行の短い文字列しか持てず(LSP 仕様に documentation 相当のフィールドが無い)長文・改行を表示できないため、候補そのものはメニューに出さず `Ok(None)` を返す。生成した候補は uri ごとに保留し(`Backend::pending_rewrite`)、`window/showMessage` でユーザーに通知する |
 | `did_change_configuration` | ランタイム設定変更 |
@@ -64,6 +65,52 @@ flowchart LR
 | `hoverProvider` | 有効 |
 | `definitionProvider` | 有効。キャラ名(表示名・別名とも)から `characters.md` の該当見出しへジャンプ |
 | `referencesProvider` | 有効。キャラ名(表示名・別名とも)の登場箇所をワークスペース直下の本文 `.txt` から横断検索 |
+| `inlayHintProvider` | 有効。`plot.md` の章見出しに現文字数/予定文字数を表示(下記参照) |
+
+## plot.md の front matter と inlay hint
+
+`plot.md` は先頭に YAML front matter を置ける(`gray_matter` でパース。`lsp/src/plot.rs`)。
+
+```markdown
+---
+episodes: 54       # 話数(全体の目標算出に使う。episodes × average_chars)
+average_chars: 4000 # 1話あたりの平均(予定)文字数
+---
+
+# 第1章
+...
+```
+
+`plot.md` を開くと、各 `# 章名` 見出し行末に inlay hint で `現文字数/予定文字数` が表示される
+(`average_chars` が無ければ現文字数のみ)。現文字数は「ワークスペース直下の `<章名>.txt`」の
+規約に従って算出する。対応する `.txt` が開いていればそのバッファ(編集中の内容)を優先し、
+無ければディスクから読む。存在しなければ `0`。`.txt` の保存・外部変更時は
+`workspace/inlayHint/refresh` でクライアントへ再取得を促す。
+
+### 前提設定(Zed)
+
+上記が動くには、サーバ側の capability 宣言(`inlayHintProvider`)に加えて Zed 側の設定が2つ要る。
+どちらか一方でも欠けると `textDocument/inlayHint` 自体がサーバへ飛ばない。
+
+1. **`plot.md` を `FiftyFour` 言語として認識させる。**
+   `extension/languages/fiftyfour/config.toml` の `path_suffixes` に `"plot.md"` が含まれている
+   こと(`["txt", "plot.md", "characters.md"]`)。この LSP はバッファの言語が `FiftyFour` の場合
+   にしかアタッチされないため、ここに無いと `initialize` すら送られない
+   (`.txt` だけしか登録されていなかった時期は、まさにこれが原因で `plot.md` 側の
+   `inlay_hint` ハンドラが一度も呼ばれなかった)。設定ファイルの変更だけなので Rust 側の
+   再ビルドは不要。Zed で `zed: reload extensions` するか Zed を再起動して反映する。
+2. **Zed の `inlay_hints.enabled` を有効にする。** Zed は既定で inlay hint 表示自体が
+   オフなので、`settings.json` に以下を追加する(`FiftyFour` 言語限定でもよい):
+   ```json
+   {
+     "inlay_hints": { "enabled": true }
+   }
+   ```
+   これは LSP の `initializationOptions`(`lsp.fifty-four.*`)とは別物で、Zed 側の
+   エディタ設定(トップレベルまたは `languages.FiftyFour.*`)に書く。
+
+`episodes` と `average_chars` が両方あれば、front matter を閉じる行にも
+`合計 現文字数合計/(episodes × average_chars)` の hint を表示する。
 
 ## 初期化オプション
 

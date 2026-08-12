@@ -71,6 +71,7 @@ link:docs/acp-agent.md[docs/acp-agent.md] を参照してください。
 * シャットダウン対応（`shutdown`）
 * ジャンプ機能（`textDocument/definition`。キャラ名から `characters.md` の該当見出しへ移動。別名も対応。定義位置で呼ぶと参照検索にフォールバック）
 * 参照検索機能（`textDocument/references`。キャラ名の登場箇所をワークスペース直下の本文から横断検索。別名も対応）
+* 章ごとの文字数表示（`textDocument/inlayHint`。`plot.md` の各 `#` 見出し行末に現文字数/予定文字数を表示。予定文字数は front matter の `average_chars`）
 
 === 今後の拡張予定
 

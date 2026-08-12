@@ -85,7 +85,6 @@ pub fn utf16_to_byte_offset(text: &str, utf16_offset: usize) -> usize {
 ///
 /// バイトオフセットから LSP の character 値(positionEncoding=utf-16)を
 /// 算出する際、`&text[..byte_offset]` を渡して使う。
-#[instrument]
 pub fn utf16_len(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
 }

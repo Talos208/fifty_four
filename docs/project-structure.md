@@ -36,7 +36,9 @@ fifty_four/
         ├── cursor_context.rs  # 補完モード分類
         ├── llm.rs          # LlmInterface トレイト / LlmClient 実装 / LlmClientBuilder
         ├── character_updater.rs  # バックグラウンド更新タスク
-        ├── tools.rs        # CharacterInfoTool / PlotInfoTool (LlmTool実装) / parse_plot_md
+        ├── tools.rs        # CharacterInfoTool / PlotInfoTool (LlmTool実装)。parse_plot_md は plot.rs に委譲
+        ├── plot.rs         # plot.md 解析(front matter + `# 章名` 見出し区切り)。PlotInfoTool と inlay hint ハンドラが共有
+        ├── frontmatter.rs  # YAML frontmatter パース(gray_matter)。プロンプトテンプレート・plot.md の両方から使う
         ├── types.rs        # LineData, CachedLinderaToken, CursorContext
         └── logging.rs      # OpenTelemetry / tracing 初期化(現状 main() からは未呼び出し。実際は env_logger)
 ```

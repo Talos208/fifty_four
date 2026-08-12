@@ -256,6 +256,9 @@ impl LanguageServer for Backend {
             // キャラ名(表示名・別名とも)の登場箇所をワークスペース直下の本文 `.txt` から
             // 横断検索する(Find All References)。
             references_provider: Some(OneOf::Left(true)),
+            // plot.md の各 `# 章名` 見出し行末に「現文字数/予定文字数」を表示する。
+            // plot.md 以外のドキュメントには何も返さない(inlay_hint ハンドラ側でガード)。
+            inlay_hint_provider: Some(OneOf::Left(true)),
             semantic_tokens_provider: Some(
                 SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
                     SemanticTokensRegistrationOptions {
@@ -420,6 +423,14 @@ impl LanguageServer for Backend {
     #[instrument(skip(self))]
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri.as_str();
+
+        // plot.md の inlay hint(各章の現文字数)は対応する .txt の内容に依存する。
+        // plot.md 自身が開いていなければクライアントは再取得しないので、保存のたびに
+        // 明示的に再取得を促す(plot.md 側の編集による更新はクライアントが自前で行う)。
+        if uri.ends_with(".txt") {
+            let _ = self.client.inlay_hint_refresh().await;
+        }
+
         if !self.is_character_file(uri) {
             return;
         }
@@ -452,6 +463,9 @@ impl LanguageServer for Backend {
     #[instrument(skip(self))]
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         let mut any_changed = false;
+        // plot.md の inlay hint(各章の現文字数)は対応する .txt の内容に依存するため、
+        // エディタ外での .txt 変更(削除・作成・他プログラムによる書き換え)も追随させる。
+        let mut any_txt_changed = false;
         for change in params.changes {
             let Some(path) = change.uri.to_file_path().map(|p| p.into_owned()) else {
                 warn!(
@@ -460,6 +474,14 @@ impl LanguageServer for Backend {
                 );
                 continue;
             };
+            if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("txt"))
+                .unwrap_or(false)
+            {
+                any_txt_changed = true;
+            }
             let Some(ws) = self.resolve_workspace(&change.uri).await else {
                 warn!(
                     "did_change_watched_files: 所属ワークスペースが特定できない: {:?}",
@@ -498,6 +520,9 @@ impl LanguageServer for Backend {
         }
         if any_changed {
             self.refresh_highlight_names().await;
+        }
+        if any_txt_changed {
+            let _ = self.client.inlay_hint_refresh().await;
         }
     }
 
@@ -725,7 +750,8 @@ impl LanguageServer for Backend {
         // カーソルが既に定義位置(キャラ見出し行)にある場合、定義へ飛んでも動かない。
         // 代わりに参照一覧を返す(rust-analyzer / IntelliJ 等と同じ振る舞い)。本文中で
         // 呼んだ場合はこの条件に該当しないため、従来通り定義へジャンプする。
-        let cur_path: Option<PathBuf> = pos.text_document.uri.to_file_path().map(|p| p.into_owned());
+        let cur_path: Option<PathBuf> =
+            pos.text_document.uri.to_file_path().map(|p| p.into_owned());
         let already_at_definition = cur_path.is_some()
             && locations.iter().any(|loc| {
                 loc.range.start.line == line_no as u32
@@ -803,6 +829,135 @@ impl LanguageServer for Backend {
             Ok(None)
         } else {
             Ok(Some(locations))
+        }
+    }
+
+    /// plot.md を開いたとき、各 `# 章名` 見出し行末に「現文字数/予定文字数」を表示する。
+    /// plot.md 以外のドキュメントには何も返さない。
+    ///
+    /// 章の現文字数は、対応する `<章名>.txt` が開いていればそのバッファ(編集中の内容)を
+    /// 優先し、無ければディスクから読む(`collect_references` と同じ方針。
+    /// `open_txt_buffers` を共有している)。front matter に `episodes`/`average_chars` が
+    /// 両方あれば、front matter を閉じる行にも作品全体の合計進捗
+    /// (現文字数合計/`episodes * average_chars`)を表示する。
+    #[instrument(skip(self))]
+    async fn inlay_hint(
+        &self,
+        params: InlayHintParams,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<Vec<InlayHint>>> {
+        let uri = &params.text_document.uri;
+        let is_plot_md = uri
+            .to_file_path()
+            .and_then(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("plot.md"))
+            })
+            .unwrap_or(false);
+        if !is_plot_md {
+            return Ok(None);
+        }
+
+        // inlay hint は開いているドキュメントにしか来ないため、バッファから全文を復元する。
+        let Some(lines) = self.text.get(uri.as_str()) else {
+            return Ok(None);
+        };
+        let content = lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        drop(lines);
+
+        let Some(ws) = self.resolve_workspace(uri).await else {
+            return Ok(None);
+        };
+
+        let plot = crate::plot::parse_plot(&content);
+
+        // 合計進捗の hint を出すべきか(front matter が揃っていて、かつその行が
+        // ビューポート内にある場合のみ)。これが false なら、範囲外の章の文字数を
+        // わざわざディスクから読みには行かない。
+        let want_total = match (
+            plot.front_matter_end_line,
+            plot.meta.episodes,
+            plot.meta.average_chars,
+        ) {
+            (Some(fm), Some(_), Some(_)) => Self::line_in_range(fm, &params.range),
+            _ => false,
+        };
+
+        let open_buffers = self.open_txt_buffers();
+        let mut hints = Vec::new();
+        let mut total_chars = 0usize;
+
+        for chapter in &plot.chapters {
+            let in_range = Self::line_in_range(chapter.heading_line, &params.range);
+            if !in_range && !want_total {
+                continue;
+            }
+
+            let path = ws.join(format!("{}.txt", chapter.name));
+            let chars = if let Some(c) = open_buffers.get(&path) {
+                crate::plot::count_chars(c)
+            } else if let Ok(c) = tokio::fs::read_to_string(&path).await {
+                crate::plot::count_chars(&c)
+            } else {
+                0
+            };
+            if want_total {
+                total_chars += chars;
+            }
+            if !in_range {
+                continue;
+            }
+
+            let Some(character) = self.line_utf16_len(uri.as_str(), chapter.heading_line) else {
+                continue;
+            };
+            let label = match plot.meta.average_chars {
+                Some(target) => format!("{}/{}", chars, target),
+                None => chars.to_string(),
+            };
+            hints.push(InlayHint {
+                position: Position {
+                    line: chapter.heading_line as u32,
+                    character,
+                },
+                label: InlayHintLabel::String(label),
+                kind: None,
+                text_edits: None,
+                tooltip: Some(InlayHintTooltip::String(format!("{}.txt", chapter.name))),
+                padding_left: Some(true),
+                padding_right: None,
+                data: None,
+            });
+        }
+
+        if want_total
+            && let Some(fm_line) = plot.front_matter_end_line
+            && let (Some(episodes), Some(avg)) = (plot.meta.episodes, plot.meta.average_chars)
+            && let Some(character) = self.line_utf16_len(uri.as_str(), fm_line)
+        {
+            hints.push(InlayHint {
+                position: Position {
+                    line: fm_line as u32,
+                    character,
+                },
+                label: InlayHintLabel::String(format!("合計 {}/{}", total_chars, episodes * avg)),
+                kind: None,
+                text_edits: None,
+                tooltip: None,
+                padding_left: Some(true),
+                padding_right: None,
+                data: None,
+            });
+        }
+
+        if hints.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(hints))
         }
     }
 
@@ -962,10 +1117,14 @@ impl LanguageServer for Backend {
         // 本文を別メッセージとして追加するフォールバックを使う。
         let text_body = before.join("");
         let chat = self.chat_digest(workspace);
+        let progress_hint = self
+            .progress_hint_for_cursor(uri, line_no, offset, workspace)
+            .await;
         let vars = HashMap::from([
             ("CHAPTER", chapter),
             ("TEXT", text_body.as_str()),
             ("CHAT", chat.as_str()),
+            ("PROGRESS", progress_hint.as_str()),
         ]);
         let prompt = crate::frontmatter::expand(&prompt, &vars);
 
@@ -1234,11 +1393,20 @@ impl LanguageServer for Backend {
 
         let before_text = before.join("");
         let chat = self.chat_digest(workspace);
+        let progress_hint = self
+            .progress_hint_for_cursor(
+                uri,
+                target_range.start.line as usize,
+                target_range.start.character as usize,
+                workspace,
+            )
+            .await;
         let vars = HashMap::from([
             ("CHAPTER", chapter),
             ("TEXT", before_text.as_str()),
             ("TARGET", target_text.as_str()),
             ("CHAT", chat.as_str()),
+            ("PROGRESS", progress_hint.as_str()),
         ]);
         let prompt = crate::frontmatter::expand(&prompt, &vars);
 
@@ -1448,11 +1616,62 @@ impl Backend {
         match crate::chat_context::read_digest(workspace, self.chat_context_max_chars.load(Relaxed))
         {
             Some(digest) => format!(
-                "# 作者がいま書こうとしていること\n\n{}\n\nこれは作者との会話から要約したもので、本文ではない。続きを考える手掛かりとしてのみ使い、この文面をそのまま候補に含めてはならない。\n",
+                "# 作者は次のようなことを相談している。続きを考える参考にしてもよい。\n\n{}\n\nこの文面をそのまま候補に含めてはならない。\n",
                 digest
             ),
             None => String::new(),
         }
+    }
+
+    /// カーソル位置が章の何割地点かを、プロンプトの `{{PROGRESS}}` 用の文として返す。
+    ///
+    /// 分子はバッファ先頭からカーソル位置までの文字数、分母は `plot.md` の front matter
+    /// にある `average_chars`(1話あたりの予定文字数)。`plot.md` が無い・
+    /// `average_chars` 未設定・対象バッファが無いなど、進捗を算出できない場合は
+    /// 空文字列を返す(`frontmatter::expand` は未知のプレースホルダを `{{NAME}}` の
+    /// ままテンプレートに残してしまうため、呼び出し側は必ずこの結果を vars に渡すこと)。
+    #[instrument(skip(self))]
+    async fn progress_hint_for_cursor(
+        &self,
+        uri: &str,
+        line_no: usize,
+        utf16_offset: usize,
+        workspace: &Path,
+    ) -> String {
+        let plot_path = workspace.join("plot.md");
+        let Ok(content) = tokio::fs::read_to_string(&plot_path).await else {
+            return String::new();
+        };
+        let plot = crate::plot::parse_plot(&content);
+        let Some(average_chars) = plot.meta.average_chars else {
+            return String::new();
+        };
+
+        let Some(lines) = self.text.get(uri) else {
+            return String::new();
+        };
+        let chars_before_cursor = Self::chars_before_cursor(&lines, line_no, utf16_offset);
+        drop(lines);
+
+        crate::plot::progress_hint(chars_before_cursor, average_chars)
+    }
+
+    /// バッファ先頭からカーソル位置までの文字数(改行を除く。`plot::count_chars` と同一基準)。
+    ///
+    /// `cursor_context::before_sentences_upto` の戻り値(直前 N 文だけの窓)とは別物で、
+    /// あちらは章の先頭からの累積文字数を表さないため進捗率の分子には使えない。
+    #[instrument(skip(lines))]
+    fn chars_before_cursor(lines: &[LineData], line_no: usize, utf16_offset: usize) -> usize {
+        let mut total: usize = lines
+            .iter()
+            .take(line_no)
+            .map(|l| crate::plot::count_chars(&l.text))
+            .sum();
+        if let Some(line) = lines.get(line_no) {
+            let byte_offset = crate::types::utf16_to_byte_offset(&line.text, utf16_offset);
+            total += crate::plot::count_chars(&line.text[..byte_offset]);
+        }
+        total
     }
 
     /// 補完用 LLM(`llm.ondemand`)を frontmatter のオプション付きで使う。
@@ -1552,19 +1771,14 @@ impl Backend {
             .or_else(|| roots.first().cloned())
     }
 
-    /// `names` に含まれる名前の登場箇所を、ワークスペース直下(非再帰)の本文 `.txt` から
-    /// 収集する(`references` ハンドラ、および `goto_definition` の定義位置フォールバックの
-    /// 共通処理)。開いているバッファがあればその内容(編集中の内容)を優先し、
-    /// 無ければディスクから読む。`characters.md` 等の設定・メモ類はスキャンしない
-    /// (`references::discover_reference_files` が `.txt` のみを列挙するため)。
-    #[instrument(skip(self, names))]
-    async fn collect_references(&self, ws: &Path, names: &HashSet<String>) -> Vec<Location> {
-        if names.is_empty() {
-            return Vec::new();
-        }
-
-        // 開いている .txt バッファを パス->内容 のマップとして集める。
-        // DashMap の走査は同期的に終える(await をまたがせない)。
+    /// 開いている `.txt` バッファを パス→内容 のマップとして集める
+    /// (DashMap の走査は同期的に終える。await をまたがせない)。
+    ///
+    /// 「開いていればバッファ優先(編集中の内容)、無ければディスクから読む」という方針を
+    /// `collect_references`(Find All References)と `inlay_hint`(plot.md の文字数表示)が
+    /// 共有するため、その前段だけを切り出したもの。
+    #[instrument(skip(self))]
+    fn open_txt_buffers(&self) -> HashMap<PathBuf, String> {
         let mut open_buffers: HashMap<PathBuf, String> = HashMap::new();
         for entry in self.text.iter() {
             let Ok(uri) = Uri::from_str(entry.key()) else {
@@ -1589,6 +1803,38 @@ impl Backend {
                 .join("\n");
             open_buffers.insert(path, content);
         }
+        open_buffers
+    }
+
+    /// `line_no` が inlay hint リクエストの `range`(ビューポート)に含まれるか。
+    /// 行単位の粗い判定で十分(ドキュメント全体を毎回返さないためのフィルタ)。
+    // #[instrument]
+    fn line_in_range(line_no: usize, range: &Range) -> bool {
+        let line_no = line_no as u32;
+        line_no >= range.start.line && line_no <= range.end.line
+    }
+
+    /// `uri` の `line_no` 行目の UTF-16 長を返す(inlay hint の位置=行末を計算するため)。
+    /// バッファが無い・行が無ければ `None`。
+    // #[instrument(skip(self))]
+    fn line_utf16_len(&self, uri: &str, line_no: usize) -> Option<u32> {
+        let lines = self.text.get(uri)?;
+        let text = lines.get(line_no)?.text.as_str();
+        Some(crate::types::utf16_len(text) as u32)
+    }
+
+    /// `names` に含まれる名前の登場箇所を、ワークスペース直下(非再帰)の本文 `.txt` から
+    /// 収集する(`references` ハンドラ、および `goto_definition` の定義位置フォールバックの
+    /// 共通処理)。開いているバッファがあればその内容(編集中の内容)を優先し、
+    /// 無ければディスクから読む。`characters.md` 等の設定・メモ類はスキャンしない
+    /// (`references::discover_reference_files` が `.txt` のみを列挙するため)。
+    #[instrument(skip(self, names))]
+    async fn collect_references(&self, ws: &Path, names: &HashSet<String>) -> Vec<Location> {
+        if names.is_empty() {
+            return Vec::new();
+        }
+
+        let open_buffers = self.open_txt_buffers();
 
         let highlighter = &self.highlighter;
         let mut hits: Vec<(PathBuf, Range)> = Vec::new();

@@ -10,18 +10,31 @@ use tracing::instrument;
 /// アセットからプロンプトを読み込み、YAML frontmatter を本文と分離して返す。
 ///
 /// - アセットが見つからない場合は `None`(欠如時の扱いは呼び出し側に委ねる)。
-/// - frontmatter が無い・パースに失敗した場合は本文をそのまま・空の data を返す。
+/// - frontmatter が無い・パースに失敗した場合は本文をそのまま・空の data を返す
+///   (詳細は [`parse_text`] 参照)。
 #[instrument]
 pub(crate) fn load_prompt(name: &str) -> Option<(String, HashMap<String, String>)> {
     let template = crate::assets::load(name)?;
+    Some(parse_text(&template))
+}
+
+/// 任意のテキストから YAML frontmatter を本文と分離して返す。
+///
+/// `load_prompt` の本体(埋め込みアセット専用)から、テキスト入力を受ける形に
+/// 切り出したもの。`plot.rs` が plot.md(ワークスペース上のファイル、アセットではない)
+/// を解析する際にも使う。
+///
+/// - frontmatter が無い・パースに失敗した場合は本文をそのまま・空の data を返す。
+#[instrument]
+pub(crate) fn parse_text(text: &str) -> (String, HashMap<String, String>) {
     let matter = gray_matter::Matter::<gray_matter::engine::YAML>::new();
     // いったん Pod として受け、スカラー値を文字列へ正規化する。
     // HashMap<String, String> へ直接デシリアライズすると、frontmatter に数値や真偽値が
     // 1つでもあると(例: `max_tokens: 4096`)全体のパースが失敗し、`schema` 等も巻き添えで
     // 失われてしまうため(option は use_llm_with_option 側で文字列から parse し直す前提)。
-    let parsed = match matter.parse::<gray_matter::Pod>(&template) {
+    let parsed = match matter.parse::<gray_matter::Pod>(text) {
         Ok(p) => p,
-        Err(_) => return Some((template, HashMap::new())),
+        Err(_) => return (text.to_string(), HashMap::new()),
     };
     let body = parsed.content;
     let mut data = HashMap::new();
@@ -32,7 +45,7 @@ pub(crate) fn load_prompt(name: &str) -> Option<(String, HashMap<String, String>
             }
         }
     }
-    Some((body, data))
+    (body, data)
 }
 
 /// frontmatter の Pod を文字列へ正規化する。
@@ -279,7 +292,7 @@ mod tests {
     #[test]
     fn test_completion_prompts_have_no_unsupplied_placeholder() {
         // Backend::completion が渡す変数
-        const KEYS: &[&str] = &["CHAPTER", "TEXT", "CHAT"];
+        const KEYS: &[&str] = &["CHAPTER", "TEXT", "CHAT", "PROGRESS"];
         for name in [
             "prompt_completion.md",
             "prompt_completion_after_bracket.md",
@@ -295,7 +308,7 @@ mod tests {
     #[test]
     fn test_code_action_prompts_have_no_unsupplied_placeholder() {
         // Backend::code_action が渡す変数
-        const KEYS: &[&str] = &["CHAPTER", "TEXT", "TARGET", "CHAT"];
+        const KEYS: &[&str] = &["CHAPTER", "TEXT", "TARGET", "CHAT", "PROGRESS"];
         for name in ["prompt_fill_mark.md", "prompt_rephrase.md"] {
             assert_no_leftover_placeholder(name, KEYS);
         }

@@ -1,6 +1,6 @@
 name = "FiftyFour"
 # grammar = "plaintext"
-path_suffixes = ["txt"]
+path_suffixes = ["txt", "plot.md", "characters.md"]
 hard_tabs = false
 tab_size = 4
 auto_indent_on_paste = false

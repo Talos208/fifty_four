@@ -13,31 +13,18 @@ use tracing::instrument;
 /// plot.md の全文テキストを解析し、(章名, プロット本文) のリストを返す。
 /// `# 章名` (level-1 見出し) を章の区切りとし、本文は trim 済みで返す。
 /// level-2 以上の見出し・コード・その他コンテンツは本文として扱う。
+/// front matter(あれば)は章本文に含めない。
+///
+/// 実体は `crate::plot::parse_plot` に委譲する(front matter の行オフセットや
+/// メタ情報(episodes/average_chars)を必要とする inlay hint ハンドラと処理を共有するため)。
+/// この関数は `PlotInfoTool` 向けの単純化されたビュー。
 #[instrument]
 pub(crate) fn parse_plot_md(content: &str) -> Vec<(String, String)> {
-    let mut chapters: Vec<(String, String)> = Vec::new();
-    let mut current_chapter: Option<String> = None;
-    let mut current_body = String::new();
-
-    for line in content.lines() {
-        let trimmed = line.trim_end();
-        if trimmed.starts_with("# ") && !trimmed.starts_with("## ") {
-            if let Some(name) = current_chapter.take() {
-                chapters.push((name, current_body.trim().to_string()));
-                current_body.clear();
-            }
-            current_chapter = Some(trimmed[2..].trim().to_string());
-        } else if current_chapter.is_some() {
-            current_body.push_str(line);
-            current_body.push('\n');
-        }
-    }
-
-    if let Some(name) = current_chapter {
-        chapters.push((name, current_body.trim().to_string()));
-    }
-
-    chapters
+    crate::plot::parse_plot(content)
+        .chapters
+        .into_iter()
+        .map(|c| (c.name, c.body))
+        .collect()
 }
 
 // ─── CharacterInfoTool ───────────────────────────────────────────────────────
@@ -276,5 +263,16 @@ mod tests {
         let chapters = parse_plot_md(md);
         assert_eq!(chapters.len(), 1);
         assert_eq!(chapters[0].0, "第1章");
+    }
+
+    // front matter は「最初の見出し前」として無視されるため章本文に混入しない
+    // (詳細な行番号・メタ情報の検証は crate::plot のテストで行う)。
+    #[test]
+    fn test_parse_plot_md_front_matter_excluded_from_body() {
+        let md = "---\nepisodes: 3\naverage_chars: 4000\n---\n# 第1章\n内容。\n";
+        let chapters = parse_plot_md(md);
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].0, "第1章");
+        assert_eq!(chapters[0].1, "内容。");
     }
 }
