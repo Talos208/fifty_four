@@ -69,11 +69,12 @@ link:docs/acp-agent.md[docs/acp-agent.md] を参照してください。
 * サーバ初期化対応（`initialize`）
 * 初期化完了通知受信（`initialized`）
 * シャットダウン対応（`shutdown`）
+* ジャンプ機能（`textDocument/definition`。キャラ名から `characters.md` の該当見出しへ移動。別名も対応。定義位置で呼ぶと参照検索にフォールバック）
+* 参照検索機能（`textDocument/references`。キャラ名の登場箇所をワークスペース直下の本文から横断検索。別名も対応）
 
 === 今後の拡張予定
 
 * テキスト編集ドキュメント対応
 * ホバー情報の実装
 * コード補完機能
-* ジャンプ機能
 * その他LSP機能の実装

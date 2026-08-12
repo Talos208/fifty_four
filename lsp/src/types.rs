@@ -10,7 +10,6 @@ pub enum TokenStatus {
 }
 
 impl Debug for TokenStatus {
-    #[instrument(skip(self, f))]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TokenStatus::Normal => write!(f, "Normal"),

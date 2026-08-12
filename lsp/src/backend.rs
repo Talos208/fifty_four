@@ -18,7 +18,7 @@ use dashmap::mapref::one::RefMut;
 use dashmap::try_result::TryResult;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -250,6 +250,12 @@ impl LanguageServer for Backend {
                 },
             )),
             selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+            // キャラ名(表示名・別名とも)にカーソルを合わせて Go to Definition すると、
+            // characters.md / characters/*.md の該当キャラ見出しへジャンプする。
+            definition_provider: Some(OneOf::Left(true)),
+            // キャラ名(表示名・別名とも)の登場箇所をワークスペース直下の本文 `.txt` から
+            // 横断検索する(Find All References)。
+            references_provider: Some(OneOf::Left(true)),
             semantic_tokens_provider: Some(
                 SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
                     SemanticTokensRegistrationOptions {
@@ -656,6 +662,148 @@ impl LanguageServer for Backend {
             }),
             range: None,
         }))
+    }
+
+    /// キャラ名(表示名・別名とも)にカーソルを合わせた際、`characters.md`
+    /// (または`characters/*.md`)の該当キャラ見出しへジャンプする。
+    /// 対象語が未登録のキャラ名でなければ `Ok(None)` を返す(hoverと同一判定基準)。
+    #[instrument(skip(self))]
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<GotoDefinitionResponse>> {
+        let pos = params.text_document_position_params;
+        let uri = pos.text_document.uri.as_str();
+        let line_no = pos.position.line as usize;
+        let utf16_offset = pos.position.character as usize;
+
+        // hoverと同じくワークスペース外へのジャンプを避ける。
+        let Some(ws) = self.resolve_workspace(&pos.text_document.uri).await else {
+            return Ok(None);
+        };
+
+        let mut tmp: RefMut<_, _> = match self.text.try_get_mut(uri) {
+            TryResult::Locked | TryResult::Absent => return Ok(None),
+            TryResult::Present(t) => t,
+        };
+        if line_no >= tmp.len() {
+            return Ok(None);
+        }
+
+        let highlighter = &self.highlighter;
+        let hit = crate::cursor_context::token_at(
+            tmp.as_mut_slice(),
+            line_no,
+            utf16_offset,
+            &mut |line| {
+                line.tokens = highlighter.text_to_lindera_token(line.text.as_str());
+            },
+        );
+        let Some((_ix, tkn)) = hit else {
+            return Ok(None);
+        };
+        let surface = tmp[line_no].surface(&tkn).to_string();
+        drop(tmp);
+
+        let allowed = self.character_store.allowed_names(&ws);
+        // hoverと同一の判定基準(品詞=固有名詞,人名 かつ 許可名一致)を通ったトークンのみ
+        // ジャンプ対象にする。ハイライト・hover・definitionで対象語を一致させるため。
+        if !Highlighter::is_recognized_name(&tkn.details, &surface, &allowed) {
+            return Ok(None);
+        }
+
+        let locations: Vec<Location> = self
+            .character_store
+            .lookup_definitions(&ws, &surface)
+            .into_iter()
+            .filter_map(|(path, range)| {
+                let uri = Uri::from_file_path(&path)?;
+                Some(Location { uri, range })
+            })
+            .collect();
+
+        // カーソルが既に定義位置(キャラ見出し行)にある場合、定義へ飛んでも動かない。
+        // 代わりに参照一覧を返す(rust-analyzer / IntelliJ 等と同じ振る舞い)。本文中で
+        // 呼んだ場合はこの条件に該当しないため、従来通り定義へジャンプする。
+        let cur_path: Option<PathBuf> = pos.text_document.uri.to_file_path().map(|p| p.into_owned());
+        let already_at_definition = cur_path.is_some()
+            && locations.iter().any(|loc| {
+                loc.range.start.line == line_no as u32
+                    && loc.uri.to_file_path().map(|p| p.into_owned()) == cur_path
+            });
+        if already_at_definition {
+            let names = self.character_store.lookup_names(&ws, &surface);
+            let refs = self.collect_references(&ws, &names).await;
+            return Ok(if refs.is_empty() {
+                None
+            } else {
+                Some(GotoDefinitionResponse::Array(refs))
+            });
+        }
+
+        if locations.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(GotoDefinitionResponse::Array(locations)))
+        }
+    }
+
+    /// キャラ名(表示名・別名とも)にカーソルを合わせて Find All References すると、
+    /// ワークスペース直下(非再帰)の本文 `.txt` から登場箇所を横断検索して返す。
+    /// 対象語が未登録のキャラ名でなければ `Ok(None)` を返す(hover/goto_definitionと同一判定基準)。
+    #[instrument(skip(self))]
+    async fn references(
+        &self,
+        params: ReferenceParams,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<Vec<Location>>> {
+        let pos = params.text_document_position;
+        let uri = pos.text_document.uri.as_str();
+        let line_no = pos.position.line as usize;
+        let utf16_offset = pos.position.character as usize;
+
+        let Some(ws) = self.resolve_workspace(&pos.text_document.uri).await else {
+            return Ok(None);
+        };
+
+        let mut tmp: RefMut<_, _> = match self.text.try_get_mut(uri) {
+            TryResult::Locked | TryResult::Absent => return Ok(None),
+            TryResult::Present(t) => t,
+        };
+        if line_no >= tmp.len() {
+            return Ok(None);
+        }
+
+        let highlighter = &self.highlighter;
+        let hit = crate::cursor_context::token_at(
+            tmp.as_mut_slice(),
+            line_no,
+            utf16_offset,
+            &mut |line| {
+                line.tokens = highlighter.text_to_lindera_token(line.text.as_str());
+            },
+        );
+        let Some((_ix, tkn)) = hit else {
+            return Ok(None);
+        };
+        let surface = tmp[line_no].surface(&tkn).to_string();
+        drop(tmp);
+
+        let allowed = self.character_store.allowed_names(&ws);
+        if !Highlighter::is_recognized_name(&tkn.details, &surface, &allowed) {
+            return Ok(None);
+        }
+
+        // `include_declaration` は本来「定義位置(見出し行)を含めるか」を制御するが、
+        // 参照検索の対象は .txt のみで定義位置は .md 側にしか無いため、両者が重なることは
+        // そもそも無い。よってここでは特に分岐しない。
+        let names = self.character_store.lookup_names(&ws, &surface);
+        let locations = self.collect_references(&ws, &names).await;
+
+        if locations.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(locations))
+        }
     }
 
     #[instrument(skip(self))]
@@ -1402,6 +1550,80 @@ impl Backend {
         CharacterStore::resolve_workspace_for(&doc_path, &roots)
             .cloned()
             .or_else(|| roots.first().cloned())
+    }
+
+    /// `names` に含まれる名前の登場箇所を、ワークスペース直下(非再帰)の本文 `.txt` から
+    /// 収集する(`references` ハンドラ、および `goto_definition` の定義位置フォールバックの
+    /// 共通処理)。開いているバッファがあればその内容(編集中の内容)を優先し、
+    /// 無ければディスクから読む。`characters.md` 等の設定・メモ類はスキャンしない
+    /// (`references::discover_reference_files` が `.txt` のみを列挙するため)。
+    #[instrument(skip(self, names))]
+    async fn collect_references(&self, ws: &Path, names: &HashSet<String>) -> Vec<Location> {
+        if names.is_empty() {
+            return Vec::new();
+        }
+
+        // 開いている .txt バッファを パス->内容 のマップとして集める。
+        // DashMap の走査は同期的に終える(await をまたがせない)。
+        let mut open_buffers: HashMap<PathBuf, String> = HashMap::new();
+        for entry in self.text.iter() {
+            let Ok(uri) = Uri::from_str(entry.key()) else {
+                continue;
+            };
+            let Some(path) = uri.to_file_path().map(|p| p.into_owned()) else {
+                continue;
+            };
+            let is_txt = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("txt"))
+                .unwrap_or(false);
+            if !is_txt {
+                continue;
+            }
+            let content = entry
+                .value()
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            open_buffers.insert(path, content);
+        }
+
+        let highlighter = &self.highlighter;
+        let mut hits: Vec<(PathBuf, Range)> = Vec::new();
+        for path in crate::references::discover_reference_files(ws) {
+            let content = if let Some(c) = open_buffers.get(&path) {
+                c.clone()
+            } else {
+                match tokio::fs::read_to_string(&path).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        debug!("collect_references: failed to read {:?}: {}", path, e);
+                        continue;
+                    }
+                }
+            };
+            let ranges = crate::references::scan_text(&content, names, &mut |line: &str| {
+                highlighter.text_to_lindera_token(line)
+            });
+            for range in ranges {
+                hits.push((path.clone(), range));
+            }
+        }
+
+        hits.sort_by(|(pa, ra), (pb, rb)| {
+            pa.cmp(pb)
+                .then(ra.start.line.cmp(&rb.start.line))
+                .then(ra.start.character.cmp(&rb.start.character))
+        });
+
+        hits.into_iter()
+            .filter_map(|(path, range)| {
+                let uri = Uri::from_file_path(&path)?;
+                Some(Location { uri, range })
+            })
+            .collect()
     }
 
     /// character_store の全ワークスペース合計の許可名集合で Linderaユーザー辞書を再構築し、

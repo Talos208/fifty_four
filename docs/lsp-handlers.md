@@ -41,6 +41,9 @@ flowchart LR
 | `did_change` | 増分更新、補完選択の記録 (debug)、キャラ更新トリガ、トークン refresh |
 | `did_close` | ドキュメント状態のクリーンアップ |
 | `semantic_tokens_full` | Lindera 形態素解析 → 品詞ベースの色分け |
+| `hover` | カーソル位置のキャラ名(表示名・別名とも)に対し、そのキャラの全セクションを Markdown で表示 |
+| `goto_definition` | カーソル位置のキャラ名(表示名・別名とも)から `characters.md` / `characters/*.md` の該当キャラ見出しへジャンプ。同名キャラが複数ファイルにあれば候補一覧を返す。判定基準は `hover` と共通(ハイライトされない語では発動しない)。**カーソルが既に定義位置(キャラ見出し行)にある場合は `references` にフォールバックする**(rust-analyzer / IntelliJ 等と同じ振る舞い) |
+| `references` | カーソル位置のキャラ名(表示名・別名とも)の登場箇所を、ワークスペース直下(非再帰)の本文 `.txt` から横断検索して返す(Find All References)。判定基準は `hover`/`goto_definition` と共通。`characters.md` 等の設定・メモ類はスキャンしない |
 | `completion` | カーソル文脈に応じた LLM 補完候補生成。`code_action` が置いた保留中の書き換え候補があれば、それを優先して返す(下記参照) |
 | `code_action` | 選択範囲(無ければカーソルの文)を LLM で書き換える。対象に「※」があればそこに当てはまる語、無ければ表現改善の候補を複数提示する。ユーザーが明示的に要求した場合(`trigger_kind == INVOKED`、または未送信で選択範囲あり)のみ LLM を呼ぶ(電球表示のための自動呼び出しでは呼ばない)。`CodeAction.title` は1行の短い文字列しか持てず(LSP 仕様に documentation 相当のフィールドが無い)長文・改行を表示できないため、候補そのものはメニューに出さず `Ok(None)` を返す。生成した候補は uri ごとに保留し(`Backend::pending_rewrite`)、`window/showMessage` でユーザーに通知する |
 | `did_change_configuration` | ランタイム設定変更 |
@@ -58,6 +61,9 @@ flowchart LR
 | `completionProvider` | トリガ: `、` `「` `『` / コミット: `。` `」` `』` |
 | `codeActionProvider` | `CodeActionKind::REFACTOR_REWRITE`。selection/cursor の文を LLM で書き換える |
 | `selectionRangeProvider` | 有効 |
+| `hoverProvider` | 有効 |
+| `definitionProvider` | 有効。キャラ名(表示名・別名とも)から `characters.md` の該当見出しへジャンプ |
+| `referencesProvider` | 有効。キャラ名(表示名・別名とも)の登場箇所をワークスペース直下の本文 `.txt` から横断検索 |
 
 ## 初期化オプション
 

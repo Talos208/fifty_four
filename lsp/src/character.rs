@@ -94,6 +94,9 @@ pub(crate) struct CharacterEntry {
     pub(crate) sections: Vec<TaggedContent>,
     /// `Alias` タグ付きセクションから抽出済みの別名リスト（人名ハイライトの絞り込みに使う）
     pub(crate) aliases: Vec<String>,
+    /// このキャラクターの見出し行（0始まり、`content`中の行番号。`goto_definition`用）。
+    /// 同名キャラが同一ファイルに複数回現れる場合は最初の出現行を保持する。
+    pub(crate) heading_line: usize,
 }
 
 /// 1キャラクターファイルのメモリ上の正本。ディスクはこの値のload/dump先でしかない。
@@ -308,6 +311,78 @@ impl CharacterStore {
         }
     }
 
+    /// `surface`(表示名/alias)に一致するキャラクターの、表示名と全別名の集合を返す
+    /// (`references`用: 本文走査で `Highlighter::is_recognized_name` の `allowed` として渡し、
+    /// 品詞判定と絞り込みを同時に行う)。同名キャラが複数ファイルに存在する場合は
+    /// 全員分の名前を和集合にする。
+    #[instrument]
+    pub(crate) fn lookup_names(
+        &self,
+        workspace_root: &Path,
+        surface: &str,
+    ) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        if surface.is_empty() {
+            return names;
+        }
+        let guard = self.0.workspaces.lock();
+        let Some(files) = guard.get(workspace_root) else {
+            return names;
+        };
+        for file in files.values() {
+            for (heading_key, entry) in &file.characters {
+                if !matches_surface(heading_key, entry, surface) {
+                    continue;
+                }
+                add_allowed_name(character_display_name(heading_key), &mut names);
+                for alias in &entry.aliases {
+                    add_allowed_name(alias, &mut names);
+                }
+            }
+        }
+        names
+    }
+
+    /// `surface`(表示名/alias)に一致するキャラクターの「定義位置」= キャラ見出し行を返す
+    /// (`goto_definition`用)。同名キャラが複数ファイルに存在する場合は全件返す
+    /// (`lookup_markdown`が"---"区切りで全件連結するのと同じ方針)。
+    /// 返り値はパスの昇順で安定させる(`HashMap`の走査順は不定なため)。
+    #[instrument]
+    pub(crate) fn lookup_definitions(
+        &self,
+        workspace_root: &Path,
+        surface: &str,
+    ) -> Vec<(PathBuf, tower_lsp_server::lsp_types::Range)> {
+        use tower_lsp_server::lsp_types::{Position, Range};
+
+        if surface.is_empty() {
+            return Vec::new();
+        }
+        let guard = self.0.workspaces.lock();
+        let Some(files) = guard.get(workspace_root) else {
+            return Vec::new();
+        };
+
+        let mut hits: Vec<(PathBuf, Range)> = Vec::new();
+        for (path, file) in files.iter() {
+            for (heading_key, entry) in &file.characters {
+                if !matches_surface(heading_key, entry, surface) {
+                    continue;
+                }
+                let Some(line_text) = file.content.lines().nth(entry.heading_line) else {
+                    // content と characters の再計算タイミングがずれた場合の安全弁
+                    continue;
+                };
+                let line = entry.heading_line as u32;
+                let end_char = crate::types::utf16_len(line_text) as u32;
+                let range = Range::new(Position::new(line, 0), Position::new(line, end_char));
+                hits.push((path.clone(), range));
+            }
+        }
+        hits.sort_by(|(a, _), (b, _)| a.cmp(b));
+        hits
+    }
+
     /// `name`(部分一致)にマッチする最初のキャラクターについて、`tags`が示す属性の
     /// セクション本文を返す(`CharacterInfoTool`用)。ワークスペース内の全ファイルを
     /// 横断して検索する(1ファイルへの決め打ちをしない)。
@@ -511,13 +586,14 @@ pub(crate) fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry
     }
 
     let mut characters: HashMap<String, CharacterEntry> = HashMap::new();
-    let mut current_char: Option<String> = None;
+    // キャラ名と、その見出し行(0始まり)を対で保持する
+    let mut current_char: Option<(String, usize)> = None;
     let mut current_section: Option<TaggedContent> = None;
 
     // 現在のセクションをキャラクターエントリに flush するクロージャ相当のマクロ
     macro_rules! flush_section {
         () => {
-            if let (Some(ref char_name), Some(section)) =
+            if let (Some((char_name, heading_line)), Some(section)) =
                 (current_char.as_ref(), current_section.take())
             {
                 if !section.text.trim().is_empty() {
@@ -528,6 +604,7 @@ pub(crate) fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry
                             .or_insert_with(|| CharacterEntry {
                                 sections: Vec::new(),
                                 aliases: Vec::new(),
+                                heading_line: *heading_line,
                             });
                     if is_alias {
                         entry.aliases.extend(split_aliases(&section.text));
@@ -547,7 +624,9 @@ pub(crate) fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry
                 if h.level == char_level {
                     let t = heading_text(node);
                     debug!("{}", t);
-                    current_char = Some(t);
+                    // sourcepos.start.line は1始まりなので0始まりへ変換する
+                    let line = node.data.borrow().sourcepos.start.line.saturating_sub(1);
+                    current_char = Some((t, line));
                 } else {
                     // タイトルなどキャラクターレベルより上の heading はスキップ
                     current_char = None;
@@ -736,6 +815,16 @@ mod tests {
             chars.keys().collect::<Vec<_>>()
         );
         assert!(chars.contains_key("シルビア（航海士）"));
+
+        // 見出し行(0始まり)がフィクスチャ中の実際の行と一致すること
+        let expected_line = CHARACTERS_MD
+            .lines()
+            .position(|l| l == "## ジェフ・クライン（艦長）")
+            .expect("フィクスチャに見出しが存在するはず");
+        assert_eq!(
+            chars["ジェフ・クライン（艦長）"].heading_line,
+            expected_line
+        );
     }
 
     #[test]
@@ -1089,6 +1178,163 @@ mod tests {
         assert!(md.contains("A船の整備士"), "{}", md);
         assert!(md.contains("B船の通信士"), "{}", md);
         assert!(md.contains("---"), "{} に区切り線が含まれるはず", md);
+    }
+
+    #[test]
+    fn test_lookup_definitions_display_name() {
+        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
+        let hits = store.lookup_definitions(&root, "ジェフ・クライン");
+        assert_eq!(hits.len(), 1, "{:?}", hits);
+        let (path, range) = &hits[0];
+        assert_eq!(path, &root.join("characters.md"));
+
+        // 行番号をハードコードせず、フィクスチャ中の実際の見出し行と突き合わせる
+        let heading_line = CHARACTERS_MD
+            .lines()
+            .position(|l| l == "## ジェフ・クライン（艦長）")
+            .expect("フィクスチャに見出しが存在するはず");
+        assert_eq!(range.start.line as usize, heading_line);
+        assert_eq!(range.end.line as usize, heading_line);
+        assert_eq!(range.start.character, 0);
+
+        // Range終端はUTF-16長であり、バイト長とは一致しない(日本語見出しのため)ことを確認する
+        let heading_text = "## ジェフ・クライン（艦長）";
+        let expected_end = crate::types::utf16_len(heading_text) as u32;
+        assert_eq!(range.end.character, expected_end);
+        assert_ne!(
+            expected_end as usize,
+            heading_text.len(),
+            "この見出しはUTF-16長とバイト長が一致しない前提のテスト"
+        );
+    }
+
+    #[test]
+    fn test_lookup_definitions_alias_jumps_to_character_heading_not_alias_section() {
+        // 別名でヒットしても、飛び先は別名セクションの行ではなくキャラ見出し行であること
+        const MD: &str = indoc!(
+            "## ジェフ・クライン（艦長）
+            ### 呼称
+            - 隊長
+            ### 背景・立場
+            - ムサイ艦の艦長。
+            "
+        );
+        let (store, root) = make_store(&[("characters.md", MD)]);
+        let hits = store.lookup_definitions(&root, "隊長");
+        assert_eq!(hits.len(), 1, "{:?}", hits);
+
+        let heading_line = MD
+            .lines()
+            .position(|l| l == "## ジェフ・クライン（艦長）")
+            .expect("フィクスチャに見出しが存在するはず");
+        assert_eq!(hits[0].1.start.line as usize, heading_line);
+    }
+
+    #[test]
+    fn test_lookup_definitions_same_name_multiple_files_sorted() {
+        const MD_A: &str = indoc!(
+            "## タナカ（技師）
+            ### 背景・立場
+            - A船の整備士。
+            "
+        );
+        const MD_B: &str = indoc!(
+            "## タナカ（通信士）
+            ### 背景・立場
+            - B船の通信士。
+            "
+        );
+        // 意図的に b.md を先に登録し、返り値がパスの昇順で安定していることを確認する
+        let (store, root) = make_store(&[("b.md", MD_B), ("a.md", MD_A)]);
+        let hits = store.lookup_definitions(&root, "タナカ");
+        assert_eq!(hits.len(), 2, "{:?}", hits);
+        assert_eq!(hits[0].0, root.join("a.md"));
+        assert_eq!(hits[1].0, root.join("b.md"));
+    }
+
+    #[test]
+    fn test_lookup_definitions_miss_and_empty_surface() {
+        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
+        assert!(store.lookup_definitions(&root, "存在しない人").is_empty());
+        assert!(store.lookup_definitions(&root, "").is_empty());
+    }
+
+    #[test]
+    fn test_lookup_names_display_name_includes_aliases() {
+        const MD: &str = indoc!(
+            "## ジェフ・クライン（艦長）
+            ### 呼称
+            - 隊長
+            - 艦長殿
+            ### 背景・立場
+            - ムサイ艦の艦長。
+            "
+        );
+        let (store, root) = make_store(&[("characters.md", MD)]);
+        let names = store.lookup_names(&root, "ジェフ・クライン");
+        assert_eq!(
+            names,
+            std::collections::HashSet::from([
+                "ジェフ・クライン".to_string(),
+                "隊長".to_string(),
+                "艦長殿".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_lookup_names_via_alias_returns_same_set() {
+        // 別名でヒットしても、返る名前集合(表示名+全別名)は表示名で引いた場合と同じであること
+        const MD: &str = indoc!(
+            "## ジェフ・クライン（艦長）
+            ### 呼称
+            - 隊長
+            ### 背景・立場
+            - ムサイ艦の艦長。
+            "
+        );
+        let (store, root) = make_store(&[("characters.md", MD)]);
+        assert_eq!(
+            store.lookup_names(&root, "隊長"),
+            store.lookup_names(&root, "ジェフ・クライン")
+        );
+    }
+
+    #[test]
+    fn test_lookup_names_same_name_multiple_files_union() {
+        const MD_A: &str = indoc!(
+            "## タナカ（技師）
+            ### 呼称
+            - タナさん
+            ### 背景・立場
+            - A船の整備士。
+            "
+        );
+        const MD_B: &str = indoc!(
+            "## タナカ（通信士）
+            ### 呼称
+            - タナちゃん
+            ### 背景・立場
+            - B船の通信士。
+            "
+        );
+        let (store, root) = make_store(&[("a.md", MD_A), ("b.md", MD_B)]);
+        let names = store.lookup_names(&root, "タナカ");
+        assert_eq!(
+            names,
+            std::collections::HashSet::from([
+                "タナカ".to_string(),
+                "タナさん".to_string(),
+                "タナちゃん".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_lookup_names_miss_and_empty_surface() {
+        let (store, root) = make_store(&[("characters.md", CHARACTERS_MD)]);
+        assert!(store.lookup_names(&root, "存在しない人").is_empty());
+        assert!(store.lookup_names(&root, "").is_empty());
     }
 
     #[tokio::test]

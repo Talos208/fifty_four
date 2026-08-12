@@ -23,6 +23,7 @@ mod highlight;
 mod llm;
 mod logging;
 mod progress;
+mod references;
 #[cfg(debug_assertions)]
 mod session_log;
 mod text;
