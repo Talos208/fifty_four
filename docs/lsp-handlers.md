@@ -45,8 +45,9 @@ flowchart LR
 | `goto_definition` | カーソル位置のキャラ名(表示名・別名とも)から `characters.md` / `characters/*.md` の該当キャラ見出しへジャンプ。同名キャラが複数ファイルにあれば候補一覧を返す。判定基準は `hover` と共通(ハイライトされない語では発動しない)。**カーソルが既に定義位置(キャラ見出し行)にある場合は `references` にフォールバックする**(rust-analyzer / IntelliJ 等と同じ振る舞い) |
 | `references` | カーソル位置のキャラ名(表示名・別名とも)の登場箇所を、ワークスペース直下(非再帰)の本文 `.txt` から横断検索して返す(Find All References)。判定基準は `hover`/`goto_definition` と共通。`characters.md` 等の設定・メモ類はスキャンしない |
 | `inlay_hint` | `plot.md` の各 `# 章名` 見出し行末に「現文字数/予定文字数」を表示する。`plot.md` 以外のドキュメントには何も返さない。現文字数は対応する `<章名>.txt` から算出(開いていればバッファ優先、無ければディスク)。front matter に `episodes`/`average_chars` があれば予定文字数も表示し、front matter を閉じる行に作品全体の合計進捗も出す |
-| `completion` | カーソル文脈に応じた LLM 補完候補生成。`code_action` が置いた保留中の書き換え候補があれば、それを優先して返す(下記参照) |
-| `code_action` | 選択範囲(無ければカーソルの文)を LLM で書き換える。対象に「※」があればそこに当てはまる語、無ければ表現改善の候補を複数提示する。ユーザーが明示的に要求した場合(`trigger_kind == INVOKED`、または未送信で選択範囲あり)のみ LLM を呼ぶ(電球表示のための自動呼び出しでは呼ばない)。`CodeAction.title` は1行の短い文字列しか持てず(LSP 仕様に documentation 相当のフィールドが無い)長文・改行を表示できないため、候補そのものはメニューに出さず `Ok(None)` を返す。生成した候補は uri ごとに保留し(`Backend::pending_rewrite`)、`window/showMessage` でユーザーに通知する |
+| `document_symbol` | `.md`(characters.md / plot.md / memo/\*.md)の見出し一覧を階層構造(`DocumentSymbol` の木)で返す。アウトラインパネル・パンくず・`editor: toggle outline` のデータ源。`.txt` には見出し概念が無いため何も返さない。front matter は見出しとして混入させない(下記参照) |
+| `completion` | カーソル文脈に応じた LLM 補完候補生成。`code_action` が置いた保留中の書き換え候補があれば、それを優先して返す(下記参照)。カーソル位置が章の何割地点かを `{{PROGRESS}}` としてプロンプトへ渡す(`docs/completion.md` 参照) |
+| `code_action` | 選択範囲(無ければカーソルの文)を LLM で書き換える。対象に「※」があればそこに当てはまる語、無ければ表現改善の候補を複数提示する。ユーザーが明示的に要求した場合(`trigger_kind == INVOKED`、または未送信で選択範囲あり)のみ LLM を呼ぶ(電球表示のための自動呼び出しでは呼ばない)。`CodeAction.title` は1行の短い文字列しか持てず(LSP 仕様に documentation 相当のフィールドが無い)長文・改行を表示できないため、候補そのものはメニューに出さず `Ok(None)` を返す。生成した候補は uri ごとに保留し(`Backend::pending_rewrite`)、`window/showMessage` でユーザーに通知する。`completion` と同じく `{{PROGRESS}}`(対象範囲開始位置基準)をプロンプトへ渡す |
 | `did_change_configuration` | ランタイム設定変更 |
 | `did_change_workspace_folders` | ワークスペースフォルダ変更 |
 
@@ -66,6 +67,7 @@ flowchart LR
 | `definitionProvider` | 有効。キャラ名(表示名・別名とも)から `characters.md` の該当見出しへジャンプ |
 | `referencesProvider` | 有効。キャラ名(表示名・別名とも)の登場箇所をワークスペース直下の本文 `.txt` から横断検索 |
 | `inlayHintProvider` | 有効。`plot.md` の章見出しに現文字数/予定文字数を表示(下記参照) |
+| `documentSymbolProvider` | 有効。`.md` の見出し一覧をアウトラインとして提供(下記参照) |
 
 ## plot.md の front matter と inlay hint
 
@@ -111,6 +113,39 @@ average_chars: 4000 # 1話あたりの平均(予定)文字数
 
 `episodes` と `average_chars` が両方あれば、front matter を閉じる行にも
 `合計 現文字数合計/(episodes × average_chars)` の hint を表示する。
+
+## `.md` のアウトライン(document symbol)
+
+FiftyFour 言語は tree-sitter 文法を持たないため(`extension/languages/fiftyfour/config.toml` の
+`grammar` はコメントアウト)、Zed の tree-sitter 由来の見出しアウトラインは使えない。
+代わりに `textDocument/documentSymbol`(`lsp/src/outline.rs` の `markdown_symbols`)で
+`characters.md` / `plot.md` / `memo/*.md` の見出し階層をアウトラインとして提供する。
+
+- comrak でパースするため、フェンス付きコードブロック内の `#` を誤検出しない。setext 見出し
+  (`見出し\n===`)も拾う。
+- front matter(`---` で囲まれたブロック)は見出しとして扱わない。素の comrak は front matter を
+  「水平線→パラグラフ→setext見出し」と誤読するため、`markdown_symbols` は
+  `front_matter_delimiter` を明示的に有効化してから解析している(`plot.rs` が独自に
+  front matter を切り離しているのと同じ理由)。
+- 見出し名は `Text`/`Code` インラインをすべて連結する。`# 第一章 **決戦**` のような装飾入り
+  見出しでも装飾部分が欠落しない。
+- `.txt` には見出し概念が無いため、`document_symbol` は `.md` 以外で常に `Ok(None)` を返す。
+
+### 前提設定(Zed)
+
+`documentSymbolProvider` を宣言しても、Zed 側で言語別に `"document_symbols": "on"` を
+指定しないと LSP のアウトラインは使われない(既定はトップレベル `"document_symbols": "off"`
+= tree-sitter 優先)。`settings.json` の `languages.FiftyFour` に以下を追加する:
+
+```json
+"languages": {
+  "FiftyFour": {
+    "document_symbols": "on"
+  }
+}
+```
+
+反映には `editor: restart language server` が必要。
 
 ## 初期化オプション
 

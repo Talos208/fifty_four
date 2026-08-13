@@ -22,6 +22,7 @@ mod frontmatter;
 mod highlight;
 mod llm;
 mod logging;
+mod outline;
 mod plot;
 mod progress;
 mod references;

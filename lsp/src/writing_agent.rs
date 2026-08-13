@@ -138,7 +138,7 @@ impl ClaudeAgent {
     /// ACP の `session/new`/`session/load` それぞれに対応する
     /// (`crate::acp` はこのIDをそのまま ACP の `SessionId` として使い回すため、
     /// 呼び出し側で別途IDのマッピングを持つ必要がない)。
-    #[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
+    #[instrument]
     pub(crate) async fn start(
         root: &Path,
         system_prompt: String,
@@ -497,7 +497,7 @@ fn append_text(out: &mut String, blocks: &[ContentBlock]) {
 
 #[async_trait::async_trait]
 impl WritingAgent for ClaudeAgent {
-    #[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
+    #[instrument(skip(self, on_chunk))]
     async fn prompt(
         &self,
         text: &str,

@@ -325,7 +325,6 @@ fn cursor_tkn(
     (line_no, cursor_ix, cursor_tkn)
 }
 
-#[instrument]
 fn is_end_of_sentence(tkn: &CachedLinderaToken) -> bool {
     tkn.details[0] == "記号"
         && match tkn.details.get(1).map(|s| s.as_str()) {

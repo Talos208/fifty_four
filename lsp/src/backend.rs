@@ -256,6 +256,11 @@ impl LanguageServer for Backend {
             // キャラ名(表示名・別名とも)の登場箇所をワークスペース直下の本文 `.txt` から
             // 横断検索する(Find All References)。
             references_provider: Some(OneOf::Left(true)),
+            // `.md`(characters.md / plot.md / memo/*.md)の見出し一覧をアウトライン・
+            // パンくずとして提供する。FiftyFour 言語は tree-sitter 文法を持たないため、
+            // Zed 側で `"document_symbols": "on"` にしないとこの capability は使われない
+            // (docs/lsp-handlers.md 参照)。
+            document_symbol_provider: Some(OneOf::Left(true)),
             // plot.md の各 `# 章名` 見出し行末に「現文字数/予定文字数」を表示する。
             // plot.md 以外のドキュメントには何も返さない(inlay_hint ハンドラ側でガード)。
             inlay_hint_provider: Some(OneOf::Left(true)),
@@ -829,6 +834,41 @@ impl LanguageServer for Backend {
             Ok(None)
         } else {
             Ok(Some(locations))
+        }
+    }
+
+    /// `.md`(characters.md / plot.md / memo/*.md)の見出し一覧を階層構造として返す。
+    /// タブ上部のパンくずと `editor: toggle outline` のデータ源になる
+    /// (docs/plans/document-symbol-outline.md 参照)。
+    /// `.txt` には見出し概念が無いため、`.md` 以外は常に `Ok(None)`。
+    #[instrument(skip(self))]
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<DocumentSymbolResponse>> {
+        let uri = params.text_document.uri.as_str();
+        if !uri.to_lowercase().ends_with(".md") {
+            return Ok(None);
+        }
+
+        // inlay_hint と同じく、開いているバッファ(編集中の内容)から全文を復元する。
+        // ここは選択ジャンプ先を返すだけの読み取り専用処理なので、書き込みロック付きの
+        // `try_get_mut` ではなく `get` でよい。
+        let Some(lines) = self.text.get(uri) else {
+            return Ok(None);
+        };
+        let content = lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        drop(lines);
+
+        let symbols = crate::outline::markdown_symbols(&content);
+        if symbols.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(DocumentSymbolResponse::Nested(symbols)))
         }
     }
 
@@ -1678,7 +1718,7 @@ impl Backend {
     ///
     /// 実体は [`crate::llm::use_llm_with_option`]。ACP エージェントも同じ処理を
     /// 使うため、`Backend` に依存しない自由関数として `llm.rs` に置いてある。
-    #[instrument(skip(proc))]
+    #[instrument(skip(self, proc))]
     async fn use_llm_with_option<F>(
         &self,
         option: HashMap<String, String>,
@@ -2052,5 +2092,42 @@ impl Backend {
             };
             tokio::spawn(fut);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(text: &str) -> LineData {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn test_chars_before_cursor_sums_preceding_lines() {
+        let lines = vec![line("あいう"), line("えお"), line("かきくけ")];
+        // line_no=2 (「かきくけ」の行) のオフセット0 → その前2行分の文字数のみ。
+        assert_eq!(Backend::chars_before_cursor(&lines, 2, 0), 3 + 2);
+    }
+
+    #[test]
+    fn test_chars_before_cursor_counts_partial_current_line_by_utf16() {
+        let lines = vec![line("あいうえお")];
+        // カーソルがUTF-16オフセット3(「あいう」の直後)にある場合。
+        assert_eq!(Backend::chars_before_cursor(&lines, 0, 3), 3);
+    }
+
+    #[test]
+    fn test_chars_before_cursor_excludes_newlines_like_count_chars() {
+        // 各 LineData.text は改行を含まない前提だが、念のため count_chars と
+        // 同一基準(改行のみ除外)であることを、行内に改行が無くても壊れないことで確認する。
+        let lines = vec![line("あ　い")]; // 全角スペースは数える
+        assert_eq!(Backend::chars_before_cursor(&lines, 0, 3), 3);
+    }
+
+    #[test]
+    fn test_chars_before_cursor_line_no_beyond_buffer_sums_all_lines() {
+        let lines = vec![line("あい"), line("うえ")];
+        assert_eq!(Backend::chars_before_cursor(&lines, 5, 0), 4);
     }
 }

@@ -90,7 +90,10 @@ cargo prepare package --release --target aarch64-pc-windows-msvc
 
 `extension/languages/fiftyfour/config.toml` で FiftyFour 言語を定義。
 
-- 対象: `.txt`, `.md`
+- 対象: `path_suffixes = ["txt", "plot.md", "characters.md"]`(完全一致サフィックスのみ)。
+  `memo/*.md` のようなグロブは `path_suffixes` では表現できないため、ユーザーが Zed の
+  `settings.json` の `languages.file_types` で FiftyFour に割り当てる運用になっている
+  (`docs/lsp-handlers.md` 参照)。
 - 括弧: `「」` `『』` `《》` `｜《》` `（）`（各ペアに close / newline 設定）
 
 ## 主要依存関係 (lsp)

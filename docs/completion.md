@@ -73,6 +73,8 @@ LLM 応答（行区切り）を `CursorContext` に応じて整形してから `
 
 `completion` は現在編集中のファイル名(拡張子抜き)を `{{CHAPTER}}` としてプロンプトへ埋め込むため、LLM が `PlotInfoTool` に渡す `chapter_name` の手がかりになる。
 
+`completion`(および `code_action`)は、カーソル位置が章のどのあたりかを `{{PROGRESS}}` としても埋め込む。分子は「バッファ先頭からカーソル位置までの文字数」(`Backend::chars_before_cursor`)、分母は `plot.md` の front matter にある `average_chars`(1話あたりの予定文字数)。`plot.md` が無い・`average_chars` 未設定の場合は空文字列になる(`{{PROGRESS}}` プレースホルダ自体がプロンプトに残ることはない。`frontmatter::expand` は未知のプレースホルダのみ `{{NAME}}` の形で残す仕様なので、空文字列を明示的に渡す必要がある)。LLM はこの進捗を手がかりに、`PlotInfoTool` で取得したプロット全体のうち今の進行度に対応する箇所を選んで参照する。
+
 ## debug 記録
 
 debug ビルドでは `FlightRecorder` が補完リクエストと候補を SQLite に記録する。

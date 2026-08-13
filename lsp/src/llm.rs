@@ -680,15 +680,15 @@ impl LlmInterface for LlmClient {
         self.with_model(model.as_str()).await
     }
 
-    #[instrument]
+    #[instrument(skip(self))]
     fn capabilities(&self) -> ModelCapability {
         self.capabilities
     }
 
-    #[instrument]
+    #[instrument(skip(self))]
     fn add_tool(&mut self, tool: Box<dyn LlmTool>) {
         self.tools.insert(tool.as_ref().name().to_string(), tool);
-        debug!("Tool added to backend {:?}", self.tools.keys());
+        // debug!("Tool added to backend {:?}", self.tools.keys());
     }
 
     #[instrument]
@@ -878,12 +878,12 @@ impl LlmInterface for LlmClient {
         Ok(chat_req)
     }
 
-    #[instrument]
+    #[instrument(skip(self))]
     fn add(&mut self, prompt: Content) {
         self.prompts.push(prompt);
     }
 
-    #[instrument]
+    #[instrument(skip(self))]
     fn build_content(&self) -> String {
         self.fetch_all()
             .iter()
@@ -1012,7 +1012,6 @@ impl LlmInterface for LlmClient {
         self.options = std::mem::take(&mut self.options).with_reasoning_effort(effort);
     }
 
-    #[instrument]
     fn reset_options(&mut self) {
         self.options = ChatOptions::default();
     }
@@ -1065,7 +1064,7 @@ pub(crate) fn build_client(
 ///
 /// LSP ハンドラ(`Backend::use_llm_with_option`)と ACP エージェント(`crate::acp`)の
 /// 双方から使うため、`Backend` に依存しない自由関数としてここに置いている。
-#[instrument(skip(proc))]
+#[instrument(skip(slot, proc))]
 pub(crate) async fn use_llm_with_option<F>(
     slot: &tokio::sync::Mutex<Option<Box<dyn LlmInterface>>>,
     option: HashMap<String, String>,
