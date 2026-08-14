@@ -37,7 +37,7 @@ pub(crate) struct CharacterInfoTool {
 
 #[async_trait]
 impl LlmTool for CharacterInfoTool {
-    #[instrument]
+    // #[instrument]
     fn schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -61,17 +61,17 @@ impl LlmTool for CharacterInfoTool {
         })
     }
 
-    #[instrument]
+    #[instrument(skip(self), ret)]
     fn name(&self) -> &str {
         "character_info"
     }
 
-    #[instrument]
+    // #[instrument]
     fn description(&self) -> &str {
         "キャラクターの設定を取得する"
     }
 
-    #[instrument(skip(_args))]
+    #[instrument(skip(self), ret)]
     async fn invoke(
         &self,
         _args: &serde_json::Map<String, Value>,
@@ -127,7 +127,7 @@ impl PlotInfoTool {
 
 #[async_trait]
 impl LlmTool for PlotInfoTool {
-    #[instrument(skip(self))]
+    // #[instrument(skip(self))]
     fn schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -141,16 +141,16 @@ impl LlmTool for PlotInfoTool {
         })
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), ret)]
     fn name(&self) -> &str {
         "plot_info"
     }
-    #[instrument(skip(self))]
+    // #[instrument(skip(self))]
     fn description(&self) -> &str {
         "章のプロット情報を取得する"
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), ret)]
     async fn invoke(
         &self,
         args: &serde_json::Map<String, Value>,

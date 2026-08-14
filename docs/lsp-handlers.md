@@ -26,8 +26,7 @@ flowchart LR
     open --> charupd
     sem --> highlight
     comp --> complete
-    ca -- "候補を保留" --> comp
-    comp -- "保留があれば消費" --> rewrite
+    ca --> rewrite
 ```
 
 ## ハンドラ一覧
@@ -46,8 +45,9 @@ flowchart LR
 | `references` | カーソル位置のキャラ名(表示名・別名とも)の登場箇所を、ワークスペース直下(非再帰)の本文 `.txt` から横断検索して返す(Find All References)。判定基準は `hover`/`goto_definition` と共通。`characters.md` 等の設定・メモ類はスキャンしない |
 | `inlay_hint` | `plot.md` の各 `# 章名` 見出し行末に「現文字数/予定文字数」を表示する。`plot.md` 以外のドキュメントには何も返さない。現文字数は対応する `<章名>.txt` から算出(開いていればバッファ優先、無ければディスク)。front matter に `episodes`/`average_chars` があれば予定文字数も表示し、front matter を閉じる行に作品全体の合計進捗も出す |
 | `document_symbol` | `.md`(characters.md / plot.md / memo/\*.md)の見出し一覧を階層構造(`DocumentSymbol` の木)で返す。アウトラインパネル・パンくず・`editor: toggle outline` のデータ源。`.txt` には見出し概念が無いため何も返さない。front matter は見出しとして混入させない(下記参照) |
-| `completion` | カーソル文脈に応じた LLM 補完候補生成。`code_action` が置いた保留中の書き換え候補があれば、それを優先して返す(下記参照)。カーソル位置が章の何割地点かを `{{PROGRESS}}` としてプロンプトへ渡す(`docs/completion.md` 参照) |
-| `code_action` | 選択範囲(無ければカーソルの文)を LLM で書き換える。対象に「※」があればそこに当てはまる語、無ければ表現改善の候補を複数提示する。ユーザーが明示的に要求した場合(`trigger_kind == INVOKED`、または未送信で選択範囲あり)のみ LLM を呼ぶ(電球表示のための自動呼び出しでは呼ばない)。`CodeAction.title` は1行の短い文字列しか持てず(LSP 仕様に documentation 相当のフィールドが無い)長文・改行を表示できないため、候補そのものはメニューに出さず `Ok(None)` を返す。生成した候補は uri ごとに保留し(`Backend::pending_rewrite`)、`window/showMessage` でユーザーに通知する。`completion` と同じく `{{PROGRESS}}`(対象範囲開始位置基準)をプロンプトへ渡す |
+| `completion` | カーソル文脈に応じた LLM 補完候補生成。カーソル位置が章の何割地点かを `{{PROGRESS}}` としてプロンプトへ渡す(`docs/completion.md` 参照) |
+| `code_action` | 選択範囲(無ければカーソルの文)を LLM で書き換える。対象に「※」があればそこに当てはまる語、無ければ表現改善の候補を複数提示する。候補はメニューにそのまま複数の `CodeAction`(`title` = 候補文、`kind: REFACTOR_REWRITE`)として返す(下記参照)。先頭には「↻ 候補を作り直す」を挿入する(`execute_command` 参照)。ゲートを通ったリクエストは(1回目でも)即座に LLM を起動する。LLM 呼び出しは detached task に切り出し、リクエストがキャンセルされても走り続け、同一の(選択範囲, 対象テキスト)への後続リクエストはそのジョブに合流・結果を再利用する(`code_action::decide_job`)。結果を配達したジョブはその場でキャッシュから破棄するため、実際に新規リクエストが届けば必ず LLM を呼び直す。`completion` と同じく `{{PROGRESS}}`(対象範囲開始位置基準)をプロンプトへ渡す |
+| `execute_command` | `code_action` が返す「↻ 候補を作り直す」(`fifty_four.codeActionRegenerate`)専用。既存のジョブ・キャッシュを問答無用で破棄し、`code_action` と同じ経路(`Backend::start_code_action_job`)で LLM を呼び直す。得られた最初の候補を `workspace/applyEdit` で直接適用する(LSP には「候補一覧メニューを開き直す」手段が無いため、選ぶと同時に書き換わる) |
 | `did_change_configuration` | ランタイム設定変更 |
 | `did_change_workspace_folders` | ワークスペースフォルダ変更 |
 
@@ -62,6 +62,7 @@ flowchart LR
 | `semanticTokensProvider` | full のみ（range 無効）、FiftyFour / file スキーム |
 | `completionProvider` | トリガ: `、` `「` `『` / コミット: `。` `」` `』` |
 | `codeActionProvider` | `CodeActionKind::REFACTOR_REWRITE`。selection/cursor の文を LLM で書き換える |
+| `executeCommandProvider` | `fifty_four.codeActionRegenerate`(「↻ 候補を作り直す」用) |
 | `selectionRangeProvider` | 有効 |
 | `hoverProvider` | 有効 |
 | `definitionProvider` | 有効。キャラ名(表示名・別名とも)から `characters.md` の該当見出しへジャンプ |
@@ -351,27 +352,51 @@ Gemini 3 系は `thinkingLevel` の対応段数がモデルで異なり、対応
 }
 ```
 
-## code_action(※穴埋め/表現改善)と completion の連携
+## code_action(※穴埋め/表現改善)のジョブ管理
 
-`textDocument/codeAction` は `CodeAction.title`(1行の短い文字列)以外に候補内容を表示する
-場所を持たない(`CompletionItem.documentation` に相当するフィールドが LSP 仕様に無い)。
-長文や改行を含む書き換え候補をそのままメニューに出すと文末や2行目以降が見えなくなるため、
-このサーバでは次の2段構えにしている:
+Zed の shortcut(`editor: toggle code actions`)は **LSP へ新規リクエストを送らない**。
+選択/カーソル移動のたびに送られる自動ポーリング(`textDocument/codeAction`)の結果を
+`editor.code_actions_for_selection` に置き、shortcut はそれを表示するだけ(Zed 本体
+`crates/editor/src/code_actions.rs` の `toggle_code_actions`、`code_actions_for_selection`
+が `None` またはフェッチが空なら何も表示せず終わる)。つまり「1回目は記録だけにして
+2回目(shortcut 起因)で LLM を起動する」という判別は成立しない(旧実装で試みたが、
+Zed は同一選択に対して1回しかリクエストを送らないため、常に1回目のまま止まって
+反応しない不具合を起こした)。加えて `trigger_kind` も一切送られない(常に `None`、
+詳細は `docs/zed-code-action-polling.md`)。
 
-1. `code_action` が LLM を呼び、候補(`{"candidates": [...]}` を要求する frontmatter の
-   `schema`。改行はエスケープされて JSON 文字列内に保たれる)を取得する。
-   `Backend::pending_rewrite: DashMap<uri, PendingRewrite>` に保留し、`Ok(None)` を返す
-   (電球メニューには何も表示されない)。`window/showMessage` で件数を通知する。
-2. ユーザーが completion(Ctrl+Space 等)を叩くと、`completion` ハンドラは冒頭で
-   `pending_rewrite` を確認する。該当 uri にエントリがあり、カーソル行が保留範囲の行内なら、
-   通常の「続きの文」補完をスキップしてこの候補を `CompletionItem` として返す(1回消費した
-   ら削除)。ラベルが25文字を超える場合は末尾を省略し、`documentation`
-   (`MarkupContent`、Markdown)に全文を出す(既存の「続きの文」補完と同じ表示方式)。
-   カーソルが保留範囲から大きく外れていれば古い候補とみなして捨て、通常の補完へ進む。
+そのため `code_action` は次の方針で実装している(`Backend::code_action_jobs:
+DashMap<uri, (JobKey, RunningJob)>`、判定は `code_action::decide_job`):
 
-**操作フロー**: 選択範囲(またはカーソルの文)に対して code action を明示的に起動 →
-`window/showMessage` の通知を待つ → 同じ位置で completion を呼ぶ → 候補一覧から選ぶ。
-1ステップの UX ではない点に注意。
+1. `trigger_kind == INVOKED`、または未送信かつ選択範囲がある場合のみ先へ進む
+   (カーソルのみの自動ポーリングは即 `Ok(None)`)。
+2. ゲートを通ったリクエストは**1回目でも即座に** LLM 呼び出しを起動する。ただし
+   呼び出し本体は `tokio::spawn` の detached task に切り出し、`self`(ハンドラの
+   future)から独立させる。これにより、このリクエストが `$/cancelRequest` で drop
+   されても task は `self.llm` を握ったまま走り続ける。
+3. 対象範囲・対象テキストから作る `JobKey` が直前のジョブと一致する場合は新規に
+   LLM を呼ばず、`watch::Receiver` を clone してその task の結果に合流する
+   (`Decision::Join`)。task が既に完了していれば即座に、まだなら完了まで待つ。
+4. `JobKey` が変わった(別の範囲が選ばれた)のに前のジョブが実行中だった場合は、
+   新しいジョブを起動する前に古い task を `abort()` する(`self.llm` を握り続けない
+   ため)。
+5. 結果を配達したら `code_action_jobs` から即座に削除する(`remove_if`)。「1回計算
+   したら選択が変わるまで無期限にキャッシュ」にはしない — 実際に新規リクエストが
+   届いた場合(選択し直す等)は必ず LLM を呼び直す。空/エラーで終わった場合も同様に
+   削除し、無限に空結果を返し続けない。
+
+**操作フロー**: 範囲選択 → shortcut を押す → 候補がメニューに複数出る。選択が安定
+してから(Zed 側の自動ポーリングが実際に発火してから)shortcut を押せば、その1回の
+リクエスト(自動ポーリングによるものであれ)で LLM が起動し、結果が届き次第メニューに
+反映される。
+
+**リトライ**: Zed の shortcut は Esc でメニューを閉じてから再度押しても LSP へ何も
+送らない(上記の通り、キャッシュ云々ではなく Zed の client 側の挙動としてサーバに
+届かない)。そのため純粋な「もう一度押すだけ」は原理的にサーバ側では検知できない。
+代わりに、候補メニューの先頭に「↻ 候補を作り直す」という `command` ベースの
+`CodeAction` を常に挿入している。これを選ぶと `workspace/executeCommand` が届き、
+`execute_command` が既存のジョブを問答無用で破棄して LLM を呼び直し、得られた
+最初の候補を `workspace/applyEdit` でそのまま適用する(新しい候補一覧を再度メニュー
+として開き直す手段は LSP に無いため)。
 
 ## 内部処理（LSP ハンドラ外）
 

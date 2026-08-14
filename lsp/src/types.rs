@@ -69,7 +69,7 @@ impl LineData {
 /// オフセットが行末を超える場合は `text.len()` にクランプする。
 /// サロゲートペアの中間を指す場合はその文字の直後に丸める
 /// (LSP仕様上、正当な Position はペア中間を指さない)。
-#[instrument]
+// #[instrument]
 pub fn utf16_to_byte_offset(text: &str, utf16_offset: usize) -> usize {
     let mut u16_count = 0;
     for (byte_ix, c) in text.char_indices() {

@@ -27,7 +27,7 @@ fn is_whitespace(token: &CachedLinderaToken) -> bool {
     token.details[0] == "記号" && token.details.get(1).map(|s| s.as_str()) == Some("空白")
 }
 
-#[instrument(skip(predicate))]
+// #[instrument(skip(predicate))]
 fn before_token_inline(
     line: &LineData,
     token_index: usize,

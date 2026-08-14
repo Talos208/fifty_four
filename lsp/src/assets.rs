@@ -25,7 +25,7 @@ pub(crate) fn load(name: &str) -> Option<String> {
 }
 
 #[cfg(debug_assertions)]
-#[instrument]
+// #[instrument]
 pub(crate) fn load(name: &str) -> Option<String> {
     from_disk(name).or_else(|| {
         Embedded::get(name).map(|f| String::from_utf8_lossy(f.data.as_ref()).into_owned())
@@ -34,7 +34,7 @@ pub(crate) fn load(name: &str) -> Option<String> {
 
 /// 実行ファイルと同じディレクトリの `data/<name>` を読む。無ければ `None`。
 #[cfg(debug_assertions)]
-#[instrument]
+// #[instrument]
 fn from_disk(name: &str) -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     std::fs::read_to_string(exe.parent()?.join("data").join(name)).ok()

@@ -141,7 +141,7 @@ pub struct Highlighter {
 }
 
 impl std::fmt::Debug for crate::highlight::Highlighter {
-    #[instrument(skip(self, f))]
+    // #[instrument(skip(self, f))]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "Highlight tokenizer using Lindera")?;
         Ok(())

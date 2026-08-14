@@ -52,7 +52,7 @@ pub(crate) fn parse_text(text: &str) -> (String, HashMap<String, String>) {
 ///
 /// スカラーはそのまま文字列化し、配列・オブジェクト(JSON schema 等)は JSON 文字列に変換する。
 /// Null のみ `None`(マップから除外)。
-#[instrument]
+// #[instrument]
 pub(crate) fn pod_to_string(pod: &gray_matter::Pod) -> Option<String> {
     use gray_matter::Pod;
     match pod {

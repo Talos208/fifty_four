@@ -5,8 +5,20 @@
 //! CodeAction 組み立ては `backend.rs` の `code_action` ハンドラが担う。
 
 use crate::types::LineData;
-use tower_lsp_server::lsp_types::{Position, Range};
+use std::sync::Arc;
+use tokio::task::AbortHandle;
+use tower_lsp_server::lsp_types::{Position, Range, Uri};
 use tracing::instrument;
+
+/// 「↻ 候補を作り直す」の `workspace/executeCommand` コマンド名。
+pub(crate) const REGENERATE_COMMAND: &str = "fifty_four.codeActionRegenerate";
+
+/// `REGENERATE_COMMAND` の引数(`Command.arguments[0]` に1個だけ積む)。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RegenerateArgs {
+    pub(crate) uri: Uri,
+    pub(crate) range: Range,
+}
 
 /// 対象範囲に応じた code action の種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +27,69 @@ pub(crate) enum ActionMode {
     FillMark { mark: Range },
     /// `※` が無かった場合。対象全体を言い換える。
     Rephrase,
+}
+
+/// `code_action` ジョブの同一性キー。
+///
+/// Zed の shortcut(`editor: toggle code actions`)は LSP へ新規リクエストを送らず、
+/// 選択変更のたびの自動ポーリングが `code_actions_for_selection` に置いた結果を
+/// 表示するだけ(Zed本体 `crates/editor/src/code_actions.rs` の `toggle_code_actions`)。
+/// つまり「同一選択への2回目のリクエスト」は基本的に来ない。よって「1回目は記録だけ」
+/// という判別は成立せず、**最初のリクエストで即座に LLM を起動する**。
+///
+/// その代わり、同一キー(選択範囲・対象テキストが同じ)への後続リクエストは新規に
+/// LLM を呼ばず、進行中/完了済みのジョブに合流する(`decide_job` 参照)。これにより
+/// Zed が同じ選択に対して複数回リクエストを送ってきても二重に LLM を呼ばず、かつ
+/// 完了済みの結果はキャッシュとして再利用される。
+///
+/// `target_text` そのものではなくハッシュを持つのは、キーの比較・保持を軽くするため
+/// (document version は持たない設計なので、テキストが変われば別ジョブとして扱われれば十分)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JobKey {
+    pub(crate) range: Range,
+    pub(crate) target_hash: u64,
+}
+
+impl JobKey {
+    pub(crate) fn new(range: Range, target_text: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        target_text.hash(&mut hasher);
+        Self {
+            range,
+            target_hash: hasher.finish(),
+        }
+    }
+}
+
+/// URI ごとに進行中/完了済みの LLM 呼び出しを1つだけ保持する。
+///
+/// LLM 呼び出しは detached task に切り出しているため、これを保持している間はリクエストが
+/// `$/cancelRequest` で drop されても task は生き続け、`rx` を clone した後続のリクエストが
+/// 結果を拾える。
+#[derive(Debug)]
+pub(crate) struct RunningJob {
+    pub(crate) rx: tokio::sync::watch::Receiver<Option<Arc<Vec<String>>>>,
+    pub(crate) abort: AbortHandle,
+}
+
+/// `decide_job` の判定結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Decision {
+    /// LLM を新規に起動する(別の選択、またはこの URI で初めての呼び出し)。
+    Start,
+    /// 既に起動済み(または完了済み)のジョブに合流する。
+    Join,
+}
+
+/// 直前のジョブのキーと今回のキーから、LLM を新規に呼ぶか既存ジョブに合流するかを判定する。
+#[instrument]
+pub(crate) fn decide_job(prev_key: Option<&JobKey>, now_key: &JobKey) -> Decision {
+    if prev_key == Some(now_key) {
+        Decision::Join
+    } else {
+        Decision::Start
+    }
 }
 
 /// `range` の直後の1行の utf16 終端位置を返す(範囲内の最終行に使う)。
@@ -274,5 +349,37 @@ mod tests {
         // JSON ではあるが期待キーが無い場合も行分割へ倒す(空リストで詰まらせない)。
         let response = r#"{"result": ["候補1"]}"#;
         assert!(!parse_candidates(response).is_empty());
+    }
+
+    // ---- decide_job ----
+
+    fn key(sc: u32, text: &str) -> JobKey {
+        JobKey::new(range(0, sc, 0, sc + 1), text)
+    }
+
+    #[test]
+    fn test_decide_job_first_request_starts() {
+        let now_key = key(0, "対象");
+        assert_eq!(decide_job(None, &now_key), Decision::Start);
+    }
+
+    #[test]
+    fn test_decide_job_same_key_joins() {
+        let k = key(0, "対象");
+        assert_eq!(decide_job(Some(&k), &k), Decision::Join);
+    }
+
+    #[test]
+    fn test_decide_job_range_changed_starts() {
+        let prev_key = key(0, "対象");
+        let now_key = key(5, "対象"); // 範囲が違う
+        assert_eq!(decide_job(Some(&prev_key), &now_key), Decision::Start);
+    }
+
+    #[test]
+    fn test_decide_job_text_edited_same_range_starts() {
+        let prev_key = key(0, "対象");
+        let now_key = key(0, "編集後"); // 範囲は同じだがテキストが変わった
+        assert_eq!(decide_job(Some(&prev_key), &now_key), Decision::Start);
     }
 }

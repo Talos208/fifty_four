@@ -22,7 +22,7 @@ use tracing::instrument;
 /// 合わせて候補を組み立てる際、置換対象・接頭辞として使う。
 /// FiftyFour 言語は `completion_query_characters`/`word_characters` を
 /// 定義していないため、Zed 側もこの既定の英数字判定のみで語境界を決める。
-#[instrument]
+#[instrument(ret)]
 pub(crate) fn precursor_word(line_text: &str, utf16_offset: usize) -> &str {
     let end = crate::types::utf16_to_byte_offset(line_text, utf16_offset);
     let prefix = &line_text[..end];
@@ -41,14 +41,14 @@ pub(crate) fn precursor_word(line_text: &str, utf16_offset: usize) -> &str {
 /// 構造化出力(`ChatResponseFormat::JsonSpec`)非対応のモデルにプロンプトで JSON を
 /// 要求すると、```json フェンスや「以下が結果です」といった前置きが付いてくることがある。
 /// 最初の `{` から最後の `}` までを切り出すことでそれらを落とす。
-#[instrument(skip(response))]
+#[instrument(skip(response), ret)]
 pub(crate) fn extract_json(response: &str) -> Option<&str> {
     let start = response.find('{')?;
     let end = response.rfind('}')?;
     (start <= end).then(|| &response[start..=end])
 }
 
-#[instrument(skip(s))]
+// #[instrument(skip(s))]
 pub(crate) fn shorten(s: &str, len: usize) -> String {
     if s.chars().count() > len {
         s.chars().take(len - 2).collect::<String>() + "……"
@@ -57,7 +57,7 @@ pub(crate) fn shorten(s: &str, len: usize) -> String {
     }
 }
 
-#[instrument(skip(s))]
+// #[instrument(skip(s))]
 pub(crate) fn shorten_middle(s: &str, len: usize) -> String {
     let c = &s.chars();
     let l = c.clone().count();
@@ -72,7 +72,7 @@ pub(crate) fn shorten_middle(s: &str, len: usize) -> String {
     }
 }
 
-#[instrument(skip(lines, text))]
+#[instrument(skip(lines, text), ret)]
 pub(crate) fn apply_changes<T: AsRef<str>>(lines: &mut Vec<LineData>, text: T, range: Range) {
     let start_line = range.start.line as usize;
     let start_char = range.start.character as usize;
