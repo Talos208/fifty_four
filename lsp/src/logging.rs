@@ -1,4 +1,5 @@
 use std::env;
+use tracing::instrument;
 
 #[cfg(feature = "otel")]
 use opentelemetry_sdk::{
@@ -19,6 +20,7 @@ pub struct Logger {
 impl Logger {
     /// `acp` は ACP モード(`--acp`)かどうか。otel 有効時、`service.name` を
     /// LSP/ACP で分けるのに使う(otel 無効時は無視する)。
+    #[instrument]
     pub fn new(acp: bool) -> Self {
         #[cfg(feature = "otel")]
         {
@@ -65,13 +67,14 @@ fn prepare_env_logger() {
 }
 
 #[cfg(all(feature = "otel", debug_assertions))]
-use tracing_subscriber::fmt;
+use tracing::debug;
+#[cfg(all(feature = "otel", debug_assertions))]
+use tracing_subscriber::fmt::{self, format::FmtSpan};
 #[cfg(feature = "otel")]
 use {
     opentelemetry::{KeyValue, global, trace::TracerProvider as _},
     opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge,
     opentelemetry_sdk::Resource,
-    tracing::debug,
     tracing_subscriber::{
         EnvFilter, Layer, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
     },
@@ -123,10 +126,20 @@ fn logging_disabled() -> bool {
     EnvFilter::from_default_env().max_level_hint() == Some(LevelFilter::OFF)
 }
 
+/// 出力先の切り替え判定。`OTEL_EXPORTER_OTLP_ENDPOINT` が空でない値で設定されていれば
+/// ネットワーク(OTel)行きとみなす(未設定・空文字は stderr 行き)。
+#[cfg(feature = "otel")]
+fn network_target() -> Option<String> {
+    env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
 #[cfg(feature = "otel")]
 fn prepare_tracing(acp: bool) -> Logger {
     // 明示的に無効化されていれば、エクスポータもプロバイダも一切作らずに即終了する。
     if logging_disabled() {
+        eprintln!("Logging disabled.");
         return Logger {
             tracer_provider: None,
             logger_provider: None,
@@ -134,7 +147,34 @@ fn prepare_tracing(acp: bool) -> Logger {
         };
     }
 
-    let service_name = if acp { SERVICE_NAME_ACP } else { SERVICE_NAME_LSP };
+    if network_target().is_some() {
+        return prepare_network_tracing(acp);
+    }
+
+    // 出力先が stderr のとき: ネットワークへは一切接続を試みない
+    // (エクスポータ/プロバイダを作らない)。stderr へのミラーは開発時のみ
+    // (配布バイナリでは省く。標準入出力を JSON-RPC チャネルとして使うため)。
+    eprintln!("Logging to stderr.");
+    #[cfg(debug_assertions)]
+    prepare_stderr_tracing();
+
+    Logger {
+        tracer_provider: None,
+        logger_provider: None,
+        meter_provider: None,
+    }
+}
+
+/// 出力先がネットワーク(OTel)のときの設定。stderr へは(エクスポータ構築失敗時を
+/// 含めて)絶対に何も出さない。
+#[cfg(feature = "otel")]
+fn prepare_network_tracing(acp: bool) -> Logger {
+    eprintln!("Logging to Otel.");
+    let service_name = if acp {
+        SERVICE_NAME_ACP
+    } else {
+        SERVICE_NAME_LSP
+    };
 
     let resource = Resource::builder()
         .with_service_name(service_name)
@@ -143,51 +183,38 @@ fn prepare_tracing(acp: bool) -> Logger {
 
     // エンドポイントは明示せず、opentelemetry-otlp 自身の解決順(シグナル別 env var →
     // 汎用 OTEL_EXPORTER_OTLP_ENDPOINT → 既定値 http://localhost:4317)に任せる。
-    let tracer_provider = match opentelemetry_otlp::SpanExporter::builder()
+    let tracer_provider = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .build()
-    {
-        Ok(span_exporter) => Some(
+        .ok()
+        .map(|span_exporter| {
             SdkTracerProvider::builder()
                 .with_resource(resource.clone())
                 .with_batch_exporter(span_exporter)
-                .build(),
-        ),
-        Err(e) => {
-            eprintln!("Failed to create span exporter: {e}");
-            None
-        }
-    };
+                .build()
+        });
 
-    let logger_provider = match opentelemetry_otlp::LogExporter::builder()
+    let logger_provider = opentelemetry_otlp::LogExporter::builder()
         .with_tonic()
         .build()
-    {
-        Ok(log_exporter) => Some(
+        .ok()
+        .map(|log_exporter| {
             SdkLoggerProvider::builder()
                 .with_resource(resource.clone())
                 .with_batch_exporter(log_exporter)
-                .build(),
-        ),
-        Err(e) => {
-            eprintln!("Failed to create log exporter: {e}");
-            None
-        }
-    };
+                .build()
+        });
 
-    let meter_provider = match opentelemetry_otlp::MetricExporter::builder().with_tonic().build()
-    {
-        Ok(metric_exporter) => Some(
+    let meter_provider = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .build()
+        .ok()
+        .map(|metric_exporter| {
             SdkMeterProvider::builder()
                 .with_resource(resource)
                 .with_periodic_exporter(metric_exporter)
-                .build(),
-        ),
-        Err(e) => {
-            eprintln!("Failed to create metric exporter: {e}");
-            None
-        }
-    };
+                .build()
+        });
 
     if let Some(tracer_provider) = &tracer_provider {
         global::set_tracer_provider(tracer_provider.clone());
@@ -206,31 +233,76 @@ fn prepare_tracing(acp: bool) -> Logger {
             .with_filter(otel_filter())
     });
 
-    // 標準入出力を JSON-RPC チャネルとして使うため、可読ログは stderr 限定。
-    // stderr へのミラーは開発時のみ(配布バイナリでは省く)。
-    #[cfg(debug_assertions)]
-    tracing_subscriber::registry()
-        .with(otel_log_layer)
-        .with(otel_trace_layer)
-        .with(
-            fmt::layer()
-                .with_writer(std::io::stderr)
-                .with_filter(suppress_transport_noise(EnvFilter::from_default_env())),
-        )
-        .init();
-    #[cfg(not(debug_assertions))]
+    // stderr へは絶対に何も出さない(要望どおり、ネットワーク行きのときは無出力)。
     tracing_subscriber::registry()
         .with(otel_log_layer)
         .with(otel_trace_layer)
         .init();
-
-    debug!("Tracing initialized");
 
     Logger {
         tracer_provider,
         logger_provider,
         meter_provider,
     }
+}
+
+/// stderr 向けの素のログ行フォーマッタ。
+///
+/// 標準の(JSON以外の)`Format` には span コンテキストの表示を消すオプションが無く
+/// (`with_current_span`/`with_span_list` は JSON 専用)、素のログ行だけにするには
+/// 自前の `FormatEvent` が要る。span/イベントの一覧(`ctx.event_scope()`)には
+/// 意図的に触れず、レベル・ターゲット・メッセージだけを書く。
+#[cfg(all(feature = "otel", debug_assertions))]
+struct PlainFormat;
+
+#[cfg(all(feature = "otel", debug_assertions))]
+impl<S, N> fmt::FormatEvent<S, N> for PlainFormat
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &fmt::FmtContext<'_, S, N>,
+        mut writer: fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        use fmt::time::FormatTime;
+        use tracing_log::NormalizeEvent;
+
+        fmt::time::SystemTime.format_time(&mut writer)?;
+        // `log::` マクロ経由のイベントは tracing-log のブリッジで target/level が
+        // 静的な "log" プレースホルダになる(実体は `log.target` 等のフィールドに
+        // 入る)。`normalized_metadata()` で元の target/level を復元する
+        // (`tracing_subscriber` の既定フォーマッタと同じ手順)。
+        let normalized_meta = event.normalized_metadata();
+        let (level, target) = match &normalized_meta {
+            Some(meta) => (meta.level(), meta.target()),
+            None => (event.metadata().level(), event.metadata().target()),
+        };
+        write!(writer, " {:>5} {}: ", level, target)?;
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
+
+/// 出力先が stderr のときの設定(開発ビルド限定)。span/trace 情報(span名の
+/// プレフィックスや開始・終了イベント)は出さず、素のログ行だけにする。
+/// ANSI エスケープシーケンスによる色装飾も無効化する。
+#[cfg(all(feature = "otel", debug_assertions))]
+fn prepare_stderr_tracing() {
+    tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .with_span_events(FmtSpan::NONE)
+                .event_format(PlainFormat)
+                .with_filter(suppress_transport_noise(EnvFilter::from_default_env())),
+        )
+        .init();
+
+    debug!("Tracing initialized (stderr)");
 }
 
 #[cfg(all(test, feature = "otel"))]

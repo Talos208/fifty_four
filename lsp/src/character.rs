@@ -132,7 +132,6 @@ fn hash_content(s: &str) -> u64 {
     h.finish()
 }
 
-#[instrument]
 fn add_allowed_name(n: &str, names: &mut std::collections::HashSet<String>) {
     let n = n.trim();
     if !n.is_empty() {
@@ -680,7 +679,6 @@ pub(crate) fn split_aliases(text: &str) -> Vec<String> {
 
 /// キャラクターの見出しキーから役職等の括弧書きを除いた表示名を返す。
 /// 例: "ジェフ・クライン（艦長）" -> "ジェフ・クライン"
-#[instrument]
 fn character_display_name(heading_key: &str) -> &str {
     let end = heading_key.find(['（', '(']).unwrap_or(heading_key.len());
     heading_key[..end].trim()

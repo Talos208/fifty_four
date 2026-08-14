@@ -14,7 +14,8 @@ otel = [
     "dep:opentelemetry-appender-tracing",
     "dep:tracing",
     "dep:tracing-subscriber",
-    "dep:tracing-opentelemetry"
+    "dep:tracing-opentelemetry",
+    "dep:tracing-log"
 ]
 
 [dependencies]
@@ -58,3 +59,4 @@ opentelemetry-appender-tracing = { version = "0.31.1", optional = true }
 tracing = { version = "0.1.44", features = ["std"], optional = true }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "registry", "std", "fmt"], optional = true }
 tracing-opentelemetry = { version = "0.32", optional = true }
+tracing-log = { version = "0.2", optional = true }

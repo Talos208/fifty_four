@@ -41,6 +41,7 @@ use crate::{backend::Backend, logging::Logger};
 // 計装対象にするため、`tracing::info!` ではなくこちらに統一する。
 #[cfg_attr(not(debug_assertions), allow(unused_imports))]
 use log::{error, info};
+use tracing::instrument;
 
 /// `RUST_LOG` は process-wide なので、それを読み書きするテストは同時に走ると競合する。
 /// `main.rs`・`logging.rs` 双方のテストがこれを共有し、1本の Mutex で直列化する。
@@ -217,6 +218,7 @@ fn append_to_acp_panic_log(line: &str) {
 /// (Zed の Agent Panel から `agent_servers` 経由で起動される)として動作します。
 /// どちらも stdio を JSON-RPC のチャネルとして使うため、ログは stderr へ出す。
 #[tokio::main]
+#[instrument]
 async fn async_main(acp: bool) {
     // ロガー/トレーサの設置はここに一本化する。以前は ACP 分岐の手前で
     // env_logger を無条件初期化していたため、Logger::new() 内の
@@ -290,7 +292,10 @@ mod tests {
 
         default_acp_log_level();
 
-        assert_eq!(std::env::var("RUST_LOG").unwrap(), "warn,fifty_four_lsp=trace");
+        assert_eq!(
+            std::env::var("RUST_LOG").unwrap(),
+            "warn,fifty_four_lsp=trace"
+        );
 
         unsafe { std::env::remove_var("RUST_LOG") };
     }
