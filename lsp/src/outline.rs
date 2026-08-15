@@ -11,10 +11,11 @@ use comrak::{Arena, parse_document};
 use tower_lsp_server::lsp_types::{DocumentSymbol, Position, Range, SymbolKind};
 use tracing::instrument;
 
-/// Markdown 全文から見出しの階層構造を `DocumentSymbol` の木として返す。
-/// 見出しが1つも無ければ空 `Vec`。
+/// Markdown 全文から見出し(レベル, 名前, 0-based 行番号, 名前の UTF-16 終端 character)を
+/// フラットな出現順のリストで返す。front matter・コードフェンス内の `#` はいずれも除外する
+/// (`markdown_symbols` と `heading_line_levels` の共通処理)。
 #[instrument]
-pub(crate) fn markdown_symbols(content: &str) -> Vec<DocumentSymbol> {
+fn collect_headings(content: &str) -> Vec<(u8, String, usize, usize)> {
     // `character::comrak_options()` をベースにしつつ、front matter の区切りだけ
     // 明示的に有効化する。plot.md の `---\nepisodes: 30\n---` を素の comrak に渡すと
     // 「水平線→パラグラフ→setext見出し」と誤読され、`episodes: 30` が偽の見出しとして
@@ -26,7 +27,6 @@ pub(crate) fn markdown_symbols(content: &str) -> Vec<DocumentSymbol> {
     let arena = Arena::new();
     let root = parse_document(&arena, content, &options);
 
-    // (level, name, 0-based heading line, 0-based heading line の UTF-16 終端 character)
     let mut headings: Vec<(u8, String, usize, usize)> = Vec::new();
     for node in root.children() {
         if let NodeValue::Heading(h) = node.data.borrow().value {
@@ -37,9 +37,27 @@ pub(crate) fn markdown_symbols(content: &str) -> Vec<DocumentSymbol> {
             headings.push((h.level, name, line, end_character));
         }
     }
+    headings
+}
 
+/// Markdown 全文から見出しの階層構造を `DocumentSymbol` の木として返す。
+/// 見出しが1つも無ければ空 `Vec`。
+#[instrument]
+pub(crate) fn markdown_symbols(content: &str) -> Vec<DocumentSymbol> {
+    let headings = collect_headings(content);
     let total_lines = content.lines().count();
     build_symbol_tree(&headings, total_lines)
+}
+
+/// Markdown 全文から見出し行を `(0-based 行番号, レベル)` のフラットなリストで返す。
+/// `semantic_tokens_full` が見出し行の装飾(および他の装飾の抑制)対象を判定するために使う。
+/// front matter・コードフェンス内の `#` は見出しとして扱わない(`markdown_symbols` と同じ判定)。
+#[instrument]
+pub(crate) fn heading_line_levels(content: &str) -> Vec<(usize, u8)> {
+    collect_headings(content)
+        .into_iter()
+        .map(|(level, _, line, _)| (line, level))
+        .collect()
 }
 
 /// 見出しノード配下のインラインテキストを走査して連結する。
@@ -287,5 +305,37 @@ mod tests {
         // マルチバイト文字なのでバイト長とUTF-16長は一致しない。
         assert_ne!(utf16_length, byte_length);
         assert_eq!(symbols[0].selection_range.end.character, utf16_length);
+    }
+
+    // ---- heading_line_levels ----
+
+    #[test]
+    fn test_heading_line_levels_returns_flat_line_level_pairs() {
+        let md = indoc! {"
+            # 章
+            本文
+            ## 節
+        "};
+        assert_eq!(heading_line_levels(md), vec![(0, 1), (2, 2)]);
+    }
+
+    #[test]
+    fn test_heading_line_levels_excludes_front_matter_and_code_fence() {
+        let md = indoc! {"
+            ---
+            episodes: 30
+            ---
+            # 第一章
+            ```
+            # コードブロック内
+            ```
+        "};
+        assert_eq!(heading_line_levels(md), vec![(3, 1)]);
+    }
+
+    #[test]
+    fn test_heading_line_levels_empty_document_returns_empty() {
+        assert!(heading_line_levels("").is_empty());
+        assert!(heading_line_levels("見出しの無い本文だけ。\n").is_empty());
     }
 }

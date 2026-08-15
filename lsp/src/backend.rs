@@ -23,6 +23,7 @@ use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+use tower_lsp_server::lsp_types::request::{GotoImplementationParams, GotoImplementationResponse};
 use tower_lsp_server::lsp_types::*;
 use tower_lsp_server::{Client, LanguageServer, UriExt};
 use tracing::instrument;
@@ -34,8 +35,8 @@ use tracing::instrument;
 pub(crate) struct Backend {
     /// LSP クライアントへのハンドル。メッセージ送信などに使用する。
     client: Client,
-    // 文章データ（uri、行ごとのテキスト）
-    text: DashMap<String, Vec<LineData>>,
+    // 文章データ（uri、行ごとのテキスト）(Arc化: plot_sync の非同期ワーカーに clone して渡せるように)
+    text: Arc<DashMap<String, Vec<LineData>>>,
     //ワークスペース
     workspace: Arc<tokio::sync::Mutex<Vec<PathBuf>>>,
     // 文章補完用 LLM(Arc化: 周期タスクに clone して渡せるようにする)
@@ -63,6 +64,13 @@ pub(crate) struct Backend {
     code_action_jobs: DashMap<String, (crate::code_action::JobKey, crate::code_action::RunningJob)>,
     // クライアントが window/workDoneProgress をサポートするか(initialize で判定)
     work_done_progress_supported: std::sync::atomic::AtomicBool,
+    // plot.md の URI ごとのリネーム同期状態(章名⇄<章名>.txt)。詳細は `plot_sync` 参照。
+    plot_sync: DashMap<String, Arc<parking_lot::Mutex<crate::plot_sync::PlotSyncState>>>,
+    plot_sync_enabled: std::sync::atomic::AtomicBool,
+    plot_sync_idle_ms: std::sync::atomic::AtomicU64,
+    // クライアントが WorkspaceEdit.document_changes 経由の ResourceOp::Rename をサポートするか
+    // (initialize で判定。false ならリネームは tokio::fs::rename にフォールバックする)
+    client_supports_rename_resource_op: std::sync::atomic::AtomicBool,
 }
 
 /// `LanguageServer` トレイトの実装。
@@ -100,6 +108,29 @@ impl LanguageServer for Backend {
         self.work_done_progress_supported
             .store(wdp_supported, std::sync::atomic::Ordering::Relaxed);
         debug!("client workDoneProgress support: {}", wdp_supported);
+
+        // plot_sync(章名⇄<章名>.txt のリネーム同期)のリネーム実行方法を決める。
+        // `document_changes` と `resource_operations` に `Rename` の両方が揃っていなければ
+        // `client.apply_edit` の `ResourceOp::Rename` は使えないとみなし、
+        // `tokio::fs::rename` へフォールバックする。
+        let supports_rename_op = _param
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.workspace_edit.as_ref())
+            .is_some_and(|we| {
+                we.document_changes == Some(true)
+                    && we
+                        .resource_operations
+                        .as_ref()
+                        .is_some_and(|ops| ops.contains(&ResourceOperationKind::Rename))
+            });
+        self.client_supports_rename_resource_op
+            .store(supports_rename_op, std::sync::atomic::Ordering::Relaxed);
+        debug!(
+            "client supports ResourceOp::Rename via apply_edit: {}",
+            supports_rename_op
+        );
 
         if let Some(opt) = _param.initialization_options {
             debug!("initialization_options: {:?}", opt);
@@ -155,6 +186,27 @@ impl LanguageServer for Backend {
                 self.chat_context_enabled
                     .load(std::sync::atomic::Ordering::Relaxed),
                 self.chat_context_max_chars
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+
+            if let Some(ps) = opt.get("plot_sync") {
+                debug!("plot_sync config found: {:?}", ps);
+                if ps.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+                    self.plot_sync_enabled
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(v) = ps.get("idle_ms").and_then(|v| v.as_u64()) {
+                    self.plot_sync_idle_ms
+                        .store(v, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else {
+                debug!("no plot_sync config; using defaults");
+            }
+            debug!(
+                "plot_sync effective: enabled={} idle_ms={}",
+                self.plot_sync_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.plot_sync_idle_ms
                     .load(std::sync::atomic::Ordering::Relaxed),
             );
 
@@ -232,6 +284,9 @@ impl LanguageServer for Backend {
             // キャラ名(表示名・別名とも)にカーソルを合わせて Go to Definition すると、
             // characters.md / characters/*.md の該当キャラ見出しへジャンプする。
             definition_provider: Some(OneOf::Left(true)),
+            // plot.md の `# 章名` 見出しで Go to Implementation すると、対応する
+            // `<章名>.txt` へジャンプする(無ければ作成する)。
+            implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
             // キャラ名(表示名・別名とも)の登場箇所をワークスペース直下の本文 `.txt` から
             // 横断検索する(Find All References)。
             references_provider: Some(OneOf::Left(true)),
@@ -325,6 +380,24 @@ impl LanguageServer for Backend {
                     label_details_support: Some(true),
                 }),
             }),
+            // plot.md の章名⇄<章名>.txt のリネーム同期用。`.txt` のリネームを通知してもらう
+            // (`did_rename_files` 参照)。フォルダのリネームは対象外(`FileOperationPatternKind::File`)。
+            workspace: Some(WorkspaceServerCapabilities {
+                workspace_folders: None,
+                file_operations: Some(WorkspaceFileOperationsServerCapabilities {
+                    did_rename: Some(FileOperationRegistrationOptions {
+                        filters: vec![FileOperationFilter {
+                            scheme: Some("file".to_string()),
+                            pattern: FileOperationPattern {
+                                glob: "**/*.txt".to_string(),
+                                matches: Some(FileOperationPatternKind::File),
+                                options: None,
+                            },
+                        }],
+                    }),
+                    ..Default::default()
+                }),
+            }),
             ..ServerCapabilities::default()
         };
 
@@ -406,6 +479,26 @@ impl LanguageServer for Backend {
             .collect();
         self.update_all(params.text_document.uri.as_str(), 0, texts);
 
+        // plot_sync: baseline(ディスク上の .txt 群と一致していると信じる章名の並び)を
+        // 開いた時点の内容で種付けする。
+        if self
+            .plot_md_workspace(&params.text_document.uri)
+            .await
+            .is_some()
+        {
+            let chapters = crate::plot::parse_plot(&params.text_document.text)
+                .chapters
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            self.plot_sync.insert(
+                params.text_document.uri.as_str().to_string(),
+                Arc::new(parking_lot::Mutex::new(
+                    crate::plot_sync::PlotSyncState::new(chapters),
+                )),
+            );
+        }
+
         let _ = self.client.semantic_tokens_refresh().await;
     }
 
@@ -421,6 +514,12 @@ impl LanguageServer for Backend {
         // 明示的に再取得を促す(plot.md 側の編集による更新はクライアントが自前で行う)。
         if uri.ends_with(".txt") {
             let _ = self.client.inlay_hint_refresh().await;
+        }
+
+        // plot_sync: 保存は「編集の確定」の明確なシグナルなので、debounce を待たず
+        // 即座に章名変更を判定・実行する。
+        if let Some(ws) = self.plot_md_workspace(&params.text_document.uri).await {
+            self.flush_plot_sync(&params.text_document.uri, ws).await;
         }
 
         if !self.is_character_file(uri) {
@@ -518,6 +617,77 @@ impl LanguageServer for Backend {
         }
     }
 
+    /// plot_sync の逆方向(`.txt` リネーム → plot.md 見出し書き換え)。`initialize` で宣言した
+    /// `workspace.fileOperations.didRename`(`**/*.txt` フィルタ)に対してクライアントから届く。
+    /// 順方向(plot.md → txt)自身が起こしたリネームは `pending_self_renames` で無視し、
+    /// 無限ループを防ぐ。
+    #[instrument(ret, skip(self))]
+    async fn did_rename_files(&self, params: RenameFilesParams) {
+        if !self
+            .plot_sync_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+
+        for f in params.files {
+            let Ok(old_uri) = Uri::from_str(&f.old_uri) else {
+                continue;
+            };
+            let Ok(new_uri) = Uri::from_str(&f.new_uri) else {
+                continue;
+            };
+            let Some(old_path) = old_uri.to_file_path().map(|p| p.into_owned()) else {
+                continue;
+            };
+            let Some(new_path) = new_uri.to_file_path().map(|p| p.into_owned()) else {
+                continue;
+            };
+
+            let is_txt = |p: &PathBuf| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("txt"))
+                    .unwrap_or(false)
+            };
+            if !is_txt(&old_path) || !is_txt(&new_path) {
+                continue;
+            }
+
+            let Some(ws) = self.resolve_workspace(&new_uri).await else {
+                continue;
+            };
+            // ワークスペース直下のみ対象(サブディレクトリへの移動・元々のパス規約に合わせる)。
+            if old_path.parent() != Some(ws.as_path()) || new_path.parent() != Some(ws.as_path()) {
+                debug!("did_rename_files: not directly under workspace, skip");
+                continue;
+            }
+
+            let plot_path = ws.join("plot.md");
+            let Some(plot_uri) = Uri::from_file_path(&plot_path) else {
+                continue;
+            };
+
+            // 自己エコー遮断: 順方向がこのペアを起こしたばかりなら無視する。
+            if let Some(state) = self.plot_sync.get(plot_uri.as_str())
+                && state.lock().take_self_rename(&old_path, &new_path)
+            {
+                debug!("did_rename_files: self-echo, ignore");
+                continue;
+            }
+
+            let (Some(old_name), Some(new_name)) = (
+                old_path.file_stem().and_then(|s| s.to_str()),
+                new_path.file_stem().and_then(|s| s.to_str()),
+            ) else {
+                continue;
+            };
+
+            self.apply_plot_heading_rename(&plot_uri, &plot_path, old_name, new_name)
+                .await;
+        }
+    }
+
     #[instrument(ret, skip(self))]
     async fn did_change(&self, param: DidChangeTextDocumentParams) {
         debug!("did_change");
@@ -542,6 +712,7 @@ impl LanguageServer for Backend {
                     .flat_map(|c| c.text.lines().map(|s| s.to_string()))
                     .collect(),
             );
+            self.note_plot_change(&param.text_document.uri).await;
             return;
         }
 
@@ -566,6 +737,8 @@ impl LanguageServer for Backend {
         self.record_change(&param.text_document.uri, param.content_changes.as_slice())
             .await;
 
+        self.note_plot_change(&param.text_document.uri).await;
+
         let _ = self.client.semantic_tokens_refresh().await;
     }
 
@@ -575,7 +748,10 @@ impl LanguageServer for Backend {
 
         self.text.remove(params.text_document.uri.as_str());
         self.update_states.remove(params.text_document.uri.as_str());
-        if let Some((_, (_, job))) = self.code_action_jobs.remove(params.text_document.uri.as_str())
+        self.plot_sync.remove(params.text_document.uri.as_str());
+        if let Some((_, (_, job))) = self
+            .code_action_jobs
+            .remove(params.text_document.uri.as_str())
         {
             // 開いたまま放置された生成中ジョブが self.llm を握り続けないよう止める。
             job.abort.abort();
@@ -584,6 +760,9 @@ impl LanguageServer for Backend {
 
     /// ドキュメント全体に対する semantic tokens の問い合わせに応答します。
     ///
+    /// `.md` ファイルでは見出し行(front matter・コードフェンス内の `#` は除く)を
+    /// 通常のキャラ名/会話ハイライトから除外し、代わりに見出し用の装飾を1トークンで
+    /// 出す(`# ` はレベル1、`## ` 以降はまとめてレベル2以上として区別する)。
     #[instrument(ret, skip(self))]
     async fn semantic_tokens_full(
         &self,
@@ -597,17 +776,66 @@ impl LanguageServer for Backend {
             None => std::collections::HashSet::new(),
         };
 
+        let is_md = params
+            .text_document
+            .uri
+            .to_file_path()
+            .and_then(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("md"))
+            })
+            .unwrap_or(false);
+
         let vec = {
             // 共有ストアの行を直接更新する(get_mut)。深さを 0 から畳み込みながら全行を
             // 処理することで、各行の tag / bracket_depth_after キャッシュが書き戻され、
             // 以降の completion がそのまま再利用できる(陳腐化キャッシュもここで修復される)。
             let mut lines = self.text.get_mut(uri).expect("Failed to get text");
+
+            // 見出し行の判定は comrak ベース(`outline::heading_line_levels`、front matter・
+            // コードフェンスを正しく除外する)を使う。`.md` 以外(`.txt` 等)では見出しの
+            // 概念が無いため計算しない(素の "#" で始まる本文が誤って装飾されるのを防ぐ)。
+            let heading_levels: std::collections::HashMap<usize, u8> = if is_md {
+                let content = lines
+                    .iter()
+                    .map(|l| l.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                crate::outline::heading_line_levels(&content)
+                    .into_iter()
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
+
             let mut depth = 0u32;
             let mut per_line = Vec::with_capacity(lines.len());
-            for line in lines.iter_mut() {
+            for (line_no, line) in lines.iter_mut().enumerate() {
+                // 深さの畳み込み(tag/bracket_depth_after キャッシュの書き戻し)は見出し行でも
+                // 必ず行う。返す通常トークン列だけを見出し行では捨てて装飾用の1トークンに
+                // 差し替える。
                 let (toks, d) = self.highlighter.tokenize_with_depth(line, depth, &allowed);
                 depth = d;
-                per_line.push(toks);
+
+                match heading_levels.get(&line_no) {
+                    Some(&level) => {
+                        let length = crate::types::utf16_len(line.text.trim_end()) as u32;
+                        if length == 0 {
+                            per_line.push(Vec::new());
+                        } else {
+                            let token_type = if level <= 1 {
+                                crate::highlight::SemanticTokenType::Type as u32
+                            } else {
+                                crate::highlight::SemanticTokenType::Class as u32
+                            };
+                            per_line.push(vec![crate::highlight::SemanticToken::new(
+                                0, length, token_type, 0,
+                            )]);
+                        }
+                    }
+                    None => per_line.push(toks),
+                }
             }
             Highlighter::to_semantic_tokens(per_line)
                 .into_iter()
@@ -767,6 +995,68 @@ impl LanguageServer for Backend {
         } else {
             Ok(Some(GotoDefinitionResponse::Array(locations)))
         }
+    }
+
+    /// plot.md の `# 章名` 見出し行にカーソルを合わせた際、対応する `<章名>.txt`
+    /// (本文ファイル)へジャンプする。ファイルがまだ無ければ空ファイルとして作成してから
+    /// ジャンプする(Zed 側がジャンプ先を開く際にファイルの存在を要求するため)。
+    /// plot.md 以外、または見出し行以外では `Ok(None)`。
+    #[instrument(ret, skip(self))]
+    async fn goto_implementation(
+        &self,
+        params: GotoImplementationParams,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<GotoImplementationResponse>> {
+        let pos = params.text_document_position_params;
+        let uri = &pos.text_document.uri;
+        let line_no = pos.position.line as usize;
+
+        let is_plot_md = uri
+            .to_file_path()
+            .and_then(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("plot.md"))
+            })
+            .unwrap_or(false);
+        if !is_plot_md {
+            return Ok(None);
+        }
+
+        let Some(lines) = self.text.get(uri.as_str()) else {
+            return Ok(None);
+        };
+        let content = lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        drop(lines);
+
+        let Some(ws) = self.resolve_workspace(uri).await else {
+            return Ok(None);
+        };
+
+        let plot = crate::plot::parse_plot(&content);
+        let Some(chapter) = plot.chapters.iter().find(|c| c.heading_line == line_no) else {
+            return Ok(None);
+        };
+
+        let path = ws.join(format!("{}.txt", chapter.name));
+        if tokio::fs::metadata(&path).await.is_err() {
+            debug!("goto_implementation: creating {:?}", path);
+            if let Err(e) = tokio::fs::write(&path, "").await {
+                error!("goto_implementation: failed to create {:?}: {}", path, e);
+                return Ok(None);
+            }
+        }
+
+        let Some(target_uri) = Uri::from_file_path(&path) else {
+            return Ok(None);
+        };
+        Ok(Some(GotoImplementationResponse::Scalar(Location {
+            uri: target_uri,
+            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+        })))
     }
 
     /// キャラ名(表示名・別名とも)にカーソルを合わせて Find All References すると、
@@ -1411,7 +1701,12 @@ impl LanguageServer for Backend {
             crate::code_action::Decision::Start => {
                 debug!("code_action: starting new job (uri={})", uri);
                 match self
-                    .start_code_action_job(&params.text_document.uri, target_range, mode, &target_text)
+                    .start_code_action_job(
+                        &params.text_document.uri,
+                        target_range,
+                        mode,
+                        &target_text,
+                    )
                     .await
                 {
                     Some(rx) => rx,
@@ -1435,7 +1730,9 @@ impl LanguageServer for Backend {
         // 生き続ける)。
         let mut rx = rx;
         let candidates = match rx.wait_for(|v| v.is_some()).await {
-            Ok(v) => v.clone().expect("wait_for(|v| v.is_some()) guarantees Some"),
+            Ok(v) => v
+                .clone()
+                .expect("wait_for(|v| v.is_some()) guarantees Some"),
             Err(_) => {
                 // task が abort/panic して tx が drop された。
                 debug!("code_action: job ended without result (uri={})", uri);
@@ -1558,7 +1855,9 @@ impl LanguageServer for Backend {
         };
 
         let candidates = match rx.wait_for(|v| v.is_some()).await {
-            Ok(v) => v.clone().expect("wait_for(|v| v.is_some()) guarantees Some"),
+            Ok(v) => v
+                .clone()
+                .expect("wait_for(|v| v.is_some()) guarantees Some"),
             Err(_) => {
                 debug!("execute_command: job ended without result (uri={})", uri);
                 return Ok(None);
@@ -1652,7 +1951,7 @@ impl Backend {
     pub(crate) fn new(client: Client) -> Self {
         Self {
             client,
-            text: DashMap::new(),
+            text: Arc::new(DashMap::new()),
             workspace: Arc::new(tokio::sync::Mutex::new(vec![])),
             llm: Arc::new(tokio::sync::Mutex::new(None)),
             background_llm: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1676,6 +1975,12 @@ impl Backend {
             update_states: DashMap::new(),
             code_action_jobs: DashMap::new(),
             work_done_progress_supported: std::sync::atomic::AtomicBool::new(false),
+            plot_sync: DashMap::new(),
+            plot_sync_enabled: std::sync::atomic::AtomicBool::new(true),
+            plot_sync_idle_ms: std::sync::atomic::AtomicU64::new(
+                crate::plot_sync::DEFAULT_PLOT_SYNC_IDLE_MS,
+            ),
+            client_supports_rename_resource_op: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2001,6 +2306,215 @@ impl Backend {
         CharacterStore::resolve_workspace_for(&doc_path, &roots)
             .cloned()
             .or_else(|| roots.first().cloned())
+    }
+
+    /// `uri` が「ワークスペース直下の `plot.md`」を指しているときだけ、そのワークスペース
+    /// root を返す。サブディレクトリの `plot.md` は対象外(plot_sync は破壊的操作なので、
+    /// `goto_implementation`/`inlay_hint` の緩い判定より厳格にする)。
+    #[instrument(skip(self))]
+    async fn plot_md_workspace(&self, uri: &Uri) -> Option<PathBuf> {
+        let path = uri.to_file_path()?.into_owned();
+        let is_plot_md = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.eq_ignore_ascii_case("plot.md"))
+            .unwrap_or(false);
+        if !is_plot_md {
+            return None;
+        }
+        let ws = self.resolve_workspace(uri).await?;
+        (path.parent() == Some(ws.as_path())).then_some(ws)
+    }
+
+    /// `uri`(plot.md)の `plot_sync` 状態を取得する。無ければ空の baseline で新規作成する
+    /// (通常は `did_open` が種付けするので、ここでの新規作成は保険)。
+    fn plot_sync_state(
+        &self,
+        uri: &Uri,
+    ) -> Arc<parking_lot::Mutex<crate::plot_sync::PlotSyncState>> {
+        self.plot_sync
+            .entry(uri.as_str().to_string())
+            .or_insert_with(|| {
+                Arc::new(parking_lot::Mutex::new(
+                    crate::plot_sync::PlotSyncState::new(Vec::new()),
+                ))
+            })
+            .clone()
+    }
+
+    /// `did_change`(plot.md)から呼ぶ。generation を進めて detached task を spawn するだけで、
+    /// 判定・実行はタイマー満了後に行う(`plot_sync::run_after` 参照)。
+    #[instrument(skip(self))]
+    async fn note_plot_change(&self, uri: &Uri) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.plot_sync_enabled.load(Relaxed) {
+            return;
+        }
+        let Some(ws) = self.plot_md_workspace(uri).await else {
+            return;
+        };
+        let state = self.plot_sync_state(uri);
+        let generation = {
+            let mut s = state.lock();
+            s.generation += 1;
+            s.generation
+        };
+        let idle = std::time::Duration::from_millis(self.plot_sync_idle_ms.load(Relaxed));
+        let supports_rename_op = self.client_supports_rename_resource_op.load(Relaxed);
+
+        tokio::spawn(crate::plot_sync::run_after(
+            idle,
+            generation,
+            uri.clone(),
+            ws,
+            self.text.clone(),
+            self.client.clone(),
+            state,
+            supports_rename_op,
+        ));
+    }
+
+    /// `did_save`(plot.md)から呼ぶ。debounce を待たず、即座に判定・実行する。
+    #[instrument(skip(self))]
+    async fn flush_plot_sync(&self, uri: &Uri, ws: PathBuf) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.plot_sync_enabled.load(Relaxed) {
+            return;
+        }
+        let state = self.plot_sync_state(uri);
+        let generation = {
+            let mut s = state.lock();
+            s.generation += 1;
+            s.generation
+        };
+        let supports_rename_op = self.client_supports_rename_resource_op.load(Relaxed);
+        crate::plot_sync::run(
+            generation,
+            uri,
+            &ws,
+            &self.text,
+            &self.client,
+            &state,
+            supports_rename_op,
+        )
+        .await;
+    }
+
+    /// plot_sync の逆方向本体。plot.md 内の `old_name` 見出しを1件だけ特定し、章名部分だけを
+    /// `new_name` に書き換える(装飾・行末コメントを保つため行全体は作り直さない)。
+    /// plot.md が開いていれば `apply_edit`、開いていなければサーバーが直接読み書きする。
+    #[instrument(skip(self))]
+    async fn apply_plot_heading_rename(
+        &self,
+        plot_uri: &Uri,
+        plot_path: &std::path::Path,
+        old_name: &str,
+        new_name: &str,
+    ) {
+        let is_open = self.text.contains_key(plot_uri.as_str());
+        let content = if let Some(lines) = self.text.get(plot_uri.as_str()) {
+            lines
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            match tokio::fs::read_to_string(plot_path).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        "apply_plot_heading_rename: failed to read {:?}: {}",
+                        plot_path, e
+                    );
+                    return;
+                }
+            }
+        };
+
+        let plot = crate::plot::parse_plot(&content);
+        let matches: Vec<_> = plot
+            .chapters
+            .iter()
+            .filter(|c| c.name == old_name)
+            .collect();
+        if matches.len() != 1 {
+            debug!(
+                "apply_plot_heading_rename: {} matches for {:?}, skip",
+                matches.len(),
+                old_name
+            );
+            return;
+        }
+        if plot.chapters.iter().any(|c| c.name == new_name) {
+            debug!(
+                "apply_plot_heading_rename: {:?} already exists as a heading, skip",
+                new_name
+            );
+            return;
+        }
+        let chapter = matches[0];
+
+        let lines: Vec<&str> = content.lines().collect();
+        let Some(line_text) = lines.get(chapter.heading_line) else {
+            return;
+        };
+        let Some((start, end)) = crate::plot::heading_name_span(line_text) else {
+            return;
+        };
+
+        // 自己編集エコー抑止: apply_edit/直接書き込みの前に baseline を書き換え後の状態へ
+        // 進める。これにより誘発された did_change は Noop 判定になり、順方向は発火しない。
+        {
+            let state = self.plot_sync_state(plot_uri);
+            let mut s = state.lock();
+            s.generation += 1;
+            s.baseline = plot
+                .chapters
+                .iter()
+                .map(|c| {
+                    if c.name == old_name {
+                        new_name.to_string()
+                    } else {
+                        c.name.clone()
+                    }
+                })
+                .collect();
+        }
+
+        if is_open {
+            let start_char = crate::types::utf16_len(&line_text[..start]) as u32;
+            let end_char = crate::types::utf16_len(&line_text[..end]) as u32;
+            let range = Range::new(
+                Position::new(chapter.heading_line as u32, start_char),
+                Position::new(chapter.heading_line as u32, end_char),
+            );
+            let edit = WorkspaceEdit {
+                changes: Some(HashMap::from([(
+                    plot_uri.clone(),
+                    vec![TextEdit {
+                        range,
+                        new_text: new_name.to_string(),
+                    }],
+                )])),
+                ..Default::default()
+            };
+            if let Err(e) = self.client.apply_edit(edit).await {
+                error!("apply_plot_heading_rename: apply_edit failed: {:?}", e);
+            }
+        } else {
+            let mut new_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+            if let Some(l) = new_lines.get_mut(chapter.heading_line) {
+                l.replace_range(start..end, new_name);
+            }
+            if let Err(e) = tokio::fs::write(plot_path, new_lines.join("\n")).await {
+                error!(
+                    "apply_plot_heading_rename: failed to write plot.md: {:?}",
+                    e
+                );
+            }
+        }
+
+        let _ = self.client.inlay_hint_refresh().await;
     }
 
     /// 開いている `.txt` バッファを パス→内容 のマップとして集める

@@ -10,6 +10,7 @@ flowchart LR
         sem["semantic_tokens_full"]
         comp["completion"]
         ca["code_action"]
+        gi["goto_implementation"]
         cfg["did_change_configuration"]
     end
 
@@ -19,6 +20,7 @@ flowchart LR
         complete["LLM 文章補完"]
         rewrite["LLM 書き換え(※穴埋め/表現改善)"]
         charupd["キャラ設定自動更新 (非同期)"]
+        chapterjump["章見出し→本文ファイルへジャンプ"]
     end
 
     init --> sync
@@ -27,6 +29,7 @@ flowchart LR
     sem --> highlight
     comp --> complete
     ca --> rewrite
+    gi --> chapterjump
 ```
 
 ## ハンドラ一覧
@@ -37,11 +40,14 @@ flowchart LR
 | `initialized` | クライアント設定の取得 |
 | `shutdown` | シャットダウン（現状は即時 OK） |
 | `did_open` | 行単位テキスト保持、セマンティックトークン refresh |
-| `did_change` | 増分更新、補完選択の記録 (debug)、キャラ更新トリガ、トークン refresh |
-| `did_close` | ドキュメント状態のクリーンアップ |
-| `semantic_tokens_full` | Lindera 形態素解析 → 品詞ベースの色分け |
+| `did_change` | 増分更新、補完選択の記録 (debug)、キャラ更新トリガ、トークン refresh、plot.md なら plot_sync の debounce タイマー起動(下記参照) |
+| `did_save` | キャラクター設定ファイルの調和(reconcile)、`.txt` なら inlay hint 再取得、plot.md なら plot_sync を即時実行(下記参照) |
+| `did_close` | ドキュメント状態のクリーンアップ(plot_sync 状態も含む) |
+| `did_rename_files` | plot_sync の逆方向(`.txt` リネーム → plot.md 見出し書き換え)。`workspace.fileOperations.didRename`(`**/*.txt`)で宣言(下記参照) |
+| `semantic_tokens_full` | Lindera 形態素解析 → 品詞ベースの色分け。`.md` ファイルでは見出し行(comrak ベース、front matter・コードフェンス内の `#` は除外)を通常のハイライトから除外し、代わりに見出し用の装飾に差し替える(`# ` は `Type`、`## ` 以降は `Class` としてレベル1を強調する。下記参照) |
 | `hover` | カーソル位置のキャラ名(表示名・別名とも)に対し、そのキャラの全セクションを Markdown で表示 |
 | `goto_definition` | カーソル位置のキャラ名(表示名・別名とも)から `characters.md` / `characters/*.md` の該当キャラ見出しへジャンプ。同名キャラが複数ファイルにあれば候補一覧を返す。判定基準は `hover` と共通(ハイライトされない語では発動しない)。**カーソルが既に定義位置(キャラ見出し行)にある場合は `references` にフォールバックする**(rust-analyzer / IntelliJ 等と同じ振る舞い) |
+| `goto_implementation` | `plot.md` の `# 章名` 見出し行にカーソルを合わせて Go to Implementation すると、対応する `<章名>.txt`(本文ファイル)へジャンプする。ファイルがまだ無ければ空ファイルとして作成してから返す(Zed はジャンプ先ファイルの存在を前提にするため)。`plot.md` 以外、または見出し行以外では `Ok(None)` |
 | `references` | カーソル位置のキャラ名(表示名・別名とも)の登場箇所を、ワークスペース直下(非再帰)の本文 `.txt` から横断検索して返す(Find All References)。判定基準は `hover`/`goto_definition` と共通。`characters.md` 等の設定・メモ類はスキャンしない |
 | `inlay_hint` | `plot.md` の各 `# 章名` 見出し行末に「現文字数/予定文字数」を表示する。`plot.md` 以外のドキュメントには何も返さない。現文字数は対応する `<章名>.txt` から算出(開いていればバッファ優先、無ければディスク)。front matter に `episodes`/`average_chars` があれば予定文字数も表示し、front matter を閉じる行に作品全体の合計進捗も出す |
 | `document_symbol` | `.md`(characters.md / plot.md / memo/\*.md)の見出し一覧を階層構造(`DocumentSymbol` の木)で返す。アウトラインパネル・パンくず・`editor: toggle outline` のデータ源。`.txt` には見出し概念が無いため何も返さない。front matter は見出しとして混入させない(下記参照) |
@@ -66,9 +72,51 @@ flowchart LR
 | `selectionRangeProvider` | 有効 |
 | `hoverProvider` | 有効 |
 | `definitionProvider` | 有効。キャラ名(表示名・別名とも)から `characters.md` の該当見出しへジャンプ |
+| `implementationProvider` | 有効。`plot.md` の章見出しから対応する `<章名>.txt` へジャンプ(無ければ作成) |
 | `referencesProvider` | 有効。キャラ名(表示名・別名とも)の登場箇所をワークスペース直下の本文 `.txt` から横断検索 |
 | `inlayHintProvider` | 有効。`plot.md` の章見出しに現文字数/予定文字数を表示(下記参照) |
 | `documentSymbolProvider` | 有効。`.md` の見出し一覧をアウトラインとして提供(下記参照) |
+| `workspace.fileOperations.didRename` | `**/*.txt`(`FileOperationPatternKind::File`)。plot_sync の逆方向用(下記参照) |
+
+## plot.md の章見出しと `<章名>.txt` のリネーム同期(plot_sync)
+
+`plot.md` の `# 章名` 見出しと対応する本文ファイル `<章名>.txt`(`goto_implementation`/`inlay_hint` と
+同じパス解決規則)を双方向でリネーム同期する。実装は `lsp/src/plot_sync.rs`(純粋ロジック +
+`character_updater.rs` と同型の非同期ワーカー)。
+
+**順方向(plot.md → txt)**: `did_change`(plot.md)のたびに `Backend.plot_sync` の該当エントリの
+`generation` を増やして debounce タイマー(既定1.5秒、`plot_sync.idle_ms`)を spawn するだけで、
+判定・実行はタイマー満了時に行う(その時点で `generation` が最新でなければ何もしない = 後発の
+変更に追い越された)。`did_save` は待たずに即時実行する。判定は「開いた時点の章名リスト
+(baseline)」と「現在の章名リスト」を**位置(インデックス)一致**で比較する
+(`plot_sync::diff_chapter_names`)。章の増減・複数章同時変更・並べ替え・空/不正な章名・
+同名章の重複は全て`Rebaseline`(同期をスキップし baseline だけ現状へ合わせる)。単一の章名変更
+だけが `Rename` として確定し、対象 `<old>.txt` の存在・`<new>.txt` の非存在を確認してから実行する。
+
+リネーム実行は `client.apply_edit` の `WorkspaceEdit.document_changes` に `ResourceOp::Rename` を
+積むのが第一手段(対象がタブで開かれていてもクライアント側で追従する)。クライアントが
+`workspace.workspaceEdit.{documentChanges,resourceOperations}` で `Rename` をサポートしないと
+`initialize` 時点で分かっている場合のみ `tokio::fs::rename` にフォールバックし、開いたままなら
+`window/showMessage` で警告する。
+
+**逆方向(txt → plot.md)**: `did_rename_files`(`workspace/didRenameFiles`)で受け取る。旧/新パスが
+ともにワークスペース直下の `.txt` であることを確認し、拡張子を除いたファイル名を章名として
+`plot.md` 内で1件だけ一致する見出しを探す(0件/複数件、または新章名が既に見出しとして存在すれば
+スキップ)。見出し行の章名部分だけを書き換える(装飾・行末コメントを保つため行全体は作り直さない。
+`plot::heading_name_span` で章名の範囲を特定)。`plot.md` が開いていれば `apply_edit`、開いて
+いなければサーバーが直接読み書きする。
+
+**無限ループ防止(二重の遮断)**: (1) 逆方向で plot.md を書き換える**前**に baseline を書き換え後の
+状態へ更新する。これにより誘発される `did_change` は `Noop` 判定になり順方向が発火しない。
+(2) 順方向でリネームを実行する直前に `PlotSyncState.pending_self_renames` へ記録し、
+`did_rename_files` が同じペアを受け取ったら自己エコーとして無視する(10秒で GC)。
+
+**初期化オプション**(`initialization_options.plot_sync`、任意):
+
+| フィールド | 型 | 既定値 | 説明 |
+|---|---|---|---|
+| `enabled` | bool | `true` | `false` で機能全体を無効化 |
+| `idle_ms` | number | `1500` | 順方向の debounce 時間(ミリ秒) |
 
 ## plot.md の front matter と inlay hint
 
@@ -397,6 +445,30 @@ DashMap<uri, (JobKey, RunningJob)>`、判定は `code_action::decide_job`):
 `execute_command` が既存のジョブを問答無用で破棄して LLM を呼び直し、得られた
 最初の候補を `workspace/applyEdit` でそのまま適用する(新しい候補一覧を再度メニュー
 として開き直す手段は LSP に無いため)。
+
+## 見出し行の装飾(semantic_tokens_full)
+
+`.md` ファイル(`plot.md` / `characters.md` / `characters/*.md` / `memo/*.md`)の見出し行では、
+本来キャラ名や会話文に付くはずのハイライト(`highlight.rs::tokenize_with_depth`)を止め、
+代わりに見出し全体(`#` 記号込みの行全文)を1つの装飾トークンとして出す。実装は
+`outline::heading_line_levels`(`markdown_symbols` と同じ comrak ベースの見出し検出を共有
+する、`outline.rs::collect_headings` から抽出)で行番号→レベルの対応を先に計算し、
+`semantic_tokens_full` の行ループでその行だけ通常のトークン列を捨てて差し替える。
+
+- `# `(レベル1)は `SemanticTokenType::Type`、`## ` 以降(レベル2以上)はまとめて
+  `SemanticTokenType::Class` として出す。既存の LSP 標準21種のレジェンドをそのまま使う
+  (新規 token type を追加すると、クライアントのテーマがマッピングを知らず無装飾に
+  なるリスクがあるため避けた)。レベル1をレベル2以上より視覚的に強調したい、という
+  要望に対する近似で、実際の見た目(太さ・色)はクライアントのテーマ次第 —
+  テーマによっては `type`/`class` が同じ見た目になることがあるため、
+  `extension/languages/fiftyfour/semantic_token_rules.json`(FiftyFour 言語専用、Zed の
+  拡張ローダーが自動読み込み)で `font_weight`/`font_style`/色をテーマに関係なく
+  上書きしている(`docs/settings.json.sample.md` 参照)。
+- `.txt` など `.md` 以外のファイルでは見出し検出自体を行わない(素の `#` から始まる
+  本文が誤って見出し扱いされるのを防ぐ)。
+- 深さの畳み込み(`tag_line_depth`、`「」` の対応など、次行以降のハイライトに影響する
+  状態)は見出し行でも通常通り計算してから、返すトークン列だけを差し替える。見出し行に
+  括弧が紛れ込んでいてもキャッシュが壊れないようにするため。
 
 ## 内部処理（LSP ハンドラ外）
 

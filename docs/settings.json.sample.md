@@ -38,3 +38,31 @@ API キーの環境変数(`GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_K
   }
 }
 ```
+
+## 見出し行のスタイル上書き(semantic_token_rules)
+
+見出し行の装飾(`.md`の`# `= `type`、`## `以降 = `class`、[lsp-handlers.md](lsp-handlers.md)の
+「見出し行の装飾」参照)は、テーマによって `type`/`class` が同じ色・太さで表示され区別がつかない
+ことがある。これは Zed の `semantic_token_rules`(`token_type` を指定して `font_weight` /
+`font_style` / `foreground_color` をテーマに関係なく上書きできる仕組み)で確実に解決できる。
+
+**`extension/languages/fiftyfour/semantic_token_rules.json` に同梱済み**なので、通常は
+settings.json をいじる必要は無い(拡張機能を再インストール/リロードすれば有効になる)。
+FiftyFour 言語専用のルールとして適用され、他の言語・LSP サーバーには影響しない
+(Zed の拡張ローダーが `<extension>/languages/<言語>/semantic_token_rules.json` を自動で
+読み込み、`languages.FiftyFour` 専用のルールとして登録する仕組み。設定ファイルの場所を
+変えるだけで settings.json 側の記述は不要)。
+
+```json
+{
+  "rules": [
+    { "token_type": "type", "font_weight": "bold" },
+    { "token_type": "class", "font_style": "italic" }
+  ]
+}
+```
+
+自分の環境だけ一時的に上書きしたい場合(拡張機能をいじらず試したい場合)は、settings.json の
+`global_lsp_settings.semantic_token_rules` に同じ形で書いても良い(ただし全言語に効く。
+`"foreground_color": "#rrggbb"` のような色指定も可能)。両方が定義されている場合の優先順位は
+未確認なので、基本的にはどちらか一方だけを使うこと。

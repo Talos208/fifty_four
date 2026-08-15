@@ -24,6 +24,7 @@ mod llm;
 mod logging;
 mod outline;
 mod plot;
+mod plot_sync;
 mod progress;
 mod references;
 #[cfg(debug_assertions)]

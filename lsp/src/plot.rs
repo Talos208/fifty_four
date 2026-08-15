@@ -112,6 +112,26 @@ fn find_front_matter_end_line(content: &str) -> Option<usize> {
     None
 }
 
+/// 見出し行(`# 章名`)の中で、章名部分だけが占める `line` 内のバイト範囲を返す。
+/// `parse_plot` の見出し判定・章名抽出ロジック(`trim_end()` → `"# "` 始まり かつ
+/// `"## "` でない → `[2..].trim()`)と厳密に一致させること。見出し行でなければ `None`。
+///
+/// 装飾や行末コメント(`# 第一章 <!-- メモ -->`)を保ったまま章名だけを置換する
+/// (`plot_sync` のリネーム同期)ために、行全体ではなく章名の範囲だけを返す。
+#[instrument]
+pub(crate) fn heading_name_span(line: &str) -> Option<(usize, usize)> {
+    let trimmed = line.trim_end();
+    if !trimmed.starts_with("# ") || trimmed.starts_with("## ") {
+        return None;
+    }
+    let rest = &trimmed[2..];
+    let name = rest.trim();
+    let leading_ws = rest.len() - rest.trim_start().len();
+    let start = 2 + leading_ws;
+    let end = start + name.len();
+    Some((start, end))
+}
+
 /// 文字数を数える。改行(`\n`/`\r`)のみ除外し、空白・全角スペース等は数える。
 pub(crate) fn count_chars(text: &str) -> usize {
     text.chars().filter(|c| *c != '\n' && *c != '\r').count()
@@ -305,5 +325,40 @@ mod tests {
     #[test]
     fn test_progress_hint_zero_average_returns_empty() {
         assert_eq!(progress_hint(100, 0), "");
+    }
+
+    // ---- heading_name_span ----
+
+    #[test]
+    fn test_heading_name_span_simple() {
+        let line = "# 第1章";
+        let (s, e) = heading_name_span(line).unwrap();
+        assert_eq!(&line[s..e], "第1章");
+    }
+
+    #[test]
+    fn test_heading_name_span_extra_whitespace() {
+        let line = "#   第1章  ";
+        let (s, e) = heading_name_span(line).unwrap();
+        assert_eq!(&line[s..e], "第1章");
+    }
+
+    #[test]
+    fn test_heading_name_span_trailing_comment_kept_out_of_span() {
+        let line = "# 第1章 <!-- x -->";
+        let (s, e) = heading_name_span(line).unwrap();
+        // 章名の抽出規則(`[2..].trim()`)は先頭の空白しか気にしないため、末尾のコメントも
+        // 含めて "章名" として扱われる。span はその全体を指す。
+        assert_eq!(&line[s..e], "第1章 <!-- x -->");
+    }
+
+    #[test]
+    fn test_heading_name_span_level2_returns_none() {
+        assert_eq!(heading_name_span("## 第1章"), None);
+    }
+
+    #[test]
+    fn test_heading_name_span_non_heading_returns_none() {
+        assert_eq!(heading_name_span("見出しでない本文"), None);
     }
 }
