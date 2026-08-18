@@ -49,7 +49,7 @@ pub enum Provider {
 
 impl Provider {
     /// 文字列からProviderを生成する
-    #[instrument]
+    #[instrument(ret)]
     pub fn from_str(s: &str) -> Result<Self, String> {
         match s.to_lowercase().as_str() {
             "google" => Ok(Provider::Google("gemini-3.1-pro-preview".to_string())),
@@ -68,7 +68,7 @@ impl Provider {
     }
 
     #[allow(unused)]
-    #[instrument]
+    #[instrument(ret)]
     pub fn from_name(name: &str) -> Result<Self, String> {
         let (mut prov, model) = if let Some((prov, model)) = name.split_once('/') {
             (prov, model)
@@ -116,7 +116,7 @@ impl Provider {
     /// プロバイダ単位で決め打ちできるものはそうしつつ、Cloudflare Workers AI
     /// のようにモデルごとに tool calling 対応が分かれるプロバイダは
     /// モデル名も加味して判定する。
-    #[instrument]
+    #[instrument(skip(self), ret)]
     pub fn default_capabilities(&self, model: &str) -> ModelCapability {
         match self {
             // Anthropic の構造化出力(output_config.format)は genai 0.6.5 の
@@ -137,7 +137,7 @@ impl Provider {
     /// Cloudflare Workers AI のモデル一覧は function calling 対応がモデル依存のため、
     /// モデル名に含まれるファミリー名から簡易判定する。
     /// 対応が確実でないモデルは安全側(空)に倒す。
-    #[instrument]
+    #[instrument(ret)]
     fn cloudflare_capabilities(model: &str) -> ModelCapability {
         let m = model.to_lowercase();
         let supports_tool_calling = ["instruct", "hermes", "qwen", "mistral"]
@@ -164,7 +164,7 @@ impl Provider {
     ///
     /// 判定順序に注意: "grok-4.20-multi-agent" は "grok-4.20" のプレフィックスにも
     /// マッチするため、multi-agent の判定を先に行う。
-    #[instrument]
+    #[instrument(ret)]
     fn xai_capabilities(model: &str) -> ModelCapability {
         let base = ModelCapability::STRUCTURED_OUTPUT | ModelCapability::TOOL_CALLING;
         let m = model.to_lowercase();
@@ -181,7 +181,7 @@ impl Provider {
 
     /// 正規化 effort (0.0..=1.0) をこのプロバイダ・モデルの ReasoningEffort 段階へ
     /// 写像する。0.0 (以下) または reasoning 非対応 => None。1.0 => 最上位段。
-    #[instrument]
+    #[instrument(skip(self), ret)]
     pub fn map_reasoning(&self, model: &str, norm: f64) -> ReasoningEffort {
         use ReasoningEffort::*;
         let m = model.to_lowercase();
@@ -206,7 +206,12 @@ impl Provider {
                 &[Low, Medium, High]
             }
             Provider::XAi(_) => &[],
-            Provider::Cloudflare(_) | Provider::LMStudio(..) | Provider::Undefined => &[],
+            // LMStudio(Qwen3系)の thinking on/off は genai の汎用 reasoning_effort ラダーでは
+            // 表現できないブール制御(chat_template_kwargs.enable_thinking)で行う
+            // (LlmClient::reasoning_level() 参照)。ここは常に使われない経路だが、
+            // 「段階的な effort という概念がそもそも無い」ことを示すため空のままにしておく。
+            Provider::LMStudio(..) => &[],
+            Provider::Cloudflare(_) | Provider::Undefined => &[],
         };
         let n = norm.clamp(0.0, 1.0);
         if n <= 0.0 || ladder.is_empty() {
@@ -219,7 +224,7 @@ impl Provider {
     }
 
     #[allow(unused)]
-    #[instrument(skip(self, f))]
+    #[instrument(skip(self, f), ret)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Provider::Google(s) => write!(f, "Google({})", s),
@@ -232,7 +237,6 @@ impl Provider {
         }
     }
 
-    #[instrument]
     fn clone(&self) -> Self {
         match self {
             Provider::Google(s) => Provider::Google(s.clone()),
@@ -246,6 +250,181 @@ impl Provider {
     }
 }
 
+/// LMStudio の capability 自動推定結果をキャッシュする。
+///
+/// `ondemand`/`deferred` の2系統や、複数プロンプトで同じ設定が使い回されるたびに
+/// ローカルサーバ・HuggingFace へ毎回問い合わせるのは無駄なため、
+/// `(api root, model名を小文字化したもの)` をキーにプロセス内で1回だけ解決する。
+static LMSTUDIO_CAP_CACHE: std::sync::LazyLock<
+    dashmap::DashMap<(String, String), ModelCapability>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// 設定に書かれた LMStudio の URL(`http://localhost:1234` / `.../v1` / `.../v1/` など
+/// 表記が揺れる)から `/api/v0` を生やすためのルートを求める。
+#[instrument(ret)]
+fn lmstudio_api_root(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
+}
+
+/// LM Studio の `/api/v0/models` と、可能なら HuggingFace の GGUF リポジトリメタデータから
+/// `ModelCapability` を自動推定する。
+///
+/// 判定の根拠(詳細は `docs/lsp-handlers.md` 参照):
+/// - `/api/v0` は LM Studio 0.3.6+ にのみ存在する名前空間なので、**到達できたこと自体**が
+///   「json_schema (GBNF grammar によるサーバ側制約) を強制できるサーバである」証拠になる。
+///   json_schema 対応はモデルではなくサーバの機能のため、モデルが一覧に見つからなくても
+///   `STRUCTURED_OUTPUT` は付与する。
+/// - モデルエントリの `capabilities` に `tool_use` があれば `TOOL_CALLING` を付与する。
+/// - `publisher` + `id` から HuggingFace の GGUF リポジトリを復元できた場合のみ、
+///   `chat_template` を追加のヒントとして重ねる(`capabilities_from_chat_template` 参照)。
+///   HF 側は repo 名の正規化に失敗して外れることがある(LM Studio のカタログ id が
+///   実際の HF repo 名と一致しない場合があるため)ので、あくまで上乗せに留め、
+///   外れても LM Studio 側の判定はそのまま活かす。
+///
+/// ネットワーク不通・タイムアウト・パース失敗など、あらゆる失敗は `debug!` に留めて
+/// `None` を返す。LSP の初期化をローカルサーバの疎通性に依存させないため。
+#[instrument(ret)]
+async fn probe_lmstudio_capabilities(base_url: &str, model: &str) -> Option<ModelCapability> {
+    let root = lmstudio_api_root(base_url);
+    let cache_key = (root.clone(), model.to_lowercase());
+    if let Some(cached) = LMSTUDIO_CAP_CACHE.get(&cache_key) {
+        return Some(*cached);
+    }
+
+    let list_url = format!("{root}/api/v0/models");
+    let client = reqwest::Client::new();
+    let resp = match client
+        .get(&list_url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            debug!("lmstudio probe: {} returned {}", list_url, r.status());
+            return None;
+        }
+        Err(e) => {
+            debug!("lmstudio probe: failed to reach {}: {}", list_url, e);
+            return None;
+        }
+    };
+    let body: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            debug!(
+                "lmstudio probe: failed to parse {} response: {}",
+                list_url, e
+            );
+            return None;
+        }
+    };
+
+    let entry = body.get("data").and_then(|d| d.as_array()).and_then(|arr| {
+        arr.iter()
+            .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(model))
+            .or_else(|| {
+                arr.iter().find(|m| {
+                    m.get("id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| id.eq_ignore_ascii_case(model))
+                })
+            })
+    });
+
+    // /api/v0 へ到達できたことが根拠なので、一覧にモデルが見つからなくても
+    // (未ロード状態が id 命名の揺れで拾えない等)STRUCTURED_OUTPUT は付ける。
+    let mut caps = ModelCapability::STRUCTURED_OUTPUT;
+
+    if let Some(entry) = entry {
+        let tool_use = entry
+            .get("capabilities")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| arr.iter().any(|c| c.as_str() == Some("tool_use")));
+        if tool_use {
+            caps |= ModelCapability::TOOL_CALLING;
+        }
+
+        if let (Some(publisher), Some(id)) = (
+            entry.get("publisher").and_then(|v| v.as_str()),
+            entry.get("id").and_then(|v| v.as_str()),
+        ) && let Some(from_hf) = probe_huggingface_capabilities(publisher, id).await
+        {
+            caps |= from_hf;
+        }
+    } else {
+        debug!(
+            "lmstudio probe: model '{}' not found in {} listing",
+            model, list_url
+        );
+    }
+
+    LMSTUDIO_CAP_CACHE.insert(cache_key, caps);
+    Some(caps)
+}
+
+/// HuggingFace の GGUF リポジトリメタデータから `chat_template` を取得し、
+/// 追加のヒントとして capability を導出する(best-effort、当たれば強い層)。
+///
+/// LM Studio のカタログ `id` はダウンロード元の repo 名そのままとは限らず、
+/// 正規化・大文字小文字変更が入ることがあるため 404/401 で外れることがある。
+/// 外れた場合は `None` を返し、呼び出し側は LM Studio 側の判定のみを使う。
+#[instrument(ret)]
+async fn probe_huggingface_capabilities(publisher: &str, id: &str) -> Option<ModelCapability> {
+    // id が既に "publisher/basename" を含む場合(LM Studio のカタログでよくある表記)
+    // でも、publisher フィールドと結合し直して repo 名を組み立てる
+    // (basename だけを使うことで publisher の重複を避ける)。
+    let basename = id.rsplit('/').next().unwrap_or(id);
+    let repo = format!("{publisher}/{basename}");
+    let url = format!("https://huggingface.co/api/models/{repo}");
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .inspect_err(|e| debug!("huggingface probe: failed to reach {}: {}", url, e))
+        .ok()?;
+    if !resp.status().is_success() {
+        debug!("huggingface probe: {} returned {}", url, resp.status());
+        return None;
+    }
+    let body: Value = resp
+        .json()
+        .await
+        .inspect_err(|e| debug!("huggingface probe: failed to parse {} response: {}", url, e))
+        .ok()?;
+    let template = body.get("gguf")?.get("chat_template")?.as_str()?;
+    Some(capabilities_from_chat_template(template))
+}
+
+/// Jinja chat_template の文字列だけから capability を推定する純粋関数。
+///
+/// テンプレートの構造だけを見た簡易的な推定であり誤判定の余地はあるが、
+/// 呼び出し側(`probe_lmstudio_capabilities`)では `|=` で重ねるだけなので、
+/// ここが空(何も検出できない)でも既存の判定を壊さない。
+///
+/// - `tools` 変数への分岐がある → テンプレートが tool 定義を描画できる = TOOL_CALLING
+/// - `enable_thinking` 等の思考トグル変数がある → on/off を制御できる = REASONING_EFFORT
+///   (`<think>` タグの有無だけでは判定しない。今回の実例のように thinking が常時固定で
+///   トグル変数を持たないモデルがあり、その場合は reasoning_effort を送っても効かない)
+#[instrument(ret)]
+fn capabilities_from_chat_template(tmpl: &str) -> ModelCapability {
+    let mut caps = ModelCapability::empty();
+    if tmpl.contains("tools") {
+        caps |= ModelCapability::TOOL_CALLING;
+    }
+    let has_thinking_toggle = ["enable_thinking", "thinking_mode", "reasoning_effort"]
+        .iter()
+        .any(|kw| tmpl.contains(kw));
+    if has_thinking_toggle {
+        caps |= ModelCapability::REASONING_EFFORT;
+    }
+    caps
+}
+
 /// xAI 等が返す 400 のエラー本文から「対応していないパラメータ名」を抽出する。
 ///
 /// 例: `"Model grok-4.20-0309-reasoning does not support parameter reasoningEffort."`
@@ -254,7 +433,7 @@ impl Provider {
 /// 静的な capability 表(`Provider::xai_capabilities` 等)が実際の API 仕様に
 /// 追いついていない場合の保険。パラメータ名は camelCase で返ってくるため
 /// snake_case に正規化する。
-#[instrument]
+#[instrument(ret)]
 fn unsupported_param_from_error_body(body: &str) -> Option<String> {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         // JSON エラー本文では引用符がバックスラッシュエスケープされて
@@ -266,7 +445,7 @@ fn unsupported_param_from_error_body(body: &str) -> Option<String> {
 }
 
 /// camelCase を snake_case へ正規化する(既に snake_case の場合はそのまま)。
-#[instrument]
+#[instrument(ret)]
 fn camel_to_snake(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     for (i, c) in s.chars().enumerate() {
@@ -297,6 +476,10 @@ fn strip_unsupported_option(options: &mut ChatOptions, param: &str) -> bool {
                 true
             }
         }
+        // LMStudio の STRUCTURED_OUTPUT は「/api/v0 へ到達できた」ことを根拠に
+        // 無条件付与しているため(json_schema はサーバの grammar 機能でモデル依存
+        // ではないという想定)、その想定が崩れて 400 が返ってきた場合の保険。
+        "response_format" => options.response_format.take().is_some(),
         _ => false,
     }
 }
@@ -315,7 +498,6 @@ pub enum Content {
 }
 
 impl Display for Content {
-    #[instrument(skip(self, f))]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Content::Text(s) => write!(f, "{}", s),
@@ -438,7 +620,7 @@ pub struct LlmClientBuilder {
 impl LlmClientBuilder {
     /// LLMビルダーを構築する
     #[allow(unused)]
-    #[instrument]
+    #[instrument(ret)]
     fn new(_provider: Provider) -> LlmClientBuilder {
         LlmClientBuilder {
             provider: _provider.clone(),
@@ -452,7 +634,7 @@ impl LlmClientBuilder {
     }
 
     #[allow(unused)]
-    #[instrument]
+    #[instrument(ret)]
     pub fn from_name(name: &str) -> Self {
         LlmClientBuilder {
             provider: Provider::from_name(name).unwrap(),
@@ -465,7 +647,7 @@ impl LlmClientBuilder {
         }
     }
 
-    #[instrument]
+    #[instrument(ret)]
     pub fn from_value(value: &serde_json::Value) -> Self {
         debug!("value: {:?}", value);
         let provider = Provider::from_str(value["provider"].as_str().unwrap()).unwrap();
@@ -498,21 +680,19 @@ impl LlmClientBuilder {
     }
 
     #[allow(dead_code)]
-    #[instrument]
     pub fn model(&mut self, model: &str) -> &Self {
         self.model = Some(model.to_string());
         self
     }
 
     #[allow(dead_code)]
-    #[instrument]
     pub fn url(&mut self, url: &str) -> &Self {
         self.url = Some(url.to_string());
         self
     }
 
     #[allow(unused)]
-    #[instrument]
+    #[instrument(skip(self), ret)]
     pub fn add_tool(mut self, tool: Box<dyn LlmTool>) -> Self {
         self.tools.push(tool);
         debug!("Tool added to builder {:?}", self.tools);
@@ -520,7 +700,6 @@ impl LlmClientBuilder {
         self
     }
 
-    #[instrument]
     pub fn sys_prompt(mut self, prompt: Option<String>) -> Self {
         if let Some(p) = prompt {
             self.sys_prompt = p;
@@ -529,7 +708,30 @@ impl LlmClientBuilder {
         self
     }
 
-    #[instrument]
+    /// `build()` の非同期版。`capabilities` が明示されておらず、かつ provider が
+    /// `LMStudio` の場合のみ、`probe_lmstudio_capabilities` でネットワーク越しに
+    /// capability を自動推定してから `build()` に委譲する。
+    ///
+    /// 他プロバイダ(自社モデル一覧が既知で `default_capabilities` が決め打ちできる)は
+    /// 同期版と全く同じ経路(`Provider::default_capabilities`)を通るため、
+    /// ここでの分岐は LMStudio のみに限定している。
+    #[instrument(skip(self), ret)]
+    pub async fn build_async(mut self) -> Box<dyn LlmInterface> {
+        if self.capabilities.is_none()
+            && let Provider::LMStudio(mdl, prov_url) = &self.provider
+        {
+            let model = self.model.clone().unwrap_or_else(|| mdl.clone());
+            let base_url = self.url.clone().or_else(|| prov_url.clone());
+            if let Some(base_url) = base_url {
+                self.capabilities = probe_lmstudio_capabilities(&base_url, &model).await;
+            } else {
+                debug!("lmstudio: no base url resolved; skipping capability probe");
+            }
+        }
+        self.build()
+    }
+
+    #[instrument(skip(self))]
     pub fn build(self) -> Box<dyn LlmInterface> {
         let mut u_from_prov = None;
         let (auth, kind, mdl_name) = match &self.provider {
@@ -557,7 +759,13 @@ impl LlmClientBuilder {
                 u_from_prov = u.clone();
                 (
                     AuthData::Key("".to_string()), // No authentication required for local LMStudio
-                    AdapterKind::Anthropic,
+                    // OpenAI互換(/v1/chat/completions)を使う。LM Studio の素の実装であり、
+                    // 対象モデルの chat_template が生成する <tool_call> 記法とも
+                    // ネイティブに対応する。さらに genai の extra_body マージ
+                    // (reasoning_level() で使う chat_template_kwargs.enable_thinking、
+                    // Qwen公式のreasoning制御方法)は OpenAI アダプタにしか実装されておらず、
+                    // Anthropic互換(/v1/messages)経由では実現できない。
+                    AdapterKind::OpenAI,
                     mdl,
                 )
             }
@@ -674,24 +882,23 @@ pub struct LlmClient {
 
 #[async_trait]
 impl LlmInterface for LlmClient {
-    #[instrument]
+    #[instrument(skip(self), ret)]
     async fn chat(&mut self) -> Result<String, LlmError> {
         let model = self.model.clone();
         self.with_model(model.as_str()).await
     }
 
-    #[instrument(skip(self))]
     fn capabilities(&self) -> ModelCapability {
         self.capabilities
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, tool))]
     fn add_tool(&mut self, tool: Box<dyn LlmTool>) {
         self.tools.insert(tool.as_ref().name().to_string(), tool);
         // debug!("Tool added to backend {:?}", self.tools.keys());
     }
 
-    #[instrument]
+    #[instrument(skip(self), ret)]
     async fn with_model(&mut self, model: &str) -> Result<String, LlmError> {
         // TODO AGENTS.mdをfrom_system()で投入
         // 一時プロンプトはここで消費する(take)。この時点で chat_req へ焼き込まれるため、
@@ -821,7 +1028,7 @@ impl LlmInterface for LlmClient {
         Ok(content)
     }
 
-    #[instrument]
+    #[instrument(skip(self), ret)]
     async fn respond_tool(&self, tool_calls: &[ToolCall]) -> Result<ChatRequest, LlmError> {
         let mut result_tc = vec![];
         let mut result_tr = vec![];
@@ -893,12 +1100,11 @@ impl LlmInterface for LlmClient {
             .join("")
     }
 
-    #[instrument]
     fn get_model(&self) -> &str {
         &self.model
     }
 
-    #[instrument]
+    #[instrument(skip(self), ret)]
     fn cache(&mut self, prompt: Content) -> Result<String, LlmError> {
         match prompt {
             Content::Text(s) => {
@@ -916,27 +1122,25 @@ impl LlmInterface for LlmClient {
         }
     }
 
-    #[instrument]
+    #[instrument(skip(self), ret)]
     fn fetch(&self, hash: &str) -> Option<&Content> {
         self.cache.get(hash)
     }
 
-    #[instrument]
+    #[instrument(skip(self), ret)]
     fn fetch_all(&self) -> Vec<Content> {
         self.cache.values().cloned().collect()
     }
 
-    #[instrument]
     fn clear(&mut self) {
         self.cache.clear();
     }
 
-    #[instrument]
     fn remove(&mut self, hash: String) {
         self.cache.remove(&hash);
     }
 
-    #[instrument]
+    #[instrument(skip(self), ret)]
     async fn get_service_target(&self) -> String {
         let st = self
             .inner_client
@@ -947,22 +1151,18 @@ impl LlmInterface for LlmClient {
         format!("{:?} {:?}", st.model, st.endpoint)
     }
 
-    #[instrument]
     fn max_tokens(&mut self, n: u32) {
         self.options = std::mem::take(&mut self.options).with_max_tokens(n);
     }
 
-    #[instrument]
     fn temperature(&mut self, v: f64) {
         self.options = std::mem::take(&mut self.options).with_temperature(v);
     }
 
-    #[instrument]
     fn top_p(&mut self, v: f64) {
         self.options = std::mem::take(&mut self.options).with_top_p(v);
     }
 
-    #[instrument]
     fn stop_sequences(&mut self, seqs: Vec<String>) {
         if !self.capabilities.contains(ModelCapability::STOP_SEQUENCES) {
             debug!(
@@ -974,12 +1174,10 @@ impl LlmInterface for LlmClient {
         self.options = std::mem::take(&mut self.options).with_stop_sequences(seqs);
     }
 
-    #[instrument]
     fn seed(&mut self, v: u64) {
         self.options = std::mem::take(&mut self.options).with_seed(v);
     }
 
-    #[instrument]
     fn reasoning_effort(&mut self, effort: ReasoningEffort) {
         if !self
             .capabilities
@@ -994,7 +1192,6 @@ impl LlmInterface for LlmClient {
         self.options = std::mem::take(&mut self.options).with_reasoning_effort(effort);
     }
 
-    #[instrument]
     fn reasoning_level(&mut self, level: f64) {
         if !self
             .capabilities
@@ -1004,6 +1201,20 @@ impl LlmInterface for LlmClient {
                 "model {} does not support reasoning_effort; skipping (level={})",
                 self.model, level
             );
+            return;
+        }
+        if matches!(self.provider, Provider::LMStudio(..)) {
+            // Qwen3 系の thinking on/off は genai の汎用 reasoning_effort
+            // (OpenAI o-series 由来の "low"/"medium"/"high" 文字列、insert_openai_reasoning_effort
+            // 経由で "reasoning_effort" キーとして送られる)では制御できず、Qwen公式ドキュメント
+            // 準拠の `chat_template_kwargs.enable_thinking`(真偽値)でのみ制御できる
+            // (vLLM/SGLang deployment doc、LM Studio issue #1990 で語彙が一致することから確認)。
+            // この capability は capabilities_from_chat_template() が chat_template 中の
+            // enable_thinking トグル変数の有無を根拠に付与しているので、ここで意味が食い違わない。
+            let enable_thinking = level > 0.0;
+            let extra =
+                serde_json::json!({"chat_template_kwargs": {"enable_thinking": enable_thinking}});
+            self.options = std::mem::take(&mut self.options).with_extra_body(extra);
             return;
         }
         // モデル名は builder 側で上書き済みの self.model を見る(self.provider が
@@ -1016,17 +1227,14 @@ impl LlmInterface for LlmClient {
         self.options = ChatOptions::default();
     }
 
-    #[instrument]
     fn response_format(&mut self, fmt: ChatResponseFormat) {
         self.options = std::mem::take(&mut self.options).with_response_format(fmt);
     }
 
-    #[instrument]
     fn service_tier(&mut self, tier: ServiceTier) {
         self.options = std::mem::take(&mut self.options).with_service_tier(tier);
     }
 
-    #[instrument]
     fn verbosity(&mut self, v: Verbosity) {
         self.options = std::mem::take(&mut self.options).with_verbosity(v);
     }
@@ -1038,7 +1246,11 @@ impl LlmInterface for LlmClient {
 /// システムプロンプトの差し替えだけが違う複数の用途(LSP の執筆支援=`system.md`、
 /// ACP のチャット=`system_chat.md`)があるため、アセット名を引数に取る。
 /// アセットが見つからない場合はシステムプロンプト無しで動かし、警告だけ出す。
-#[instrument]
+///
+/// 同期版。現在の呼び出し元は全て async 文脈のため `build_client_async` を使うが、
+/// LMStudio のネットワークプローブが不要/不都合なテストコード等から使えるよう残している。
+#[allow(dead_code)]
+#[instrument(ret)]
 pub(crate) fn build_client(
     cfg: &serde_json::Value,
     sys_prompt_name: &str,
@@ -1053,6 +1265,27 @@ pub(crate) fn build_client(
     LlmClientBuilder::from_value(cfg)
         .sys_prompt(sys_prompt)
         .build()
+}
+
+/// `build_client` の非同期版。LMStudio かつ `capabilities` 未指定のときのみ
+/// `LlmClientBuilder::build_async` でネットワーク越しの capability 自動推定を行う。
+/// それ以外のプロバイダでは同期版と同じ結果を返す(内部で await が挟まるだけ)。
+#[instrument(ret)]
+pub(crate) async fn build_client_async(
+    cfg: &serde_json::Value,
+    sys_prompt_name: &str,
+) -> Box<dyn LlmInterface> {
+    let sys_prompt = crate::assets::load(sys_prompt_name);
+    if sys_prompt.is_none() {
+        warn!(
+            "{} not found on disk nor in embedded assets; LLM runs without system prompt",
+            sys_prompt_name
+        );
+    }
+    LlmClientBuilder::from_value(cfg)
+        .sys_prompt(sys_prompt)
+        .build_async()
+        .await
 }
 
 /// プロンプトの frontmatter で指定されたオプションを適用してから LLM を使う。
@@ -1284,6 +1517,9 @@ mod tests_reasoning {
 
     #[test]
     fn test_lmstudio_always_none() {
+        // LMStudio(Qwen3系)の thinking on/off は genai の汎用 reasoning_effort ラダーでは
+        // 表現しない(chat_template_kwargs.enable_thinking というブール制御を
+        // LlmClient::reasoning_level() が別経路で扱う)。map_reasoning() は常に None。
         for v in [0.0, 0.5, 1.0, 2.0] {
             assert!(matches!(
                 lmstudio().map_reasoning("model", v),
@@ -1438,6 +1674,9 @@ mod tests_capabilities {
 
     #[test]
     fn test_lmstudio_always_empty_regardless_of_model() {
+        // default_capabilities() はネットワークプローブ(probe_lmstudio_capabilities)
+        // が失敗/未実施のときの最終防衛線。プローブ結果の反映は build_async() 側の
+        // 責務であり、default_capabilities() 自体は変更していない。
         let lmstudio = Provider::LMStudio("model".to_string(), None);
         assert_eq!(
             lmstudio.default_capabilities("qwen3.5-2b-instruct"),
@@ -1471,6 +1710,192 @@ mod tests_capabilities {
             cf.default_capabilities("@cf/qwen/qwen1.5-14b-chat"),
             ModelCapability::TOOL_CALLING // "qwen" キーワードにマッチ
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_lmstudio_probe {
+    use super::*;
+
+    // 実サンプル: Ma7ee7/Qwen3.8_4B_Distilled_GGUF の chat_template を要約したもの。
+    // tools 分岐はあるが enable_thinking のようなトグル変数は無く、<think>/
+    // reasoning_content の処理はテンプレート側で固定的に行われる
+    // (= reasoning_effort を送っても効かない。LM Studio の実際の WARN
+    //  "No valid custom reasoning fields found" と整合する)。
+    const THINKING_FIXED_TEMPLATE: &str = r#"
+        {%- if tools %}
+            {{- '<tools>' }}
+        {%- endif %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- else %}
+            {%- if '</think>' in content %}
+                {%- set reasoning_content = content.split('</think>')[0] %}
+            {%- endif %}
+        {%- endif %}
+    "#;
+
+    // 標準的な Qwen3 系: enable_thinking で on/off を切り替えられるテンプレートを想定。
+    const THINKING_TOGGLE_TEMPLATE: &str = r#"
+        {%- if tools %}
+            {{- '<tools>' }}
+        {%- endif %}
+        {%- if enable_thinking is defined and enable_thinking is false %}
+            {{- '/no_think' }}
+        {%- endif %}
+    "#;
+
+    #[test]
+    fn test_chat_template_with_tools_but_fixed_thinking_grants_tool_calling_only() {
+        assert_eq!(
+            capabilities_from_chat_template(THINKING_FIXED_TEMPLATE),
+            ModelCapability::TOOL_CALLING
+        );
+    }
+
+    #[test]
+    fn test_chat_template_with_thinking_toggle_grants_reasoning_effort_too() {
+        assert_eq!(
+            capabilities_from_chat_template(THINKING_TOGGLE_TEMPLATE),
+            ModelCapability::TOOL_CALLING | ModelCapability::REASONING_EFFORT
+        );
+    }
+
+    #[test]
+    fn test_chat_template_empty_or_garbage_yields_empty_without_panic() {
+        assert_eq!(
+            capabilities_from_chat_template(""),
+            ModelCapability::empty()
+        );
+        assert_eq!(
+            capabilities_from_chat_template("{{{ not a template at all \0\0"),
+            ModelCapability::empty()
+        );
+    }
+
+    #[test]
+    fn test_lmstudio_api_root_strips_v1_suffix_variants() {
+        assert_eq!(
+            lmstudio_api_root("http://localhost:1234"),
+            "http://localhost:1234"
+        );
+        assert_eq!(
+            lmstudio_api_root("http://localhost:1234/"),
+            "http://localhost:1234"
+        );
+        assert_eq!(
+            lmstudio_api_root("http://localhost:1234/v1"),
+            "http://localhost:1234"
+        );
+        assert_eq!(
+            lmstudio_api_root("http://localhost:1234/v1/"),
+            "http://localhost:1234"
+        );
+    }
+
+    #[test]
+    fn test_explicit_capabilities_override_skips_probe() {
+        // capabilities が明示されていれば build_async() はプローブせず、
+        // from_value() が組み立てた capabilities をそのまま使う
+        // (LMStudio が起動していないテスト環境でも安定して通ることの確認)。
+        let builder = LlmClientBuilder::from_value(&serde_json::json!({
+            "provider": "lmstudio",
+            "model": "qwen3.8_4b_distilled_gguf",
+            "url": "http://127.0.0.1:1/", // 到達不能なポート
+            "capabilities": ["tool_calling", "structured_output"]
+        }));
+        assert_eq!(
+            builder.capabilities,
+            Some(ModelCapability::TOOL_CALLING | ModelCapability::STRUCTURED_OUTPUT)
+        );
+    }
+
+    #[test]
+    fn test_strip_unsupported_option_response_format() {
+        use genai::chat::{ChatResponseFormat, JsonSpec};
+        let mut opts = ChatOptions::default().with_response_format(ChatResponseFormat::JsonSpec(
+            JsonSpec::new("s", serde_json::json!({})),
+        ));
+        assert!(strip_unsupported_option(&mut opts, "response_format"));
+        assert!(opts.response_format.is_none());
+        // 既に外れていれば false(無限リトライ防止)
+        assert!(!strip_unsupported_option(&mut opts, "response_format"));
+    }
+
+    #[tokio::test]
+    async fn test_probe_returns_none_when_server_unreachable() {
+        // 到達不能なローカルポートへの疎通確認。LM Studio 未起動時に
+        // 初期化がハングしたりパニックしたりしないことの回帰確認。
+        let result = probe_lmstudio_capabilities("http://127.0.0.1:1/", "any-model").await;
+        assert_eq!(result, None);
+    }
+
+    /// 実際に起動中の LM Studio に対する結合確認。CI や LM Studio 未起動の環境では
+    /// 落ちる/スキップされるので `#[ignore]`。手元で `cargo test -- --ignored
+    /// test_probe_against_real_lmstudio_server` として実行する。
+    #[tokio::test]
+    #[ignore = "requires a running LM Studio server on localhost:1234"]
+    async fn test_probe_against_real_lmstudio_server() {
+        // tool_use capability を持つモデルであれば TOOL_CALLING が付く。
+        // 到達できた時点で STRUCTURED_OUTPUT は常に付く(層2の設計)。
+        let result = probe_lmstudio_capabilities("http://localhost:1234/v1/", "qwen/qwen3-4b-2507")
+            .await
+            .expect("LM Studio should be reachable for this manual check");
+        assert!(result.contains(ModelCapability::STRUCTURED_OUTPUT));
+        assert!(result.contains(ModelCapability::TOOL_CALLING));
+
+        // 一覧に無いモデル名でも、到達できた事実だけで STRUCTURED_OUTPUT は付く。
+        let unknown = probe_lmstudio_capabilities("http://localhost:1234/v1/", "no-such-model")
+            .await
+            .expect("reachable server should still return Some even for unknown model id");
+        assert_eq!(unknown, ModelCapability::STRUCTURED_OUTPUT);
+    }
+
+    /// テスト用に最小構成の LMStudio 向け LlmClient を組み立てる。
+    /// `genai::Client` は `Default` を実装しているので実際の HTTP 設定は不要。
+    fn lmstudio_test_client(capabilities: ModelCapability) -> LlmClient {
+        LlmClient {
+            provider: Provider::LMStudio("model".to_string(), None),
+            inner_client: genai::Client::default(),
+            options: ChatOptions::default(),
+            model: "model".to_string(),
+            cache: HashMap::new(),
+            prompts: vec![],
+            tools: HashMap::new(),
+            sys_prompt: String::new(),
+            capabilities,
+        }
+    }
+
+    #[test]
+    fn test_reasoning_level_sets_chat_template_kwargs_enable_thinking() {
+        // Qwen3系(chat_template に enable_thinking トグルがある)モデル相当。
+        // genai の汎用 reasoning_effort ではなく、Qwen公式の非標準フィールド
+        // chat_template_kwargs.enable_thinking を extra_body に積む。
+        let mut cl = lmstudio_test_client(ModelCapability::REASONING_EFFORT);
+
+        cl.reasoning_level(0.8);
+        assert_eq!(
+            cl.options.extra_body,
+            Some(serde_json::json!({"chat_template_kwargs": {"enable_thinking": true}}))
+        );
+        // reasoning_effort 自体は(LMStudio では使わないので)設定されない。
+        assert!(cl.options.reasoning_effort.is_none());
+
+        cl.reasoning_level(0.0);
+        assert_eq!(
+            cl.options.extra_body,
+            Some(serde_json::json!({"chat_template_kwargs": {"enable_thinking": false}}))
+        );
+    }
+
+    #[test]
+    fn test_reasoning_level_skips_extra_body_without_capability() {
+        // REASONING_EFFORT capability が無ければ(今回発端になった thinking 固定モデル相当)、
+        // 早期returnして extra_body は一切設定されない。
+        let mut cl = lmstudio_test_client(ModelCapability::TOOL_CALLING);
+        cl.reasoning_level(0.8);
+        assert!(cl.options.extra_body.is_none());
     }
 }
 

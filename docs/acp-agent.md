@@ -20,12 +20,18 @@ LSP の補完が見ているのは、カーソル直前の 10 文（`cursor_cont
 
 ```
 Zed ──stdio──> fifty_four_lsp --acp
-                 └─ ClaudeAgent          … writing_agent.rs
-                      └─ anthropic-agent-sdk
-                           └─ claude CLI （サブスクリプション認証をそのまま継承）
-                                └── <workspace>/.fifty_four/chat_context.md
-                                        ↑ LSP サーバ（別プロセス）が補完時に読む
+                 ├─ ClaudeAgent          … writing_agent.rs（会話本体）
+                 │    └─ anthropic-agent-sdk
+                 │         └─ claude CLI （サブスクリプション認証をそのまま継承）
+                 └─ llm.rs 経由の LLM   … acp.rs::update_digest（会話の要約）
+                      └─ Gemini 等（既定は Gemini。FIFTY_FOUR_ACP_LLM で変更可）
+                           └── <workspace>/.fifty_four/chat_context.md
+                                   ↑ LSP サーバ（別プロセス）が補完時に読む
 ```
+
+会話本体と要約は**別の LLM を使う**。会話本体は `claude` CLI(サブスク枠)に固定だが、
+要約は `llm.rs` の provider(LSP の `llm.ondemand`/`llm.deferred` と同じ仕組み)を通すため、
+Gemini 等の API キーで動く。詳細は「認証」節を参照。
 
 Zed は LSP サーバ（拡張経由）と ACP エージェント（`agent_servers` 経由）を**別プロセス**
 として起動する。Zed の拡張 API には ACP を登録する口が無い（language server /
@@ -55,25 +61,35 @@ Claude Agent SDK は Python と TypeScript のみで、他言語には「`claude
 
 ## 認証 — サブスクリプション枠
 
-LLM アクセスは `claude` CLI の認証をそのまま使う。**このエージェントは API キーを要求しないし、
-自前で保持もしない。** 以前は「`ANTHROPIC_API_KEY` を設定しなければサブスク枠で動く」という
-ドキュメント上の但し書きに過ぎず、実際にはコード側で何も担保していなかった
-（`.env` の provider キーがそのまま使われる／子プロセスが親の環境を継承する、の 2 経路で
-API キー課金になり得た）。現在は次の 2 点を**コードで**担保している(`lsp/src/main.rs`)。
+**会話本体**の LLM アクセスは `claude` CLI の認証をそのまま使う。以前は「`ANTHROPIC_API_KEY`
+を設定しなければサブスク枠で動く」というドキュメント上の但し書きに過ぎず、実際にはコード側で
+何も担保していなかった（`.env` の provider キーがそのまま使われる／子プロセスが親の環境を
+継承する、の 2 経路で API キー課金になり得た）。現在は次の 2 点を**コードで**担保している
+(`lsp/src/main.rs`)。
 
-1. **`.env` を読まない。** `--acp` 時は `load_dev_env()` を呼ばない。ACP 経路は provider の
-   API キーを一切必要としないので、そもそも読む理由が無い。
-2. **プロセス環境から Anthropic の資格情報を削除する。** `anthropic-agent-sdk` は子プロセス
-   (`claude` CLI) へ親プロセスの環境を丸ごと渡す(`env::vars()` → `Command::envs`)。
-   `ClaudeAgentOptions::env` には削除の口が無く insert しかできないため、シェルや Zed が
-   `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` を export していると打ち消せない。
-   Anthropic の認証解決は `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → ログイン済み
-   プロファイルの順でキーが在る限り先に勝つため、`scrub_anthropic_credentials()` が
-   tokio ランタイムを起動する前(シングルスレッドな時点)にこの 2 変数を
+1. **`.env` を読む(要約用)。** `--acp` 時も `load_dev_env()` を呼ぶ。理由は**要約
+   (chat digest)が `llm.rs` の provider(既定は Gemini)を使う**ため、その API キーを
+   `.env` から取る必要があるから(下記「プロンプト」節の `update_digest` 参照)。
+2. **その直後にプロセス環境から Anthropic の資格情報を削除する。** `anthropic-agent-sdk`
+   は子プロセス(`claude` CLI) へ親プロセスの環境を丸ごと渡す(`env::vars()` →
+   `Command::envs`)。`ClaudeAgentOptions::env` には削除の口が無く insert しかできないため、
+   シェルや Zed が `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` を export していると、
+   あるいは `.env` にそれらが書かれていると打ち消せない。Anthropic の認証解決は
+   `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → ログイン済みプロファイルの順で
+   キーが在る限り先に勝つため、`scrub_anthropic_credentials()` が `load_dev_env()` の
+   **直後**(まだ tokio ランタイムを起動する前、シングルスレッドな時点)にこの 2 変数を
    `std::env::remove_var` で実際に消している。
 
-**逃げ道は設けていない。** release ビルドで `--acp` 自体を機能ごと落とす以上
-（下記参照）、API キーで動かすユースケースは存在しない。
+> **順序が要。** `load_dev_env()` → `scrub_anthropic_credentials()` の順で呼ぶことで、
+> 「要約用の provider キーは入る」「Anthropic のキーだけは必ず消える」の両方が成り立つ。
+> 逆順にすると `.env` の `ANTHROPIC_API_KEY` が残ったまま `claude` CLI が起動し、
+> 会話本体がサブスク枠ではなく API キー課金で動いてしまう。この順序は
+> `lsp/src/main.rs` のテストで固定してある。
+
+**会話本体を API キーで動かす逃げ道は設けていない。** release ビルドで `--acp` 自体を
+機能ごと落とす以上（下記参照）、会話本体を API キーで動かすユースケースは存在しない。
+要約が provider の API キーを使うのはこの判断と別で、規約上の建て付け(下記の
+Anthropic Agent SDK の注意書き)は会話本体にのみ関わる。
 
 > ⚠️ Anthropic の Agent SDK ドキュメントには次の注意書きがある。
 >
@@ -88,34 +104,59 @@ API キー課金になり得た）。現在は次の 2 点を**コードで**担
 > 選択肢は採らず、**release ビルドでは `--acp` 自体が起動しない**ようにしてこの問題を
 > 構造的に回避している。
 
-## CLAUDE.md を一切読ませない
+## グローバル設定は読ませない、ワークスペース側は読む
 
 コーディング向けの CLAUDE.md が執筆用エージェントに混ざると邪魔になるので、
-**プロジェクトのものも `~/.claude/CLAUDE.md` も含めて全て無効化**している。
+**`~/.claude/CLAUDE.md`（グローバル側）は無効化**している。一方、ワークスペース側
+（原稿を置いているディレクトリの `.claude/`）は skill を使うために**有効**にしている。
 
 | 目的 | 実装 | 実際に `claude` へ渡るフラグ |
 |---|---|---|
 | システムプロンプト完全置換 | `SystemPrompt::String`（`data/system_chat.md`） | `--system-prompt <本文>` |
-| CLAUDE.md / output styles / settings.json 全無効化 | `setting_sources` を**設定しない** | `--setting-sources ""` |
+| グローバル無効化・ワークスペース側は有効化 | `setting_sources` に `Project` のみ | `--setting-sources project` |
 
 `--setting-sources` は "Comma-separated list of setting sources to load (user, project, local)"
-なので、空文字は「どれも読まない」を意味する。この挙動はクレートの既定でもあり
-（`src/transport/subprocess.rs`）、公式 TS/Python SDK の既定（`project` と `user` を
-**有効化**）より厳しい。
+なので、`project` のみを渡すと `user`（グローバル）は読まず、ワークスペース直下の
+`.claude/`（CLAUDE.md・`settings.json`・skill・output styles）だけを読む。`local`
+（`settings.local.json`、個人用の上書き）は skill 探索に関与しないため含めていない。
+
+> ⚠️ **原稿ワークスペースにコーディング向けの CLAUDE.md を置かないこと。** グローバルは
+> 締め出しても、原稿ワークスペース直下に `CLAUDE.md` を置けばそちらは読み込まれる
+> （`project` ソースが有効なため）。原稿執筆用のワークスペースにコーディング規約が
+> 紛れ込むと会話の邪魔になる。
 
 実際に渡っている argv は `data/` のプロンプトを差し替えずに確認できる（後述の「動作確認」）。
+
+## skill
+
+`<workspace>/.claude/skills/<name>/SKILL.md` に Claude Code と同じ形式の skill を
+置くと、執筆相談エージェントからも使える。上記の通り `setting_sources` に `Project`
+を含めているため探索自体は効くが、それだけでは呼び出せないので `ALLOWED_TOOLS`
+（下記「ツールと権限」節）に `Skill` を明示的に加えてある。
+
+```
+<workspace>/.claude/skills/plot-check/SKILL.md
+```
+
+`SKILL.md` の frontmatter に `name` / `description` を持たせる。`description` が
+「この場面でこの skill を使うべきか」の判断材料になる点は Claude Code と同じ。
+
+**`Bash` を前提にする skill はここでは動かない。** `ALLOWED_TOOLS` に `Bash` を
+入れていない（下記「ツールと権限」節）ため、skill 本文が `Bash` 実行を要求しても
+そこで止まる。
 
 ## ツールと権限
 
 エージェントに許可するツールは明示的に絞ってある（`writing_agent.rs` の `ALLOWED_TOOLS`）。
 
 ```
-Read, Write, Edit, Glob, Grep, WebSearch, WebFetch
+Read, Write, Edit, Glob, Grep, WebSearch, WebFetch, Skill
 ```
 
 **`Bash` は許可しない。** 原稿ディレクトリで任意のコマンドを実行できる必要は無く、
 許可範囲は狭いほどよい。characters.md / plot.md / memo/*.md の読み書きはファイルツールで足り、
-調べ物は `WebSearch` / `WebFetch` で足りる。
+調べ物は `WebSearch` / `WebFetch` で足りる。skill を呼び出すための `Skill` はこの
+方針とは別枠（上記「skill」節参照）。
 
 権限モードは `acceptEdits`。ACP の権限要求フロー（`session/request_permission`）を
 実装していないため、編集のたびに承認を求められると会話が進まなくなる。
@@ -128,8 +169,8 @@ Read, Write, Edit, Glob, Grep, WebSearch, WebFetch
 2. `session/prompt` を受けてエージェントへ中継し、応答テキストを届いた順に
    `AgentMessageChunk` としてクライアントへ流す
 3. `PromptResponse(StopReason::EndTurn)` を返す
-4. **応答を返したあと**、別セッションの一発問い合わせ（ツール不許可・`max_turns 1`）で
-   直近 8 ターンを要約し、`chat_context.md` へ書き出す
+4. **応答を返したあと**、`crate::llm` 経由の要約用 LLM（`claude` CLI とは別。上記
+   「プロンプト」節参照）で直近 8 ターンを要約し、`chat_context.md` へ書き出す
 
 要約を対話用クライアントと分けてあるので、要約中でも次のターンを受けられる。
 `session/cancel` を受けたら `interrupt()` で進行中のターンを止める。
@@ -142,8 +183,9 @@ Read, Write, Edit, Glob, Grep, WebSearch, WebFetch
 
 ### エージェントの登録
 
-`settings.json` の `agent_servers` に手で書く。**API キーの環境変数は要らない
-（設定されていても `scrub_anthropic_credentials()` が無視する）。** `--acp` は debug ビルド
+`settings.json` の `agent_servers` に手で書く。**Anthropic の API キーの環境変数は要らない
+（設定されていても `scrub_anthropic_credentials()` が無視する）。** 一方、**要約用の
+provider(既定 Gemini)の API キーは必要**（上記「プロンプト」節参照）。`--acp` は debug ビルド
 限定なので、パスは `target/debug/fifty_four_lsp` を指す（`--release` の成果物では動かない）。
 
 ```json
@@ -208,7 +250,32 @@ Read, Write, Edit, Glob, Grep, WebSearch, WebFetch
 |---|---|
 | `data/system_chat.md` | 会話用システムプロンプト。Claude Code の既定を**置き換える**ので、役割・原稿ディレクトリの約束事（plot.md / キャラ設定 / memo/）・本文 `.txt` を勝手に編集しない旨まで全てここに書く |
 | `data/system_chat_digest.md` | 要約用システムプロンプト |
-| `data/prompt_chat_digest.md` | 要約の指示。`{{HISTORY}}` |
+| `data/prompt_chat_digest.md` | 要約の指示。`{{HISTORY}}`。frontmatter の `max_tokens`/`temperature` も適用される |
+
+**要約(`acp.rs::update_digest`)は `crate::llm::use_llm_with_option` 経由で動く。**
+LSP ハンドラ(`Backend::use_llm_with_option`)と同じ自由関数を使っており、`claude` CLI
+(会話本体)とは独立した LLM クライアントを1つ持って使い回す(`AgentState::digest_llm`)。
+
+使う provider/model は環境変数 `FIFTY_FOUR_ACP_LLM` で指定する(LSP の
+`llm.ondemand`/`llm.deferred` と同じ JSON 形式)。ACP には LSP の
+`initialization_options` に相当する経路が無いため、Zed の `agent_servers.env` 経由で渡す:
+
+```json
+{
+  "agent_servers": {
+    "fifty-four": {
+      "command": "/path/to/fifty_four/target/debug/fifty_four_lsp",
+      "args": ["--acp"],
+      "env": { "FIFTY_FOUR_ACP_LLM": "{\"provider\":\"google\",\"model\":\"gemini-pro-latest\"}" }
+    }
+  }
+}
+```
+
+未設定・JSON 不正・`provider` が未知の値の場合は既定(Gemini)へフォールバックする
+(`acp.rs::digest_llm_config`)。使う provider に応じた API キー(`GEMINI_API_KEY` 等)は
+`.env`(または OS のユーザー環境変数)に置く。設定可能な provider は
+[lsp-handlers.md](lsp-handlers.md) の LLM 設定と同じ。
 
 補完・code action 側のテンプレート（`prompt_completion*.md`、`prompt_fill_mark.md`、
 `prompt_rephrase.md`）には `{{CHAT}}` を追加してある。見出しごと Rust 側
@@ -250,7 +317,9 @@ PATH=/tmp/stubbin:$PATH fifty_four_lsp --acp   # 別端末から ACP を喋る
 cat /tmp/claude-argv.txt                        # --setting-sources が空で渡っているか
 ```
 
-`--setting-sources` の次の行が**空行**になっていれば、CLAUDE.md 類が締め出されている。
+`--setting-sources` の次の行が **`project`** になっていれば、グローバル
+（`~/.claude/`）は締め出されつつワークスペース側（skill 含む）は読まれる設定になっている。
+`--allowedTools` の値に `Skill` が含まれていることも合わせて確認する。
 
 ### 子プロセスの環境を確認する（API 消費ゼロ）
 

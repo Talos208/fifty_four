@@ -222,7 +222,7 @@ impl LanguageServer for Backend {
                 });
 
                 if let Some(cfg) = ondemand_cfg {
-                    let cl = crate::llm::build_client(cfg, "system.md");
+                    let cl = crate::llm::build_client_async(cfg, "system.md").await;
                     debug!(
                         "llm.ondemand built.\tmodel: {:?}\n\tservice_target: {}",
                         cl,
@@ -252,7 +252,7 @@ impl LanguageServer for Backend {
                         }
                     })
                 {
-                    let cl = crate::llm::build_client(cfg, "system.md");
+                    let cl = crate::llm::build_client_async(cfg, "system.md").await;
                     debug!(
                         "llm.deferred built.\tmodel: {:?}\n\tservice_target: {}",
                         cl,

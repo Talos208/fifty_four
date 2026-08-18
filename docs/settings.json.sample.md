@@ -16,6 +16,16 @@ API キーの環境変数(`GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_K
 明示しないと 400 になることがあるので、対応表は [lsp-handlers.md](lsp-handlers.md) の
 「xAI (Grok) の `reasoning_effort` 対応」を参照。
 
+`lmstudio` は通常 `capabilities` を書く必要はない(起動時に LM Studio 自身と HuggingFace への
+問い合わせで自動推定される。詳細は [lsp-handlers.md](lsp-handlers.md) の
+「LMStudio の capability 自動推定」を参照)。自動推定を上書きしたいときだけ明示する。
+
+Qwen3 系(`enable_thinking` トグルを持つモデル)は reasoning 制御に `chat_template_kwargs` を使うが、
+**現行の LM Studio にはこれを壊すバグがある**(補完が空になる。詳細は [lsp-handlers.md](lsp-handlers.md) の
+「Qwen3 系の reasoning 制御と既知の LM Studio 不具合」参照)。影響を受ける場合は
+`capabilities` に `"structured_output"`/`"tool_calling"` のみを明示し `"reasoning_effort"` を
+含めないことでオプトアウトできる。
+
 ```json
 {
   "lsp": {

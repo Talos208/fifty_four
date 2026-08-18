@@ -279,11 +279,70 @@ LSP バイナリの起動コマンドを指示する(Zed 拡張側、`extension/
 | `google` / `openai` / `anthropic` | 常に `structured_output` + `tool_calling` + `reasoning_effort` + `stop_sequences`(`reasoning_effort` の段数はモデル依存。下記参照) |
 | `xai` | 常に `structured_output` + `tool_calling`。`reasoning_effort` はモデル名依存(下表参照) |
 | `cloudflare` | モデル名に `instruct`/`hermes`/`qwen`/`mistral` を含む場合のみ `tool_calling`、それ以外は空 |
-| `lmstudio` | 常に空(ローカルモデルは多様なため自動判定しない。構造化出力に対応したモデルを使うなら `capabilities` で明示すること) |
+| `lmstudio` | ネットワーク越しの自動推定(下記「LMStudio の capability 自動推定」参照)。到達不能なら空にフォールバック |
 
 `capabilities` に指定できる値は `structured_output` / `tool_calling` / `reasoning_effort` / `stop_sequences` の4つ。
 **`capabilities` を明示すると上記の自動導出結果は完全に置き換わる**(マージではない)。一部だけ足したい場合も
 必要な値を全て書くこと。
+
+##### LMStudio の capability 自動推定(2026-08 時点)
+
+ローカルモデルはラインナップが多様で静的表を持てないため、`lsp/src/llm.rs` の
+`LlmClientBuilder::build_async`(`build_client_async` 経由で `ondemand`/`deferred` 双方から呼ばれる)が
+起動時に以下の順でネットワーク越しに推定する。`capabilities` を明示した場合はこの推定自体を行わない。
+
+1. **LM Studio `/api/v0/models` への到達**(`probe_lmstudio_capabilities`)
+   - `/api/v0` 名前空間は LM Studio 0.3.6+ にのみ存在するため、**到達できたこと自体**を
+     「json_schema (llama.cpp の GBNF grammar) をサーバ側で強制できる」根拠とみなし、
+     モデルが一覧に見つからなくても `structured_output` を付与する
+     (json_schema はモデルの能力ではなくサーバの機能であるため)。
+   - 一覧中のモデルエントリの `capabilities` に `tool_use` があれば `tool_calling` を付与する。
+2. **HuggingFace の GGUF リポジトリメタデータ**(`probe_huggingface_capabilities`、best-effort)
+   - LM Studio のモデルエントリの `publisher`/`id` から HuggingFace repo を復元できた場合のみ、
+     `chat_template`(Jinja)を追加のヒントとして重ねる。
+   - テンプレートに `tools` への分岐があれば `tool_calling`、`enable_thinking` 等の思考トグル変数が
+     あれば `reasoning_effort` を追加で付与する。`<think>` タグの有無だけでは判定しない
+     (thinking が常時固定でトグルできないモデルがあるため。実例: 後述)。
+   - LM Studio のカタログ id は実際の HF repo 名と一致しないことがあり、その場合は 404/401 で
+     単に何も足さない(LM Studio 側の判定はそのまま活きる)。
+3. **フォールバック**: LM Studio 未起動・タイムアウト(2秒)・パース失敗などは全て `debug!` に
+   留めて空にフォールバックする。ローカルサーバの疎通性で LSP の初期化を止めないため。
+
+実例: `Ma7ee7/Qwen3.8_4B_Distilled_GGUF`(Qwen3 Thinking 固定モデル)は `tools` 分岐はあるが
+`enable_thinking` トグルを持たないため `tool_calling` のみが付き `reasoning_effort` は付かない。
+これは LM Studio 側が出す `No valid custom reasoning fields found ...` という WARN
+(thinking を切り替えるための GGUF metadata KV が無い)と整合する。
+
+##### Qwen3 系の reasoning 制御(`chat_template_kwargs.enable_thinking`)と既知の LM Studio 不具合
+
+`enable_thinking` トグルを持つモデル(`reasoning_effort` capability 付き)に対して
+`LlmClient::reasoning_level()` を呼ぶと、genai の汎用 `reasoning_effort` パラメータではなく
+Qwen公式ドキュメント準拠の `extra_body: {"chat_template_kwargs": {"enable_thinking": bool}}` を送る
+(`llm.rs` の `reasoning_level()` 内の `Provider::LMStudio` 分岐)。このため `Provider::LMStudio` は
+`AdapterKind::OpenAI`(`/v1/chat/completions`)を使う(`extra_body` のマージは genai の OpenAI アダプタにしか
+実装されておらず、以前使っていた `AdapterKind::Anthropic` 経由の `/v1/messages` では届かない)。
+
+**既知の不具合**: `Qwen3.5-0.8B-Q8_0.gguf` を使い、同一の llama.cpp バイナリ(LM Studio が内部で使う
+`llama-server.exe`)へ別ポートで直接投げた場合は `enable_thinking:false`/`true` とも正しく機能する
+(false で reasoning 0字、true で reasoning を経て正しく本文が出る)ことを確認済み。**ところが LM Studio
+自身(`http://localhost:1234`)を経由すると、`chat_template_kwargs` を付けるだけで(true/false 問わず)
+reasoning が収束せず `max_tokens` を使い切り本文が空になる**(LM Studio のバグトラッカー
+[issue #1990](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1990) と一致)。
+つまりメカニズム自体は正しいが、LM Studio 側のラッパー層(`No valid custom reasoning fields ...`
+WARN を出している処理)が壊している。
+
+**オプトアウト**: この不具合の影響を受ける場合は、`capabilities` を明示して `reasoning_effort` を
+含めなければよい(既存の明示指定は自動推定を完全に置き換えるため、そのまま無効化できる)。
+
+```json
+"deferred": {
+  "provider": "lmstudio",
+  "model": "qwen3.5-0.8b",
+  "capabilities": ["structured_output", "tool_calling"]
+}
+```
+
+LM Studio 側の不具合が直れば、コード変更なしにこのオプトアウトを外すだけで有効化できる。
 
 ##### xAI (Grok) の `reasoning_effort` 対応(2026-08 時点)
 

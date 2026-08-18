@@ -112,11 +112,11 @@ classDiagram
 | `llm` | `llm.ondemand` | 文章補完（ユーザー操作に同期） |
 | `background_llm` | `llm.deferred`（未指定時は `ondemand` と同じ） | キャラ設定更新（バックグラウンド） |
 
-どちらも `LlmClientBuilder` → `GenericLlmClient` 経由で `genai` クレートを利用する。プロバイダは Google / OpenAI / Anthropic / xAI / LMStudio / Cloudflare Workers AI に対応。
+どちらも `LlmClientBuilder` → `GenericLlmClient` 経由で `genai` クレートを利用する。プロバイダは Google / OpenAI / Anthropic / xAI / LMStudio / Cloudflare Workers AI に対応。LMStudio は `AdapterKind::OpenAI`(`/v1/chat/completions`)を使う。Qwen3 系の reasoning 制御(`chat_template_kwargs.enable_thinking`、詳細は [lsp-handlers.md](lsp-handlers.md))が genai の OpenAI アダプタにしかマージされないため。
 
 Cloudflare Workers AI は OpenAI 互換エンドポイント（`AdapterKind::OpenAI`）を利用し、認証には環境変数 `CLOUDFLARE_API_TOKEN` を使う。エンドポイントURLはアカウントIDから `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/` の形で組み立てるため、設定に `account_id` を指定する必要がある（設定例は [lsp-handlers.md](lsp-handlers.md) 参照）。
 
-各プロバイダの `capabilities`（`structured_output` / `tool_calling`）は、明示設定がなければプロバイダと実効モデル名から自動導出される（`Provider::default_capabilities`）。LMStudio はローカルLLM前提でモデル構成が多様なため常に未対応（空）として扱い、必要なら設定側で明示する。
+各プロバイダの `capabilities`（`structured_output` / `tool_calling`）は、明示設定がなければプロバイダと実効モデル名から自動導出される（`Provider::default_capabilities`）。LMStudio はローカルLLM前提でモデル構成が多様なため静的表を持たず、代わりに起動時に LM Studio の `/api/v0/models`(権威)と HuggingFace の GGUF メタデータ(best-effort)へネットワーク越しに問い合わせて自動推定する(`LlmClientBuilder::build_async` / `probe_lmstudio_capabilities`)。到達不能な場合は安全側の空にフォールバックする。詳細は [lsp-handlers.md](lsp-handlers.md) の「LMStudio の capability 自動推定」参照。
 
 ## エージェント（AGENTS.md との対応）
 

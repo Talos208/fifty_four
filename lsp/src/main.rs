@@ -73,6 +73,12 @@ fn load_dev_env() {
 /// `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → ログイン済みプロファイルの順で、
 /// キーが在る限り先に勝つため、実際に消すしかない。
 ///
+/// `--acp` は要約(chat digest)用に `load_dev_env()` で `.env` を読むようになった
+/// (`crate::acp::update_digest` 参照)ため、シェル/Zed からの継承だけでなく `.env` に
+/// `ANTHROPIC_API_KEY` があるケースもここで弾く。**`load_dev_env()` の直後に呼ぶこと**
+/// (`main()` 参照。順序を逆にすると `.env` のキーが残ったまま `claude` CLI が起動し、
+/// サブスク枠ではなく API キー課金で動いてしまう)。
+///
 /// # Safety
 /// `remove_var` は他スレッドが環境を読んでいると UB。tokio ランタイムを起こす前の
 /// シングルスレッドな時点でのみ呼ぶこと。
@@ -83,7 +89,8 @@ fn scrub_anthropic_credentials() {
             // ログ初期化前なので eprintln!。黙って消すと
             // 「なぜ自分のキーが効かないのか」を追えない。
             eprintln!(
-                "--acp: {} を無視します(claude CLI のサブスクリプション枠で動かすため)",
+                "--acp: {} を無視します(シェル/Zed からの継承、または .env 由来。\
+                 claude CLI のサブスクリプション枠で動かすため)",
                 key
             );
             unsafe { std::env::remove_var(key) };
@@ -150,8 +157,14 @@ fn main() {
 
     #[cfg(debug_assertions)]
     if acp {
-        // ACP 経路は provider の API キーを一切必要としない(LLM は claude CLI 経由)。
-        // .env を読む理由が無いので読まない。
+        // 会話本体(claude CLI)はサブスク枠のままだが、要約(chat digest)は
+        // `llm.rs` の provider(Gemini 等)を使うため、そちらの API キーを
+        // `.env` から読む必要がある(`crate::acp::update_digest` 参照)。
+        // 読んだ直後に Anthropic の資格情報だけ消すので、`claude` CLI が
+        // 誤って API キー課金へ落ちることはない
+        // (**順序が重要**: 消す前に読むと Anthropic のキーも一瞬入るが、
+        // scrub が必ずそれを取り除いてから claude CLI を起動する)。
+        load_dev_env();
         scrub_anthropic_credentials();
         default_acp_log_level();
     } else {
@@ -316,6 +329,28 @@ mod tests {
         assert!(value.contains("fifty_four_lsp::acp=debug"));
 
         unsafe { std::env::remove_var("RUST_LOG") };
+    }
+
+    /// `--acp` 時、`.env` を読んだ**あと**に Anthropic の資格情報を消すという順序を
+    /// 固定する回帰テスト。逆順(消してから読む)にすると `.env` の
+    /// `ANTHROPIC_API_KEY` が生き残り、`claude` CLI がサブスク枠ではなく
+    /// API キー課金で動いてしまう(要約用に `load_dev_env()` を足したときに
+    /// 一番壊しやすい箇所なので、`main()` の呼び出し順そのものではなく、
+    /// 「読み込み後に scrub すれば必ず消える」という性質をここで固定する)。
+    #[test]
+    fn test_scrub_after_load_dev_env_removes_anthropic_keys_regardless_of_source() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // `.env` を読んだ直後の状態を模して、Anthropic のキーが環境に入っている
+        // ケースを再現する(実際には dotenvx が .env から復号して入れる)。
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-dummy-from-dotenv");
+            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "dummy-token-from-dotenv");
+        }
+
+        scrub_anthropic_credentials();
+
+        assert!(std::env::var_os("ANTHROPIC_API_KEY").is_none());
+        assert!(std::env::var_os("ANTHROPIC_AUTH_TOKEN").is_none());
     }
 
     /// panic hook 本体(`std::panic::set_hook`)はプロセス全体に効いてしまい、

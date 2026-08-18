@@ -11,13 +11,18 @@
 //! 案内されている。このクレートも中身は同じで CLI のラッパーなので、いざとなれば
 //! 同じフラグを自前で組み立てる実装に置き換えられる(下記 `CLI フラグ`参照)。
 //!
-//! # CLAUDE.md を一切読ませない
+//! # グローバル設定は読ませない、ワークスペース側は読む
 //!
-//! 執筆用エージェントに、コーディング向けの CLAUDE.md が混ざると邪魔になる。
-//! `setting_sources` を **設定しない**ことで、クレートは `--setting-sources ""` を渡す。
-//! これによりプロジェクトの `CLAUDE.md` も `~/.claude/CLAUDE.md` も output styles も
-//! `settings.json` も一切読み込まれない。加えて [`SystemPrompt::String`] を使うので
-//! `--system-prompt` となり、Claude Code の既定プロンプトも丸ごと置き換わる。
+//! コーディング向けの `~/.claude/CLAUDE.md`(や output styles / settings.json)が
+//! 執筆用エージェントに混ざると邪魔になるので、`setting_sources` に
+//! [`SettingSource::Project`] だけを渡す(`User`/`Local` は含めない)。これにより
+//! クレートは `--setting-sources project` を渡し、**グローバル側は締め出したまま**
+//! ワークスペース側(原稿を置いているディレクトリ)の `.claude/` だけを読む。
+//! これは skill(`<workspace>/.claude/skills/<name>/SKILL.md`)をワークスペース側に
+//! 置いて使うための変更(詳細は [`docs/acp-agent.md`] の「skill」節)。
+//! 加えて [`SystemPrompt::String`] を使うので `--system-prompt` となり、
+//! Claude Code の既定プロンプトも丸ごと置き換わる(こちらは `setting_sources` とは
+//! 独立で、`project` を有効にしても既定プロンプトが復活するわけではない)。
 //!
 //! # CLI フラグ
 //!
@@ -25,13 +30,13 @@
 //!
 //! ```text
 //! --system-prompt <data/system_chat.md の中身>
-//! --setting-sources ""
-//! --allowedTools Read,Write,Edit,Glob,Grep,WebSearch,WebFetch
+//! --setting-sources project
+//! --allowedTools Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Skill
 //! ```
 
 use crate::acp_config::SessionConfig;
 use anthropic_agent_sdk::{
-    ClaudeAgentOptions, ClaudeSDKClient, ContentBlock, Message, PermissionMode, StreamExt, query,
+    ClaudeAgentOptions, ClaudeSDKClient, ContentBlock, Message, PermissionMode, SettingSource,
 };
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
@@ -43,7 +48,10 @@ use tracing::instrument;
 /// 執筆支援に必要なものだけを明示的に挙げる。**`Bash` は入れない** —
 /// 原稿ディレクトリで任意のコマンドを実行できる必要はなく、許可範囲は狭いほどよい。
 /// `Read`/`Write`/`Edit`/`Glob`/`Grep` があれば characters.md・plot.md・memo/*.md の
-/// 読み書きは足りるし、`WebSearch`/`WebFetch` で調べ物もできる。
+/// 読み書きは足りるし、`WebSearch`/`WebFetch` で調べ物もできる。`Skill` は
+/// ワークスペース側の `.claude/skills/` を呼び出すために追加した(`setting_sources`
+/// で `project` を有効にしても、このツール自体を許可しないと起動できない)。
+/// **`Bash` を前提にする skill はここでは動かない**(意図的な制約)。
 const ALLOWED_TOOLS: &[&str] = &[
     "Read",
     "Write",
@@ -52,6 +60,7 @@ const ALLOWED_TOOLS: &[&str] = &[
     "Grep",
     "WebSearch",
     "WebFetch",
+    "Skill",
 ];
 
 /// エージェント操作の失敗。
@@ -111,7 +120,7 @@ pub(crate) trait WritingAgent: Send + Sync + std::fmt::Debug {
 /// (このモジュールが履歴を組み立て直す必要はない)。
 pub(crate) struct ClaudeAgent {
     client: tokio::sync::Mutex<ClaudeSDKClient>,
-    /// 要約の一発問い合わせで使い回すワークスペースルート。
+    /// このエージェントが動いているワークスペースルート(デバッグ表示用)。
     root: PathBuf,
     /// `--resume` で起動されたか(`session/load`、またはモデル/effort変更による
     /// 再起動)。`Message::Result{is_error:true}` の文言選びに使う
@@ -146,14 +155,16 @@ impl ClaudeAgent {
         resume: bool,
         config: &SessionConfig,
     ) -> Result<Self, AgentError> {
-        // `setting_sources` をあえて設定しない — これがクレート側で
-        // `--setting-sources ""` になり CLAUDE.md 類を全て締め出す(モジュール冒頭参照)。
+        // `setting_sources` に `Project` だけを渡す — クレート側で
+        // `--setting-sources project` になり、グローバル(`User`)は締め出したまま
+        // ワークスペース側の `.claude/`(skill 含む)だけを読む(モジュール冒頭参照)。
         let mut options = if resume {
             ClaudeAgentOptions::builder()
                 .system_prompt(system_prompt)
                 .cwd(root.to_path_buf())
                 .permission_mode(PermissionMode::AcceptEdits)
                 .allowed_tools(tool_names())
+                .setting_sources(vec![SettingSource::Project])
                 .resume(session_id)
                 .build()
         } else {
@@ -162,6 +173,7 @@ impl ClaudeAgent {
                 .cwd(root.to_path_buf())
                 .permission_mode(PermissionMode::AcceptEdits)
                 .allowed_tools(tool_names())
+                .setting_sources(vec![SettingSource::Project])
                 .session_id(session_id)
                 .build()
         };
@@ -190,57 +202,6 @@ impl ClaudeAgent {
             root: root.to_path_buf(),
             resumed: resume,
         })
-    }
-
-    /// 会話とは別セッションで一発だけ問い合わせる(要約用)。
-    ///
-    /// ツールを一切許可せず `max_turns(1)` で回すので、応答は素のテキスト1回で返る。
-    /// 会話用のクライアントとは独立しているため、要約が進行中の対話へ混ざらない。
-    #[instrument]
-    pub(crate) async fn one_shot(
-        root: &Path,
-        system_prompt: String,
-        prompt: String,
-    ) -> Result<String, AgentError> {
-        let options = ClaudeAgentOptions::builder()
-            .system_prompt(system_prompt)
-            .cwd(root.to_path_buf())
-            .disallowed_tools(tool_names())
-            .max_turns(1)
-            .build();
-
-        let stream = query(prompt, Some(options)).await.map_err(cli_error)?;
-        let mut stream = Box::pin(stream);
-
-        let mut out = String::new();
-        while let Some(message) = stream.next().await {
-            let message = match parse_line(message)? {
-                ParsedLine::Message(m) => m,
-                // 要約用の一発問い合わせでは枠の使用率を見せる先が無いので単に読み捨てる。
-                ParsedLine::RateLimit(_) | ParsedLine::Skip => continue,
-            };
-            match message {
-                Message::Assistant { message, .. } => append_text(&mut out, &message.content),
-                Message::Result {
-                    is_error,
-                    subtype,
-                    errors,
-                    result,
-                    ..
-                } => {
-                    if is_error {
-                        let detail = describe_result_error(&subtype, &errors, &result);
-                        warn!("acp: chat digest 生成が失敗結果を返しました: {}", detail);
-                        return Err(AgentError {
-                            message: format!("claude reported an error result ({})", detail),
-                        });
-                    }
-                    break;
-                }
-                _ => {}
-            }
-        }
-        Ok(out)
     }
 
     /// `Message::Result{is_error:true}` を分かりやすい `AgentError` へ変換する。

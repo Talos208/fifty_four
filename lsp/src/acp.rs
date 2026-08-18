@@ -12,9 +12,10 @@
 //!
 //! ```text
 //! Zed ──stdio──> fifty_four_lsp --acp
-//!                  └─ ClaudeAgent (Claude Agent SDK → claude CLI)
-//!                       └── <workspace>/.fifty_four/chat_context.md
-//!                              ↑ LSP サーバ(別プロセス)が補完時に読む
+//!                  └─ ClaudeAgent (Claude Agent SDK → claude CLI)  … 会話本体
+//!                  └─ llm.rs 経由の LLM (Gemini 等)                … 会話の要約
+//!                       │                    └── <workspace>/.fifty_four/chat_context.md
+//!                       │                           ↑ LSP サーバ(別プロセス)が補完時に読む
 //! ```
 //!
 //! Zed は LSP サーバ(拡張経由)と ACP エージェント(`agent_servers` 設定経由)を
@@ -25,9 +26,16 @@
 //!
 //! # 認証
 //!
-//! LLM アクセスは Claude Agent SDK 経由、つまり `claude` CLI の認証をそのまま使う。
+//! **会話本体**は Claude Agent SDK 経由、つまり `claude` CLI の認証をそのまま使う。
 //! `ANTHROPIC_API_KEY` を設定しなければ、ログイン済み CLI のサブスクリプション枠で動く。
-//! このモジュールは API キーを要求しないし、自前で持つこともしない。
+//!
+//! **要約(chat digest)** は [`update_digest`] が `crate::llm` 経由で別 provider
+//! (既定は Gemini)を呼ぶ。`--acp` 時も `.env` を読むようになった([`crate::main`] の
+//! `load_dev_env`)ため provider の API キーはここから取れるが、Anthropic の資格情報は
+//! 読み込み直後に必ず取り除かれる(`scrub_anthropic_credentials`)ので、会話本体が
+//! 誤って API キー課金になることはない。使う provider/model は環境変数
+//! `FIFTY_FOUR_ACP_LLM` で `{"provider": "...", "model": "..."}` 形式で指定でき、
+//! 無ければ既定(Gemini)にフォールバックする([`digest_llm_config`] 参照)。
 
 use crate::acp_config::{self, SessionConfig};
 use crate::writing_agent::{AgentError, ClaudeAgent, WritingAgent};
@@ -119,6 +127,11 @@ struct AgentState {
     sessions: tokio::sync::Mutex<HashMap<SessionId, Session>>,
     /// 実行中の要約タスク。切断時に待ち合わせるため保持する([`DIGEST_DRAIN_TIMEOUT`])。
     digests: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
+    /// 要約(chat digest)専用の LLM。`crate::llm::build_client` で1度だけ組み立てて使い回す
+    /// (`crate::llm::use_llm_with_option` が要求する形。LSP 側の `Backend::llm` と同じ持ち方)。
+    /// 組み立てに失敗した場合は `None` のままにし、[`update_digest`] が
+    /// `LlmError::NotInitialized` で警告を出して終わる(要約が出ないだけで会話は成立する)。
+    digest_llm: tokio::sync::Mutex<Option<Box<dyn crate::llm::LlmInterface>>>,
 }
 
 impl AgentState {
@@ -141,6 +154,9 @@ pub(crate) async fn run() -> Result<(), String> {
     let state = Arc::new(AgentState {
         sessions: tokio::sync::Mutex::new(HashMap::new()),
         digests: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+        digest_llm: tokio::sync::Mutex::new(Some(
+            crate::llm::build_client_async(&digest_llm_config(), "system_chat_digest.md").await,
+        )),
     });
 
     info!("start acp agent");
@@ -352,10 +368,17 @@ pub(crate) async fn run() -> Result<(), String> {
                         let root = req.cwd.clone();
                         let session_id = req.session_id.0.to_string();
                         let turns_for_digest = turns.clone();
+                        let digest_state = load_session.clone();
                         let mut digests = load_session.digests.lock().await;
                         while digests.try_join_next().is_some() {}
                         digests.spawn(async move {
-                            update_digest(&root, &turns_for_digest, &session_id).await;
+                            update_digest(
+                                &root,
+                                &turns_for_digest,
+                                &session_id,
+                                &digest_state.digest_llm,
+                            )
+                            .await;
                         });
                     }
                 }
@@ -547,12 +570,13 @@ pub(crate) async fn run() -> Result<(), String> {
                         turns.len(),
                         root
                     );
+                    let digest_state = prompt_state.clone();
                     let mut digests = prompt_state.digests.lock().await;
                     // 完了済みを回収してから積む(放っておくと JoinSet が伸び続ける)。
                     while digests.try_join_next().is_some() {}
                     let owner_id = session_id.0.to_string();
                     digests.spawn(async move {
-                        update_digest(&root, &turns, &owner_id).await;
+                        update_digest(&root, &turns, &owner_id, &digest_state.digest_llm).await;
                     });
                 }
                 responded
@@ -607,6 +631,45 @@ async fn drain_digests(state: &AgentState) {
     }
 }
 
+/// 要約(chat digest)用 LLM の provider/model 設定。
+///
+/// 環境変数 `FIFTY_FOUR_ACP_LLM` に `{"provider": "...", "model": "..."}`
+/// (`crate::llm::LlmClientBuilder::from_value` が受ける形。LSP の `llm.ondemand` /
+/// `llm.deferred` と同じ)を渡すと差し替えられる。ACP には LSP の
+/// `initialization_options` に相当する経路が無いため、Zed の `agent_servers.env`
+/// 経由で渡す想定(`docs/acp-agent.md` に `RUST_LOG` を渡す前例がある)。
+///
+/// 未設定・パース失敗・`provider` が既知の値でない場合は既定(Gemini)へフォールバックする。
+/// `crate::llm::LlmClientBuilder::from_value` は不正な `provider` を `unwrap()` で
+/// panic させるため、**ここで必ず検証してから返す**。
+#[instrument(ret)]
+fn digest_llm_config() -> serde_json::Value {
+    const DEFAULT: &str = r#"{"provider": "google"}"#;
+    let raw = std::env::var("FIFTY_FOUR_ACP_LLM").ok();
+    let Some(raw) = raw else {
+        return serde_json::from_str(DEFAULT).expect("DEFAULT is valid JSON");
+    };
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(value) => match value.get("provider").and_then(|v| v.as_str()) {
+            Some(provider) if crate::llm::Provider::from_str(provider).is_ok() => value,
+            _ => {
+                warn!(
+                    "FIFTY_FOUR_ACP_LLM: provider が不正または未指定です({:?})。既定(Gemini)を使います",
+                    raw
+                );
+                serde_json::from_str(DEFAULT).expect("DEFAULT is valid JSON")
+            }
+        },
+        Err(e) => {
+            warn!(
+                "FIFTY_FOUR_ACP_LLM: JSON として解釈できません({}: {:?})。既定(Gemini)を使います",
+                e, raw
+            );
+            serde_json::from_str(DEFAULT).expect("DEFAULT is valid JSON")
+        }
+    }
+}
+
 /// 会話用のシステムプロンプトを読む。
 ///
 /// Claude Code の既定プロンプトを**置き換える**中身なので、執筆支援としての役割・
@@ -644,12 +707,18 @@ pub(crate) fn render_history(turns: &[ChatTurn], max_turns: usize) -> String {
 
 /// 会話を要約して受け渡しファイルへ書き出す。
 ///
-/// 対話用とは別セッションの一発問い合わせで回す。会話側のクライアントを占有しないので、
-/// 要約中でも次のターンを受けられる。失敗はログに落とすだけで握りつぶす —
-/// 要約が無くても補完は `{{CHAT}}` が空になるだけで動く。
-#[instrument(skip(turns))]
-async fn update_digest(root: &std::path::Path, turns: &[ChatTurn], session_id: &str) {
-    let Some((template, _options)) = crate::frontmatter::load_prompt("prompt_chat_digest.md")
+/// 会話本体(`claude` CLI、サブスク枠)とは別に、`crate::llm` 経由の LLM(既定は
+/// Gemini。[`digest_llm_config`] 参照)で処理する。会話側のクライアントを占有しないので
+/// 要約中でも次のターンを受けられる、という性質は変わらない。失敗はログに落とすだけで
+/// 握りつぶす — 要約が無くても補完は `{{CHAT}}` が空になるだけで動く。
+#[instrument(skip(turns, digest_llm))]
+async fn update_digest(
+    root: &std::path::Path,
+    turns: &[ChatTurn],
+    session_id: &str,
+    digest_llm: &tokio::sync::Mutex<Option<Box<dyn crate::llm::LlmInterface>>>,
+) {
+    let Some((template, options)) = crate::frontmatter::load_prompt("prompt_chat_digest.md")
     else {
         warn!("prompt_chat_digest.md not found; chat context will not be updated");
         return;
@@ -659,15 +728,13 @@ async fn update_digest(root: &std::path::Path, turns: &[ChatTurn], session_id: &
     let vars = HashMap::from([("HISTORY", history.as_str())]);
     let prompt = crate::frontmatter::expand(&template, &vars);
 
-    let system = match crate::assets::load("system_chat_digest.md") {
-        Some(s) => s,
-        None => {
-            warn!("system_chat_digest.md not found; chat context will not be updated");
-            return;
-        }
-    };
+    let result = crate::llm::use_llm_with_option(digest_llm, options, async |l| {
+        l.add(crate::llm::Content::Text(prompt));
+        l.chat().await
+    })
+    .await;
 
-    match ClaudeAgent::one_shot(root, system, prompt).await {
+    match result {
         Ok(text) => {
             let text = text.trim();
             if text.is_empty() {
@@ -687,6 +754,66 @@ async fn update_digest(root: &std::path::Path, turns: &[ChatTurn], session_id: &
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::TextContent;
+
+    /// `FIFTY_FOUR_ACP_LLM` はプロセス全体の環境変数なので、テストが並行に
+    /// 走ると互いの `set_var`/`remove_var` が競合する
+    /// (`crate::RUST_LOG_TEST_LOCK` と同じ理由。あちらは `RUST_LOG` 専用なので
+    /// 別変数を扱うここでは流用せず、専用のロックを用意する)。
+    static ACP_LLM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_digest_llm_config_defaults_to_gemini_when_unset() {
+        let _guard = ACP_LLM_ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("FIFTY_FOUR_ACP_LLM") };
+
+        let cfg = digest_llm_config();
+
+        assert_eq!(cfg["provider"], "google");
+    }
+
+    #[test]
+    fn test_digest_llm_config_uses_valid_override() {
+        let _guard = ACP_LLM_ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(
+                "FIFTY_FOUR_ACP_LLM",
+                r#"{"provider": "xai", "model": "grok-4.5"}"#,
+            );
+        }
+
+        let cfg = digest_llm_config();
+
+        assert_eq!(cfg["provider"], "xai");
+        assert_eq!(cfg["model"], "grok-4.5");
+
+        unsafe { std::env::remove_var("FIFTY_FOUR_ACP_LLM") };
+    }
+
+    #[test]
+    fn test_digest_llm_config_falls_back_on_invalid_json() {
+        let _guard = ACP_LLM_ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("FIFTY_FOUR_ACP_LLM", "{not json") };
+
+        let cfg = digest_llm_config();
+
+        assert_eq!(cfg["provider"], "google");
+
+        unsafe { std::env::remove_var("FIFTY_FOUR_ACP_LLM") };
+    }
+
+    #[test]
+    fn test_digest_llm_config_falls_back_on_unknown_provider() {
+        let _guard = ACP_LLM_ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("FIFTY_FOUR_ACP_LLM", r#"{"provider": "no-such-provider"}"#);
+        }
+
+        let cfg = digest_llm_config();
+
+        assert_eq!(cfg["provider"], "google");
+
+        unsafe { std::env::remove_var("FIFTY_FOUR_ACP_LLM") };
+    }
 
     fn turn(speaker: Speaker, text: &str) -> ChatTurn {
         ChatTurn {
