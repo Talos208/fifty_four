@@ -21,7 +21,6 @@ impl CompletionProgress {
     /// - クライアントがリクエストに workDoneToken を付けてきた場合はそれを使う(create 不要)
     /// - 無ければ window/workDoneProgress/create でサーバ発トークンを登録する
     ///   (クライアントが window.workDoneProgress 非対応、または create 拒否なら None)
-    #[instrument(skip(client, title, message))]
     pub(crate) async fn begin(
         client: &Client,
         supported: bool,
@@ -71,6 +70,7 @@ impl CompletionProgress {
 
     /// End 通知を送って進捗表示を消す(正常終了経路)。
     #[instrument(skip(self))]
+    #[allow(dead_code)]
     pub(crate) async fn finish(mut self) {
         self.finished = true;
         Self::send_end(&self.client, self.token.clone()).await;

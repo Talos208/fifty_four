@@ -1,4 +1,8 @@
+#[cfg(feature = "otel")]
+use http::uri;
 use std::env;
+#[cfg(feature = "otel")]
+use std::{eprintln, time::Duration};
 use tracing::instrument;
 
 #[cfg(feature = "otel")]
@@ -132,7 +136,38 @@ fn logging_disabled() -> bool {
 fn network_target() -> Option<String> {
     env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .ok()
-        .filter(|v| !v.is_empty())
+        .filter(|v: &String| {
+            if !v.is_empty() {
+                // connectできるアドレスなら有効とみなす
+                if let Ok(uri) = v.parse::<uri::Uri>() {
+                    if let Some(authority) = uri.authority() {
+                        if let Ok(addrs) =
+                            std::net::ToSocketAddrs::to_socket_addrs(authority.as_str())
+                        {
+                            for addr in addrs {
+                                let ip = std::net::SocketAddr::from(addr);
+                                if let Ok(conn) = std::net::TcpStream::connect_timeout(
+                                    &ip,
+                                    Duration::from_secs(5),
+                                ) {
+                                    eprintln!("Success to connect");
+                                    let _ = conn.shutdown(std::net::Shutdown::Both);
+                                    return true;
+                                }
+                                eprintln!("can't connect to {:?}", ip);
+                            }
+                        } else {
+                            eprintln!("failed to parse {:?}", authority);
+                        }
+                    } else {
+                        eprintln!("no authority {:?}", uri);
+                    }
+                } else {
+                    eprintln!("not uri {:?}", v);
+                }
+            }
+            false
+        })
 }
 
 #[cfg(feature = "otel")]
@@ -147,7 +182,7 @@ fn prepare_tracing(acp: bool) -> Logger {
         };
     }
 
-    if network_target().is_some() {
+    if network_target().filter(|t| !t.is_empty()).is_some() {
         return prepare_network_tracing(acp);
     }
 

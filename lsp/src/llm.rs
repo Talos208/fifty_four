@@ -1297,7 +1297,7 @@ pub(crate) async fn build_client_async(
 ///
 /// LSP ハンドラ(`Backend::use_llm_with_option`)と ACP エージェント(`crate::acp`)の
 /// 双方から使うため、`Backend` に依存しない自由関数としてここに置いている。
-#[instrument(skip(slot, proc))]
+#[instrument(skip(slot, proc), ret)]
 pub(crate) async fn use_llm_with_option<F>(
     slot: &tokio::sync::Mutex<Option<Box<dyn LlmInterface>>>,
     option: HashMap<String, String>,

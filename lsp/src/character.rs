@@ -32,7 +32,7 @@ pub(crate) enum CharacterAttribute {
 impl TryFrom<&str> for CharacterAttribute {
     type Error = String;
 
-    #[instrument]
+    #[instrument(ret)]
     fn try_from(s: &str) -> std::result::Result<Self, Self::Error> {
         match s {
             "appearance" | "容姿" | "特徴" | "外見" | "体格" | "風貌" | "風体" | "顔立ち"
@@ -63,7 +63,6 @@ impl TryFrom<&str> for CharacterAttribute {
 
 impl CharacterAttribute {
     /// 新規セクション/ファイル作成時に使う日本語正規見出しを返す。
-    #[instrument]
     pub(crate) fn canonical_heading(&self) -> &'static str {
         match self {
             Self::Appearance => "容姿",
@@ -113,7 +112,6 @@ pub(crate) struct CharacterFile {
 }
 
 impl CharacterFile {
-    #[instrument]
     fn from_content(content: String) -> Self {
         let characters = parse_all_content(&content);
         Self {
@@ -124,7 +122,6 @@ impl CharacterFile {
     }
 }
 
-#[instrument]
 fn hash_content(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -424,7 +421,7 @@ impl CharacterStore {
     /// メモリの`content`/`characters`/`last_written_hash`を即座に更新してからディスクへ
     /// 書き出す。メモリ更新はディスク書き込みの成否と独立(メモリが正本、ディスクは
     /// ベストエフォートな永続化という設計上の帰結)。
-    #[cfg_attr(feature = "otel", tracing::instrument())]
+    #[instrument(skip(self, new_content), ret)]
     pub(crate) async fn write(
         &self,
         workspace_root: &Path,
@@ -446,7 +443,7 @@ impl CharacterStore {
     /// 直前の自己書き込みハッシュと一致すればエコーとして無視し`false`を返す。
     /// 不一致なら真の外部変更としてメモリを全置換し`true`を返す
     /// (呼び出し側は`true`のときだけ`refresh_highlight_names`等の後続処理をする)。
-    #[cfg_attr(feature = "otel", tracing::instrument())]
+    #[instrument(skip(self, disk_content), ret)]
     pub(crate) fn reconcile(
         &self,
         workspace_root: &Path,
@@ -469,7 +466,7 @@ impl CharacterStore {
     }
 
     /// 指定ワークスペースの該当ファイルをメモリから除去する(削除イベント用)。
-    #[instrument]
+    #[instrument(skip(self), ret)]
     pub(crate) fn remove(&self, workspace_root: &Path, path: &Path) {
         if let Some(files) = self.0.workspaces.lock().get_mut(workspace_root) {
             files.remove(path);
@@ -477,7 +474,7 @@ impl CharacterStore {
     }
 
     /// 指定ワークスペースのキャラクターファイルパス一覧を返す。
-    #[instrument]
+    #[instrument(skip(self), ret)]
     pub(crate) fn files_in(&self, workspace_root: &Path) -> Vec<PathBuf> {
         self.0
             .workspaces
@@ -488,7 +485,7 @@ impl CharacterStore {
     }
 
     /// 指定ワークスペースの、指定パスの現在のMarkdown全文を返す。
-    #[instrument]
+    #[instrument(skip(self), ret)]
     pub(crate) fn content_of(&self, workspace_root: &Path, path: &Path) -> Option<String> {
         self.0
             .workspaces
@@ -501,7 +498,7 @@ impl CharacterStore {
     /// ワークスペースroot単位の書き込みロックを取得する。`character_updater::run`が
     /// どのドキュメントURIから発火しても、同一ワークスペースの plan→バッチマージ→apply
     /// はこのガードが生きている間、直列化される。
-    #[cfg_attr(feature = "otel", tracing::instrument())]
+    #[instrument(skip(self), ret)]
     pub(crate) async fn acquire_write_lock(
         &self,
         workspace_root: &Path,
@@ -522,7 +519,7 @@ impl CharacterStore {
 /// 最も出現回数が多い「子持ちレベル」を返す。タイ時は深レベル(より多くの # を持つ)優先。
 /// 例: `# Story / ## キャラ / ### 属性` のように各レベルが 1 件ずつの場合、
 /// タイトル(1)よりキャラクター(2)を選ぶ方が意味的に正しい。
-#[instrument]
+#[instrument(skip(root), ret)]
 pub(crate) fn detect_char_level<'a>(root: &'a AstNode<'a>) -> u8 {
     let mut counts: HashMap<u8, usize> = HashMap::new();
     let mut has_sub: Vec<u8> = Vec::new();
@@ -547,7 +544,6 @@ pub(crate) fn detect_char_level<'a>(root: &'a AstNode<'a>) -> u8 {
 }
 
 /// このプロジェクト共通の comrak パースオプションを返す。
-#[instrument]
 pub(crate) fn comrak_options() -> comrak::Options<'static> {
     let mut options = comrak::Options::default();
     options.extension = comrak::options::Extension::builder()
@@ -573,7 +569,7 @@ pub(crate) fn comrak_options() -> comrak::Options<'static> {
 /// Markdown 文字列をパースし、全キャラクターの全セクションを `HashMap` で返す。
 ///
 /// キーは heading 全文（例: "ジェフ・クライン（艦長）"）。
-#[cfg_attr(feature = "otel", tracing::instrument())]
+#[instrument(skip(content), ret)]
 pub(crate) fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry> {
     let arena = Arena::new();
     let options = comrak_options();
@@ -667,7 +663,7 @@ pub(crate) fn parse_all_content(content: &str) -> HashMap<String, CharacterEntry
 /// `Alias` タグ付きセクションのテキストを個々の別名に分割する。
 /// 箇条書きの各行をさらに区切り文字（「・」「、」「,」「/」半角スペース）で分割し、
 /// trim・空文字列除外して返す。
-#[instrument]
+#[instrument(ret)]
 pub(crate) fn split_aliases(text: &str) -> Vec<String> {
     text.lines()
         .flat_map(|line| line.split(['・', '、', ',', '/', ' ']))
@@ -685,7 +681,7 @@ fn character_display_name(heading_key: &str) -> &str {
 }
 
 /// キャラクターエントリを、キャラ情報ツール向けの完全な Markdown ドキュメントへ変換する。
-#[instrument]
+#[instrument(skip(entry))]
 fn character_entry_to_markdown(heading_key: &str, entry: &CharacterEntry) -> String {
     let mut out = format!("# {}", heading_key);
 
@@ -721,7 +717,7 @@ fn character_entry_to_markdown(heading_key: &str, entry: &CharacterEntry) -> Str
 }
 
 /// 見出しノードの直接子から `Text` ノードを結合してキャラクター名や属性名を返す。
-#[instrument]
+#[instrument(skip(node), ret)]
 pub(crate) fn heading_text<'a>(node: &'a AstNode<'a>) -> String {
     node.children()
         .filter_map(|c| {
@@ -735,7 +731,7 @@ pub(crate) fn heading_text<'a>(node: &'a AstNode<'a>) -> String {
 }
 
 /// ブロックノードを深さ優先で走査してプレーンテキストを返す。
-#[instrument]
+#[instrument(skip(node))]
 fn node_to_plain_text<'a>(node: &'a AstNode<'a>) -> String {
     let mut result = String::new();
     for edge in node.traverse() {

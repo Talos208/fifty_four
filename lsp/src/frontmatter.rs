@@ -52,7 +52,6 @@ pub(crate) fn parse_text(text: &str) -> (String, HashMap<String, String>) {
 ///
 /// スカラーはそのまま文字列化し、配列・オブジェクト(JSON schema 等)は JSON 文字列に変換する。
 /// Null のみ `None`(マップから除外)。
-// #[instrument]
 pub(crate) fn pod_to_string(pod: &gray_matter::Pod) -> Option<String> {
     use gray_matter::Pod;
     match pod {
@@ -74,7 +73,7 @@ pub(crate) fn pod_to_string(pod: &gray_matter::Pod) -> Option<String> {
 /// 構築せず、置換後の文字列を再走査しないためその心配がない。
 ///
 /// 未知のプレースホルダ(`vars` に無いキー)は `{{NAME}}` の形のまま残す。
-#[instrument]
+#[instrument(skip(template), ret)]
 pub(crate) fn expand(template: &str, vars: &HashMap<&str, &str>) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -106,7 +105,7 @@ pub(crate) fn expand(template: &str, vars: &HashMap<&str, &str>) -> String {
     out
 }
 
-#[instrument]
+#[instrument(skip_all, ret)]
 pub(crate) fn pod_to_json_value(pod: &gray_matter::Pod) -> serde_json::Value {
     use gray_matter::Pod;
     match pod {

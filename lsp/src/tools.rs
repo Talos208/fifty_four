@@ -37,7 +37,6 @@ pub(crate) struct CharacterInfoTool {
 
 #[async_trait]
 impl LlmTool for CharacterInfoTool {
-    // #[instrument]
     fn schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -61,7 +60,6 @@ impl LlmTool for CharacterInfoTool {
         })
     }
 
-    #[instrument(skip(self), ret)]
     fn name(&self) -> &str {
         "character_info"
     }
@@ -127,7 +125,6 @@ impl PlotInfoTool {
 
 #[async_trait]
 impl LlmTool for PlotInfoTool {
-    // #[instrument(skip(self))]
     fn schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
@@ -141,7 +138,6 @@ impl LlmTool for PlotInfoTool {
         })
     }
 
-    #[instrument(skip(self), ret)]
     fn name(&self) -> &str {
         "plot_info"
     }
