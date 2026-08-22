@@ -718,8 +718,7 @@ async fn update_digest(
     session_id: &str,
     digest_llm: &tokio::sync::Mutex<Option<Box<dyn crate::llm::LlmInterface>>>,
 ) {
-    let Some((template, options)) = crate::frontmatter::load_prompt("prompt_chat_digest.md")
-    else {
+    let Some((template, options)) = crate::frontmatter::load_prompt("prompt_chat_digest.md") else {
         warn!("prompt_chat_digest.md not found; chat context will not be updated");
         return;
     };

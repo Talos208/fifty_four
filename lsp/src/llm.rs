@@ -1151,10 +1151,12 @@ impl LlmInterface for LlmClient {
         format!("{:?} {:?}", st.model, st.endpoint)
     }
 
+    #[instrument(skip(self))]
     fn max_tokens(&mut self, n: u32) {
         self.options = std::mem::take(&mut self.options).with_max_tokens(n);
     }
 
+    #[instrument(skip(self))]
     fn temperature(&mut self, v: f64) {
         self.options = std::mem::take(&mut self.options).with_temperature(v);
     }
@@ -1165,7 +1167,7 @@ impl LlmInterface for LlmClient {
 
     fn stop_sequences(&mut self, seqs: Vec<String>) {
         if !self.capabilities.contains(ModelCapability::STOP_SEQUENCES) {
-            debug!(
+            warn!(
                 "model {} does not support stop_sequences; skipping",
                 self.model
             );
@@ -1178,12 +1180,13 @@ impl LlmInterface for LlmClient {
         self.options = std::mem::take(&mut self.options).with_seed(v);
     }
 
+    #[instrument(skip(self))]
     fn reasoning_effort(&mut self, effort: ReasoningEffort) {
         if !self
             .capabilities
             .contains(ModelCapability::REASONING_EFFORT)
         {
-            debug!(
+            warn!(
                 "model {} does not support reasoning_effort; skipping",
                 self.model
             );
@@ -1192,12 +1195,13 @@ impl LlmInterface for LlmClient {
         self.options = std::mem::take(&mut self.options).with_reasoning_effort(effort);
     }
 
+    #[instrument(skip(self))]
     fn reasoning_level(&mut self, level: f64) {
         if !self
             .capabilities
             .contains(ModelCapability::REASONING_EFFORT)
         {
-            debug!(
+            warn!(
                 "model {} does not support reasoning_effort; skipping (level={})",
                 self.model, level
             );
@@ -1318,45 +1322,53 @@ where
     // 前回リクエストの max_tokens/temperature/reasoning_level 等が
     // 失敗・キャンセル時に持ち越されないよう、適用前に既定値へ戻す。
     llm.reset_options();
-    if let Some(v) = option.get("max_tokens")
-        && let Ok(n) = v.parse::<u32>()
-    {
-        llm.max_tokens(n);
+    if let Some(v) = option.get("max_tokens") {
+        match v.parse::<u32>() {
+            Ok(n) => llm.max_tokens(n),
+            Err(e) => warn!("invalid max_tokens {:?}: {}; skipping", v, e),
+        }
     }
-    if let Some(v) = option.get("temperature")
-        && let Ok(n) = v.parse::<f64>()
-    {
-        llm.temperature(n);
+    if let Some(v) = option.get("temperature") {
+        match v.parse::<f64>() {
+            Ok(n) => llm.temperature(n),
+            Err(e) => warn!("invalid temperature {:?}: {}; skipping", v, e),
+        }
     }
-    if let Some(v) = option.get("top_p")
-        && let Ok(n) = v.parse::<f64>()
-    {
-        llm.top_p(n);
+    if let Some(v) = option.get("top_p") {
+        match v.parse::<f64>() {
+            Ok(n) => llm.top_p(n),
+            Err(e) => warn!("invalid top_p {:?}: {}; skipping", v, e),
+        }
     }
     if let Some(v) = option.get("stop_sequences") {
         llm.stop_sequences(v.split(',').map(|s| s.to_string()).collect());
     }
-    if let Some(v) = option.get("seed")
-        && let Ok(n) = v.parse::<u64>()
-    {
-        llm.seed(n);
+    if let Some(v) = option.get("seed") {
+        match v.parse::<u64>() {
+            Ok(n) => llm.seed(n),
+            Err(e) => warn!("invalid seed {:?}: {}; skipping", v, e),
+        }
     }
     if let Some(v) = option.get("reasoning_effort") {
         if let Ok(level) = v.parse::<f64>() {
             llm.reasoning_level(level);
         } else if let Ok(eff) = v.parse::<ReasoningEffort>() {
             llm.reasoning_effort(eff);
+        } else {
+            warn!("invalid reasoning_effort {:?}; skipping", v);
         }
     }
-    if let Some(v) = option.get("service_tier")
-        && let Ok(n) = v.parse::<ServiceTier>()
-    {
-        llm.service_tier(n);
+    if let Some(v) = option.get("service_tier") {
+        match v.parse::<ServiceTier>() {
+            Ok(n) => llm.service_tier(n),
+            Err(e) => warn!("invalid service_tier {:?}: {}; skipping", v, e),
+        }
     }
-    if let Some(v) = option.get("verbosity")
-        && let Ok(n) = v.parse::<Verbosity>()
-    {
-        llm.verbosity(n);
+    if let Some(v) = option.get("verbosity") {
+        match v.parse::<Verbosity>() {
+            Ok(n) => llm.verbosity(n),
+            Err(e) => warn!("invalid verbosity {:?}: {}; skipping", v, e),
+        }
     }
 
     // スキーマが frontmatter に指定されている場合、capability に応じて切り替える

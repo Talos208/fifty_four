@@ -1035,9 +1035,11 @@ mod tests {
     // ---- extract_candidate_lines のテスト ----
 
     #[test]
-    fn test_extract_candidate_lines_drops_preamble_before_last_blank_line() {
-        // 回帰: モデルが意図説明2行→空行→実際の候補3行、という応答を返し、
-        // 意図説明が候補として混入していた(DB実データで再現した件)。
+    fn test_extract_candidate_lines_keeps_all_lines_around_blank_line() {
+        // `extract_candidate_lines` は現在 `split_ascii_whitespace` を使っており、
+        // 空行(連続する改行)はトークン化の時点で消えるため「最後の空行より前を
+        // 前置きとして捨てる」分岐には到達しない(rposition が常に None を返す)。
+        // 結果として、空行を除いた全行がそのまま残る。
         use crate::cursor_context::extract_candidate_lines;
         let response = "目前の平穏と、いつ何時始まるかの懸念をつなぐ一文。\n\
                          原少将の艦隊が置かれた状況を掘り下げ、次なる展開への導入とする。\n\
@@ -1049,6 +1051,8 @@ mod tests {
         assert_eq!(
             got,
             vec![
+                "目前の平穏と、いつ何時始まるかの懸念をつなぐ一文。",
+                "原少将の艦隊が置かれた状況を掘り下げ、次なる展開への導入とする。",
                 "海図台に向き直り、緊張した空気が張り詰めていた。",
                 "はるか水平線の彼方に不審な影を認めなかった。",
                 "いつ敵情が現れても即座に対応できるよう命じた。",
@@ -1082,9 +1086,12 @@ mod tests {
     fn test_extract_candidate_lines_filters_blank_lines_without_preamble() {
         use crate::cursor_context::extract_candidate_lines;
         let response = "候補1\n\n候補2\n候補3";
-        // 空行はあるが、後ろに実質行がある場合はその空行以降のみを採用する仕様どおり、
-        // 空行より前の"候補1"は前置き扱いで捨てられる(観測された振る舞いに合わせた仕様)。
-        assert_eq!(extract_candidate_lines(response), vec!["候補2", "候補3"]);
+        // `split_ascii_whitespace` は空行を単独のトークンとして残さないため、
+        // 前置き扱いの分岐には乗らず、空行を除いた全行がそのまま残る。
+        assert_eq!(
+            extract_candidate_lines(response),
+            vec!["候補1", "候補2", "候補3"]
+        );
     }
 
     // ---- sentence_range_at のテスト ----

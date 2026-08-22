@@ -1,8 +1,9 @@
 ---
 schema: >
-  {"type":"object","properties":{"candidates":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5}},"required":["candidates"],"additionalProperties":false}
+  {"type":"object","properties":{"candidates":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":3}},"required":["candidates"],"additionalProperties":false}
 schema_name: fill_mark_candidates
-max_tokens: 1024
+# 候補は「※」に当てはまる語のみ(前後の文は含めない)なので短い。JSON化のオーバーヘッド込みで余裕を持たせる
+max_tokens: 512
 temperature: 0.8
 ---
 # 指示

@@ -66,7 +66,6 @@ pub(crate) fn heading_line_levels(content: &str) -> Vec<(usize, u8)> {
 /// `# 第一章 **決戦**` のような強調・リンクを含む見出しでは装飾部分が抜け落ちる
 /// (`**決戦**` は `Text` の子ではなく `Strong` の孫)。ここでは `Text`/`Code` を
 /// 深さ問わず拾い、`Emph`/`Strong`/`Link` 等はコンテナとして単に降りる。
-#[instrument]
 fn heading_inline_text<'a>(node: &'a AstNode<'a>) -> String {
     let mut result = String::new();
     for edge in node.traverse() {

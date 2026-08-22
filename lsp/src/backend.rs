@@ -23,10 +23,18 @@ use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use tower_lsp_server::lsp_types::request::{GotoImplementationParams, GotoImplementationResponse};
+use tower_lsp_server::lsp_types::request::{
+    GotoImplementationParams, GotoImplementationResponse, Request,
+};
 use tower_lsp_server::lsp_types::*;
 use tower_lsp_server::{Client, LanguageServer, UriExt};
 use tracing::instrument;
+
+/// Zed が `didOpen` で送ってくる languageId。
+/// `extension/languages/fiftyfour/config.toml` の `name = "FiftyFour"` を
+/// Zed が小文字化したもの(Zed.log の didOpen 実測値)。`semantic_tokens_provider` の
+/// `documentSelector` はこれと一致していないとどのバッファにもマッチしない。
+pub(crate) const LANGUAGE_ID: &str = "fiftyfour";
 
 /// `Backend` はサーバの状態を保持する構造体です。
 ///
@@ -71,6 +79,224 @@ pub(crate) struct Backend {
     // クライアントが WorkspaceEdit.document_changes 経由の ResourceOp::Rename をサポートするか
     // (initialize で判定。false ならリネームは tokio::fs::rename にフォールバックする)
     client_supports_rename_resource_op: std::sync::atomic::AtomicBool,
+}
+
+/// サーバの capabilities を組み立てる。`Backend`(`Client` を保持する)から独立した
+/// 自由関数にしてあるのは、テストから `Client` なしで直接呼べるようにするため。
+#[instrument(ret)]
+fn server_capabilities() -> ServerCapabilities {
+    ServerCapabilities {
+        // UTF-16 は LSP の必須ベースラインで全クライアントがサポートするため、
+        // クライアントの general.positionEncodings を確認せず常に宣言してよい。
+        // (実クライアントの Zed も utf-16 のみをオファーする)
+        position_encoding: Some(PositionEncodingKind::UTF16),
+        // キャラ名にカーソルを合わせた際、そのキャラの設定をMarkdownで表示する。
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
+        // save 通知(did_save)を有効化するため Kind ではなく Options 形式にする。
+        // キャラクター設定ファイル保存時に character_store を調和(reconcile)するために使う。
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(TextDocumentSyncKind::INCREMENTAL),
+                save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                ..Default::default()
+            },
+        )),
+        selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+        // キャラ名(表示名・別名とも)にカーソルを合わせて Go to Definition すると、
+        // characters.md / characters/*.md の該当キャラ見出しへジャンプする。
+        definition_provider: Some(OneOf::Left(true)),
+        // plot.md の `# 章名` 見出しで Go to Implementation すると、対応する
+        // `<章名>.txt` へジャンプする(無ければ作成する)。
+        implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
+        // キャラ名(表示名・別名とも)の登場箇所をワークスペース直下の本文 `.txt` から
+        // 横断検索する(Find All References)。
+        references_provider: Some(OneOf::Left(true)),
+        // `.md`(characters.md / plot.md / memo/*.md)の見出し一覧をアウトライン・
+        // パンくずとして提供する。FiftyFour 言語は tree-sitter 文法を持たないため、
+        // Zed 側で `"document_symbols": "on"` にしないとこの capability は使われない
+        // (docs/lsp-handlers.md 参照)。
+        document_symbol_provider: Some(OneOf::Left(true)),
+        // plot.md の各 `# 章名` 見出し行末に「現文字数/予定文字数」を表示する。
+        // plot.md 以外のドキュメントには何も返さない(inlay_hint ハンドラ側でガード)。
+        inlay_hint_provider: Some(OneOf::Left(true)),
+        semantic_tokens_provider: Some(
+            SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
+                SemanticTokensRegistrationOptions {
+                    text_document_registration_options: TextDocumentRegistrationOptions {
+                        document_selector: Some(vec![DocumentFilter {
+                            language: Some(LANGUAGE_ID.to_string()),
+                            scheme: Some("file".to_string()),
+                            pattern: None,
+                        }]),
+                    },
+                    semantic_tokens_options: SemanticTokensOptions {
+                        // 代表的なトークン種類を列挙しておく（クライアントが期待するため）
+                        legend: SemanticTokensLegend {
+                            // LSP 3.17 仕様の SemanticTokenTypes 定義順
+                            token_types: vec![
+                                SemanticTokenType::NAMESPACE,
+                                SemanticTokenType::TYPE,
+                                SemanticTokenType::CLASS,
+                                SemanticTokenType::ENUM,
+                                SemanticTokenType::INTERFACE,
+                                SemanticTokenType::STRUCT,
+                                SemanticTokenType::TYPE_PARAMETER,
+                                SemanticTokenType::PARAMETER,
+                                SemanticTokenType::VARIABLE,
+                                SemanticTokenType::PROPERTY,
+                                SemanticTokenType::ENUM_MEMBER,
+                                SemanticTokenType::EVENT,
+                                SemanticTokenType::FUNCTION,
+                                SemanticTokenType::METHOD,
+                                SemanticTokenType::MACRO,
+                                SemanticTokenType::KEYWORD,
+                                SemanticTokenType::MODIFIER,
+                                SemanticTokenType::COMMENT,
+                                SemanticTokenType::STRING,
+                                SemanticTokenType::NUMBER,
+                                SemanticTokenType::REGEXP,
+                                SemanticTokenType::OPERATOR,
+                                SemanticTokenType::DECORATOR,
+                            ],
+                            token_modifiers: vec![],
+                        },
+                        // フル（ドキュメント全体）の要求に応答することを示す
+                        full: Some(SemanticTokensFullOptions::Bool(true)),
+                        // 範囲クエリのサポートは無効（今回は実装しない）
+                        range: Some(false),
+                        // work_done_progress のオプション（未使用）
+                        work_done_progress_options: WorkDoneProgressOptions {
+                            work_done_progress: None,
+                        },
+                    },
+                    static_registration_options: StaticRegistrationOptions::default(),
+                },
+            ),
+        ),
+        // 選択範囲(無ければカーソルの文)を LLM で書き換える code action。
+        // 「※」があればそこに当てはまる語、無ければ表現改善の候補を複数提示する。
+        code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+            code_action_kinds: Some(vec![CodeActionKind::REFACTOR_REWRITE]),
+            resolve_provider: Some(false),
+            work_done_progress_options: WorkDoneProgressOptions {
+                work_done_progress: None,
+            },
+        })),
+        // 「↻ 候補を作り直す」用。code_action が返すキャッシュ済み候補を無視して
+        // LLM を呼び直すための command(下記 execute_command 参照)。
+        execute_command_provider: Some(ExecuteCommandOptions {
+            commands: vec![crate::code_action::REGENERATE_COMMAND.to_string()],
+            work_done_progress_options: WorkDoneProgressOptions {
+                work_done_progress: None,
+            },
+        }),
+        completion_provider: Some(CompletionOptions {
+            resolve_provider: None,
+            trigger_characters: Some(vec!["、".into(), "「".into(), "『".into()]),
+            all_commit_characters: Some(vec!["。".into(), "」".into(), "』".into()]),
+            work_done_progress_options: WorkDoneProgressOptions {
+                work_done_progress: None,
+            },
+            completion_item: Some(CompletionOptionsCompletionItem {
+                label_details_support: Some(true),
+            }),
+        }),
+        // plot.md の章名⇄<章名>.txt のリネーム同期用。`.txt` のリネームを通知してもらう
+        // (`did_rename_files` 参照)。フォルダのリネームは対象外(`FileOperationPatternKind::File`)。
+        workspace: Some(WorkspaceServerCapabilities {
+            workspace_folders: None,
+            file_operations: Some(WorkspaceFileOperationsServerCapabilities {
+                did_rename: Some(FileOperationRegistrationOptions {
+                    filters: vec![FileOperationFilter {
+                        scheme: Some("file".to_string()),
+                        pattern: FileOperationPattern {
+                            glob: "**/*.txt".to_string(),
+                            matches: Some(FileOperationPatternKind::File),
+                            options: None,
+                        },
+                    }],
+                }),
+                ..Default::default()
+            }),
+        }),
+        ..ServerCapabilities::default()
+    }
+}
+
+/// 指定 URI のトークン列を組み立てる。`uri` が未オープン(`text` に無い)なら `None`。
+/// `Client` を持たないのでテストから直接呼べる。`semantic_tokens_full` から
+/// ロジックを分離するために切り出した(ハンドラ側は Client 経由のワークスペース解決・
+/// initialized 待ちを担当し、こちらは純粋なトークン化のみを担当する)。
+#[instrument(skip(text, highlighter, allowed), ret)]
+fn build_semantic_tokens(
+    text: &DashMap<String, Vec<LineData>>,
+    highlighter: &Highlighter,
+    uri: &str,
+    is_md: bool,
+    allowed: &HashSet<String>,
+) -> Option<Vec<SemanticToken>> {
+    // 共有ストアの行を直接更新する(get_mut)。深さを 0 から畳み込みながら全行を
+    // 処理することで、各行の tag / bracket_depth_after キャッシュが書き戻され、
+    // 以降の completion がそのまま再利用できる(陳腐化キャッシュもここで修復される)。
+    let mut lines = text.get_mut(uri)?;
+
+    // 見出し行の判定は comrak ベース(`outline::heading_line_levels`、front matter・
+    // コードフェンスを正しく除外する)を使う。`.md` 以外(`.txt` 等)では見出しの
+    // 概念が無いため計算しない(素の "#" で始まる本文が誤って装飾されるのを防ぐ)。
+    let heading_levels: std::collections::HashMap<usize, u8> = if is_md {
+        let content = lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        crate::outline::heading_line_levels(&content)
+            .into_iter()
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    let mut depth = 0u32;
+    let mut per_line = Vec::with_capacity(lines.len());
+    for (line_no, line) in lines.iter_mut().enumerate() {
+        // 深さの畳み込み(tag/bracket_depth_after キャッシュの書き戻し)は見出し行でも
+        // 必ず行う。返す通常トークン列だけを見出し行では捨てて装飾用の1トークンに
+        // 差し替える。
+        let (toks, d) = highlighter.tokenize_with_depth(line, depth, allowed);
+        depth = d;
+
+        match heading_levels.get(&line_no) {
+            Some(&level) => {
+                let length = crate::types::utf16_len(line.text.trim_end()) as u32;
+                if length == 0 {
+                    per_line.push(Vec::new());
+                } else {
+                    let token_type = if level <= 1 {
+                        crate::highlight::SemanticTokenType::Type as u32
+                    } else {
+                        crate::highlight::SemanticTokenType::Class as u32
+                    };
+                    per_line.push(vec![crate::highlight::SemanticToken::new(
+                        0, length, token_type, 0,
+                    )]);
+                }
+            }
+            None => per_line.push(toks),
+        }
+    }
+    Some(
+        Highlighter::to_semantic_tokens(per_line)
+            .into_iter()
+            .map(|t| SemanticToken {
+                delta_line: t.delta_line,
+                delta_start: t.delta_start,
+                length: t.length,
+                token_type: t.token_type,
+                token_modifiers_bitset: t.token_modifiers_bitset,
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// `LanguageServer` トレイトの実装。
@@ -263,143 +489,7 @@ impl LanguageServer for Backend {
             }
         }
 
-        let capabilities = ServerCapabilities {
-            // UTF-16 は LSP の必須ベースラインで全クライアントがサポートするため、
-            // クライアントの general.positionEncodings を確認せず常に宣言してよい。
-            // (実クライアントの Zed も utf-16 のみをオファーする)
-            position_encoding: Some(PositionEncodingKind::UTF16),
-            // キャラ名にカーソルを合わせた際、そのキャラの設定をMarkdownで表示する。
-            hover_provider: Some(HoverProviderCapability::Simple(true)),
-            // save 通知(did_save)を有効化するため Kind ではなく Options 形式にする。
-            // キャラクター設定ファイル保存時に character_store を調和(reconcile)するために使う。
-            text_document_sync: Some(TextDocumentSyncCapability::Options(
-                TextDocumentSyncOptions {
-                    open_close: Some(true),
-                    change: Some(TextDocumentSyncKind::INCREMENTAL),
-                    save: Some(TextDocumentSyncSaveOptions::Supported(true)),
-                    ..Default::default()
-                },
-            )),
-            selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
-            // キャラ名(表示名・別名とも)にカーソルを合わせて Go to Definition すると、
-            // characters.md / characters/*.md の該当キャラ見出しへジャンプする。
-            definition_provider: Some(OneOf::Left(true)),
-            // plot.md の `# 章名` 見出しで Go to Implementation すると、対応する
-            // `<章名>.txt` へジャンプする(無ければ作成する)。
-            implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
-            // キャラ名(表示名・別名とも)の登場箇所をワークスペース直下の本文 `.txt` から
-            // 横断検索する(Find All References)。
-            references_provider: Some(OneOf::Left(true)),
-            // `.md`(characters.md / plot.md / memo/*.md)の見出し一覧をアウトライン・
-            // パンくずとして提供する。FiftyFour 言語は tree-sitter 文法を持たないため、
-            // Zed 側で `"document_symbols": "on"` にしないとこの capability は使われない
-            // (docs/lsp-handlers.md 参照)。
-            document_symbol_provider: Some(OneOf::Left(true)),
-            // plot.md の各 `# 章名` 見出し行末に「現文字数/予定文字数」を表示する。
-            // plot.md 以外のドキュメントには何も返さない(inlay_hint ハンドラ側でガード)。
-            inlay_hint_provider: Some(OneOf::Left(true)),
-            semantic_tokens_provider: Some(
-                SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
-                    SemanticTokensRegistrationOptions {
-                        text_document_registration_options: TextDocumentRegistrationOptions {
-                            document_selector: Some(vec![DocumentFilter {
-                                language: Some("fifty_four".to_string()),
-                                scheme: Some("file".to_string()),
-                                pattern: None,
-                            }]),
-                        },
-                        semantic_tokens_options: SemanticTokensOptions {
-                            // 代表的なトークン種類を列挙しておく（クライアントが期待するため）
-                            legend: SemanticTokensLegend {
-                                // LSP 3.17 仕様の SemanticTokenTypes 定義順
-                                token_types: vec![
-                                    SemanticTokenType::NAMESPACE,
-                                    SemanticTokenType::TYPE,
-                                    SemanticTokenType::CLASS,
-                                    SemanticTokenType::ENUM,
-                                    SemanticTokenType::INTERFACE,
-                                    SemanticTokenType::STRUCT,
-                                    SemanticTokenType::TYPE_PARAMETER,
-                                    SemanticTokenType::PARAMETER,
-                                    SemanticTokenType::VARIABLE,
-                                    SemanticTokenType::PROPERTY,
-                                    SemanticTokenType::ENUM_MEMBER,
-                                    SemanticTokenType::EVENT,
-                                    SemanticTokenType::FUNCTION,
-                                    SemanticTokenType::METHOD,
-                                    SemanticTokenType::MACRO,
-                                    SemanticTokenType::KEYWORD,
-                                    SemanticTokenType::MODIFIER,
-                                    SemanticTokenType::COMMENT,
-                                    SemanticTokenType::STRING,
-                                    SemanticTokenType::NUMBER,
-                                    SemanticTokenType::REGEXP,
-                                    SemanticTokenType::OPERATOR,
-                                    SemanticTokenType::DECORATOR,
-                                ],
-                                token_modifiers: vec![],
-                            },
-                            // フル（ドキュメント全体）の要求に応答することを示す
-                            full: Some(SemanticTokensFullOptions::Bool(true)),
-                            // 範囲クエリのサポートは無効（今回は実装しない）
-                            range: Some(false),
-                            // work_done_progress のオプション（未使用）
-                            work_done_progress_options: WorkDoneProgressOptions {
-                                work_done_progress: None,
-                            },
-                        },
-                        static_registration_options: StaticRegistrationOptions::default(),
-                    },
-                ),
-            ),
-            // 選択範囲(無ければカーソルの文)を LLM で書き換える code action。
-            // 「※」があればそこに当てはまる語、無ければ表現改善の候補を複数提示する。
-            code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
-                code_action_kinds: Some(vec![CodeActionKind::REFACTOR_REWRITE]),
-                resolve_provider: Some(false),
-                work_done_progress_options: WorkDoneProgressOptions {
-                    work_done_progress: None,
-                },
-            })),
-            // 「↻ 候補を作り直す」用。code_action が返すキャッシュ済み候補を無視して
-            // LLM を呼び直すための command(下記 execute_command 参照)。
-            execute_command_provider: Some(ExecuteCommandOptions {
-                commands: vec![crate::code_action::REGENERATE_COMMAND.to_string()],
-                work_done_progress_options: WorkDoneProgressOptions {
-                    work_done_progress: None,
-                },
-            }),
-            completion_provider: Some(CompletionOptions {
-                resolve_provider: None,
-                trigger_characters: Some(vec!["、".into(), "「".into(), "『".into()]),
-                all_commit_characters: Some(vec!["。".into(), "」".into(), "』".into()]),
-                work_done_progress_options: WorkDoneProgressOptions {
-                    work_done_progress: None,
-                },
-                completion_item: Some(CompletionOptionsCompletionItem {
-                    label_details_support: Some(true),
-                }),
-            }),
-            // plot.md の章名⇄<章名>.txt のリネーム同期用。`.txt` のリネームを通知してもらう
-            // (`did_rename_files` 参照)。フォルダのリネームは対象外(`FileOperationPatternKind::File`)。
-            workspace: Some(WorkspaceServerCapabilities {
-                workspace_folders: None,
-                file_operations: Some(WorkspaceFileOperationsServerCapabilities {
-                    did_rename: Some(FileOperationRegistrationOptions {
-                        filters: vec![FileOperationFilter {
-                            scheme: Some("file".to_string()),
-                            pattern: FileOperationPattern {
-                                glob: "**/*.txt".to_string(),
-                                matches: Some(FileOperationPatternKind::File),
-                                options: None,
-                            },
-                        }],
-                    }),
-                    ..Default::default()
-                }),
-            }),
-            ..ServerCapabilities::default()
-        };
+        let capabilities = server_capabilities();
 
         Ok(InitializeResult {
             capabilities,
@@ -417,8 +507,12 @@ impl LanguageServer for Backend {
             scope_uri: None,
             section: None,
         }];
-        let res = self.client.configuration(req).await.unwrap();
-        debug!("{:?}", res);
+        // 失敗しても致命的ではないので warn に落として続行する
+        // (以前は unwrap() で panic していた)。
+        match self.client.configuration(req).await {
+            Ok(res) => debug!("{:?}", res),
+            Err(e) => warn!("workspace/configuration の取得に失敗: {:?}", e),
+        }
 
         // (a) ワークスペース初期化時にキャラクターファイルを能動スキャンし character_store へ
         // ロードする。LLM補完のtool calling実行を待たずに、人名ハイライトの絞り込みをすぐ
@@ -499,7 +593,19 @@ impl LanguageServer for Backend {
             );
         }
 
-        let _ = self.client.semantic_tokens_refresh().await;
+        let _ = tokio::join!(
+            self.client.semantic_tokens_refresh(),
+            self.client.inline_value_refresh(),
+            self.client.code_lens_refresh()
+        );
+
+        let params = ShowDocumentParams {
+            uri: params.text_document.uri,
+            external: None,
+            take_focus: Some(true),
+            selection: None,
+        };
+        let _ = self.client.show_document(params);
     }
 
     /// (b) キャラクター設定ファイル保存時、character_store を調和(reconcile)する。
@@ -787,66 +893,14 @@ impl LanguageServer for Backend {
             })
             .unwrap_or(false);
 
-        let vec = {
-            // 共有ストアの行を直接更新する(get_mut)。深さを 0 から畳み込みながら全行を
-            // 処理することで、各行の tag / bracket_depth_after キャッシュが書き戻され、
-            // 以降の completion がそのまま再利用できる(陳腐化キャッシュもここで修復される)。
-            let mut lines = self.text.get_mut(uri).expect("Failed to get text");
-
-            // 見出し行の判定は comrak ベース(`outline::heading_line_levels`、front matter・
-            // コードフェンスを正しく除外する)を使う。`.md` 以外(`.txt` 等)では見出しの
-            // 概念が無いため計算しない(素の "#" で始まる本文が誤って装飾されるのを防ぐ)。
-            let heading_levels: std::collections::HashMap<usize, u8> = if is_md {
-                let content = lines
-                    .iter()
-                    .map(|l| l.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                crate::outline::heading_line_levels(&content)
-                    .into_iter()
-                    .collect()
-            } else {
-                std::collections::HashMap::new()
-            };
-
-            let mut depth = 0u32;
-            let mut per_line = Vec::with_capacity(lines.len());
-            for (line_no, line) in lines.iter_mut().enumerate() {
-                // 深さの畳み込み(tag/bracket_depth_after キャッシュの書き戻し)は見出し行でも
-                // 必ず行う。返す通常トークン列だけを見出し行では捨てて装飾用の1トークンに
-                // 差し替える。
-                let (toks, d) = self.highlighter.tokenize_with_depth(line, depth, &allowed);
-                depth = d;
-
-                match heading_levels.get(&line_no) {
-                    Some(&level) => {
-                        let length = crate::types::utf16_len(line.text.trim_end()) as u32;
-                        if length == 0 {
-                            per_line.push(Vec::new());
-                        } else {
-                            let token_type = if level <= 1 {
-                                crate::highlight::SemanticTokenType::Type as u32
-                            } else {
-                                crate::highlight::SemanticTokenType::Class as u32
-                            };
-                            per_line.push(vec![crate::highlight::SemanticToken::new(
-                                0, length, token_type, 0,
-                            )]);
-                        }
-                    }
-                    None => per_line.push(toks),
-                }
-            }
-            Highlighter::to_semantic_tokens(per_line)
-                .into_iter()
-                .map(|t| SemanticToken {
-                    delta_line: t.delta_line,
-                    delta_start: t.delta_start,
-                    length: t.length,
-                    token_type: t.token_type,
-                    token_modifiers_bitset: t.token_modifiers_bitset,
-                })
-                .collect::<Vec<_>>()
+        let Some(vec) = build_semantic_tokens(&self.text, &self.highlighter, uri, is_md, &allowed)
+        else {
+            // did_open 前(あるいは既に did_close 済み)の URI。未オープンの文書に
+            // トークンを返す意味は無いので黙って None を返す(以前は expect() で panic
+            // していた: panic するとハンドラの応答が永久に返らず、Zed 側では
+            // そのタブだけ semantic tokens が効かなくなる)。
+            debug!("semantic_tokens_full[{}]: 未オープンの URI", uri);
+            return Ok(None);
         };
 
         let tokens = SemanticTokens {
@@ -1609,12 +1663,6 @@ impl LanguageServer for Backend {
         &self,
         params: CodeActionParams,
     ) -> tower_lsp_server::jsonrpc::Result<Option<CodeActionResponse>> {
-        debug!(
-            "code_action: trigger_kind={:?}, range={:?}",
-            params.context.trigger_kind, // trigger_kindがNoneでしか来ない？
-            params.range
-        );
-
         let has_selection = params.range.start != params.range.end;
         let should_run = match params.context.trigger_kind {
             Some(CodeActionTriggerKind::INVOKED) => true,
@@ -1626,7 +1674,9 @@ impl LanguageServer for Backend {
                 "code_action: skip (trigger_kind={:?}, has_selection={})",
                 params.context.trigger_kind, has_selection
             );
-            return Ok(None);
+            return Err(tower_lsp_server::jsonrpc::Error::new(
+                tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled,
+            ));
         }
 
         let uri = params.text_document.uri.as_str();
@@ -1658,8 +1708,12 @@ impl LanguageServer for Backend {
 
         if target_text.trim().is_empty() {
             debug!("code_action: target_text is empty, skip");
-            return Ok(None);
+            return Err(tower_lsp_server::jsonrpc::Error::new(
+                tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled,
+            ));
         }
+
+        // TODO: ここでdebounce
 
         // ジョブ判定: 同一の(選択範囲, 対象テキスト)なら進行中/完了済みのジョブに合流し、
         // 別の選択なら(古いジョブを中断して)新規に LLM を起動する。
@@ -1989,7 +2043,7 @@ impl Backend {
     /// (呼び出し元は `.rx` を待つだけでよい)。プロンプトが見つからなければ `None`。
     /// `code_action` ハンドラの `Decision::Start` と、`execute_command` の
     /// 「↻ 候補を作り直す」の両方から呼ばれる。
-    #[instrument(skip(self, target_text))]
+    #[instrument(skip(self, target_text), ret)]
     async fn start_code_action_job(
         &self,
         document_uri: &Uri,
@@ -2015,9 +2069,9 @@ impl Backend {
             },
         );
 
-        let prompt_name = match mode {
-            crate::code_action::ActionMode::FillMark { .. } => "prompt_fill_mark.md",
-            crate::code_action::ActionMode::Rephrase => "prompt_rephrase.md",
+        let (prompt_name, mode_str) = match mode {
+            crate::code_action::ActionMode::FillMark { .. } => ("prompt_fill_mark.md", "fill_mark"),
+            crate::code_action::ActionMode::Rephrase => ("prompt_rephrase.md", "rephrase"),
         };
         let (prompt, options) = match crate::frontmatter::load_prompt(prompt_name) {
             Some(v) => v,
@@ -2066,7 +2120,11 @@ impl Backend {
         let llm = self.llm.clone();
         let character_store = self.character_store.clone();
         let client = self.client.clone();
+        let db = self.db.clone();
+        let uri_owned = uri.to_string();
+        let target_text_owned = target_text.to_string();
         let handle = tokio::spawn(async move {
+            let mut action_id = -1i64;
             let raw = crate::llm::use_llm_with_option(&llm, options, async |l| {
                 l.add_tool(crate::tools::CharacterInfoTool::new(
                     &workspace,
@@ -2077,12 +2135,24 @@ impl Backend {
 
                 l.reasoning_level(0.0); // 速度優先
 
+                action_id = db.record_code_action(
+                    &uri_owned,
+                    mode_str,
+                    &target_text_owned,
+                    l.get_model(),
+                    l.build_content().as_str(),
+                );
+                trace!("CodeAction {}", action_id);
+
                 l.chat().await
             })
             .await;
 
             let candidates = match raw {
-                Ok(response) => crate::code_action::parse_candidates(&response),
+                Ok(response) => {
+                    db.record_code_action_response(action_id, &response);
+                    crate::code_action::parse_candidates(&response)
+                }
                 Err(err) => {
                     error!("Error on code_action: {:?}", err);
                     if let LlmError::LlmBusy { retry_after: _ } = err {
@@ -2096,6 +2166,9 @@ impl Backend {
                     Vec::new()
                 }
             };
+            for (i, candidate) in candidates.iter().enumerate() {
+                db.record_code_action_candidate(action_id, i, candidate);
+            }
             // 受信側が誰もいなくても(全リクエストがキャンセル済みでも)送信でき、
             // その場合は結果を無視してよい(次に同じ範囲へ来たリクエストが拾う)。
             let _ = tx.send(Some(Arc::new(candidates)));
@@ -2835,5 +2908,79 @@ mod tests {
     fn test_chars_before_cursor_line_no_beyond_buffer_sums_all_lines() {
         let lines = vec![line("あい"), line("うえ")];
         assert_eq!(Backend::chars_before_cursor(&lines, 5, 0), 4);
+    }
+
+    /// `extension/languages/fiftyfour/config.toml` の `name = "..."` を素朴に読み取る。
+    /// dev-dependency に toml クレートを足したくないための最小限のパース。
+    fn extension_language_name() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../extension/languages/fiftyfour/config.toml");
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {:?}: {}", path, e));
+        let line = content
+            .lines()
+            .find(|l| l.trim_start().starts_with("name"))
+            .unwrap_or_else(|| panic!("no `name = ...` line in {:?}", path));
+        line.split('=')
+            .nth(1)
+            .unwrap()
+            .trim()
+            .trim_matches('"')
+            .to_string()
+    }
+
+    /// `server_capabilities()` の semanticTokens.documentSelector が、実際に Zed から
+    /// 送られてくる languageId(= extension の `name` を小文字化したもの)と一致しているか
+    /// をビルド時に検証する。過去にこれがズレて("fifty_four" vs "fiftyfour")
+    /// documentSelector がどのバッファにもマッチしない不発弾になっていたことがある。
+    #[test]
+    fn test_semantic_tokens_document_selector_matches_extension_language_id() {
+        let expected = extension_language_name().to_lowercase();
+        assert_eq!(LANGUAGE_ID, expected);
+
+        let caps = server_capabilities();
+        let Some(SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(opts)) =
+            caps.semantic_tokens_provider
+        else {
+            panic!("semantic_tokens_provider is not SemanticTokensRegistrationOptions");
+        };
+        let selectors = opts
+            .text_document_registration_options
+            .document_selector
+            .expect("document_selector must be set");
+        assert_eq!(selectors.len(), 1);
+        assert_eq!(selectors[0].language.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn test_build_semantic_tokens_returns_none_for_unopened_uri() {
+        let text: DashMap<String, Vec<LineData>> = DashMap::new();
+        let highlighter = Highlighter::new();
+        let allowed = HashSet::new();
+        assert!(
+            build_semantic_tokens(&text, &highlighter, "file:///not-open.txt", false, &allowed)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_build_semantic_tokens_marks_heading_lines() {
+        let text: DashMap<String, Vec<LineData>> = DashMap::new();
+        text.insert(
+            "file:///characters.md".to_string(),
+            vec![line("# 見出し"), line("本文行")],
+        );
+        let highlighter = Highlighter::new();
+        let allowed = HashSet::new();
+        let tokens =
+            build_semantic_tokens(&text, &highlighter, "file:///characters.md", true, &allowed)
+                .expect("did_open 済みの URI なので Some のはず");
+
+        // 先頭トークンは見出し行(レベル1)の装飾トークンで、`SemanticTokenType::Type` に
+        // なっているはず(`# ` はレベル1 → Type、`## ` 以降は Class)。
+        assert_eq!(
+            tokens[0].token_type,
+            crate::highlight::SemanticTokenType::Type as u32
+        );
     }
 }

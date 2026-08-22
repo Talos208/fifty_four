@@ -56,6 +56,16 @@ character_update_sections (id, update_id, character_name, attribute, old_text, n
 
 キャラ更新タスクの実行履歴と、セクション単位の適用結果を記録する。
 
+### code_actions / code_action_candidates
+
+```sql
+-- V3__code_actions.sql
+code_actions (id, created_at, document_uri, mode, target_text, model_name, prompt, response)
+code_action_candidates (id, code_action_id, rank, candidate, selected)
+```
+
+`textDocument/codeAction`(穴埋め `fill_mark` / 表現改善 `rephrase`)のリクエストごとに、対象テキスト・プロンプト・LLM の生応答(`response`)と生成された候補を記録する。`response` を持つのは `max_tokens` が適切かを後から検証するため(`length(response)` が上限付近に張り付いていないかを見る)。`selected`(採用追跡)は列のみ用意し、現状は更新していない。
+
 ## プロンプト読み込み
 
 `data/` 配下の Markdown は `rust-embed` でもバイナリに埋め込まれる（`Asset` 構造体）が、`load_prompt(name)` は**実行ファイルと同じ階層の `data/<name>` を優先して読み**、無ければ埋め込みへフォールバックする(`load_prompt_from_disk`)。再ビルドせずにプロンプトを編集して試せるようにするための dev 用フック。

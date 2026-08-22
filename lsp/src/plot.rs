@@ -291,35 +291,36 @@ mod tests {
     }
 
     #[test]
-    fn test_progress_hint_normal_case_includes_percent_and_chars() {
+    fn test_progress_hint_normal_case_includes_percent() {
+        // 現行実装は「章のおよそN%あたりを執筆している」の一文のみを返す
+        // (文字数そのものは含まない)。
         let hint = progress_hint(1600, 4000);
         assert!(hint.contains("40%"));
-        assert!(hint.contains("1600字"));
-        assert!(hint.contains("4000字"));
-        assert!(!hint.contains("超えて"));
+        assert!(hint.contains("あたりを執筆している"));
+        assert!(!hint.contains("終盤"));
     }
 
     #[test]
     fn test_progress_hint_chapter_start_is_zero_percent() {
         let hint = progress_hint(0, 4000);
         assert!(hint.contains("0%"));
-        assert!(hint.contains("0字"));
+        assert!(hint.contains("あたりを執筆している"));
     }
 
     #[test]
     fn test_progress_hint_exactly_at_average_is_over_wording() {
-        // ちょうど予定文字数 = 100%相当は「超過」側の文言になる(percent < 100 の分岐)。
+        // ちょうど予定文字数 = 100%相当は percent < 100 の分岐に乗らないため
+        // 「終盤」側の文言になる。
         let hint = progress_hint(4000, 4000);
-        assert!(hint.contains("超えて"));
         assert!(hint.contains("終盤"));
+        assert!(!hint.contains("あたりを執筆している"));
     }
 
     #[test]
     fn test_progress_hint_over_average_uses_ending_wording() {
         let hint = progress_hint(4800, 4000);
-        assert!(hint.contains("超えて"));
         assert!(hint.contains("終盤"));
-        assert!(hint.contains("4800字"));
+        assert!(!hint.contains("あたりを執筆している"));
     }
 
     #[test]

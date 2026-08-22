@@ -2,6 +2,7 @@
 schema: >
   {"type":"object","properties":{"candidates":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":3}},"required":["candidates"],"additionalProperties":false}
 schema_name: rewrite_candidates
+# 対象テキスト(選択範囲)長に比例。長め(~650字)の選択でも3候補(短い/同程度/長い)が収まるよう厚めに確保
 max_tokens: 4096
 temperature: 0.8
 ---

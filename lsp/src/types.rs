@@ -1,4 +1,3 @@
-use log::debug;
 use std::fmt::Debug;
 use std::str::FromStr;
 use tracing::instrument;
@@ -43,7 +42,6 @@ pub struct LineData {
 impl FromStr for LineData {
     type Err = std::convert::Infallible;
 
-    #[instrument]
     fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
         // debug!("LineData::from_str");
         Ok(Self {

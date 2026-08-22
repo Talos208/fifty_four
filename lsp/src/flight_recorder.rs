@@ -189,6 +189,72 @@ impl FlightRecorder {
         }
     }
 
+    /// INSERT INTO code_actions ... RETURNING id。失敗時は -1 を返す。
+    ///
+    /// `record_completion` と同じく detached task から呼ばれ、補完の記録と
+    /// 並走しうるため `try_lock_for` で待つ(`record_character_*` の無制限 `lock()` とは違う)。
+    pub(crate) fn record_code_action(
+        &self,
+        uri: &str,
+        mode: &str,
+        target_text: &str,
+        model: &str,
+        prompt: &str,
+    ) -> i64 {
+        use std::time::Duration;
+
+        if let Some(db) = self.conn.try_lock_for(Duration::from_secs(1)) {
+            db.query_row(
+                indoc!(
+                    "INSERT INTO code_actions
+                    (document_uri, mode, target_text, model_name, prompt)
+                    VALUES (?,?,?,?,?) RETURNING id;"
+                ),
+                rusqlite::params![uri, mode, target_text, model, prompt],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1)
+        } else {
+            -1
+        }
+    }
+
+    /// code_actions.response へ LLM の生応答(パース前)を書き込む。
+    ///
+    /// `max_tokens` の見積もりが妥当かを後から検証するため
+    /// (`length(response)` が上限に張り付いていないかを見る)。
+    pub(crate) fn record_code_action_response(&self, code_action_id: i64, response: &str) {
+        if let Some(db) = self.conn.try_lock_for(std::time::Duration::from_secs(1)) {
+            if let Err(e) = db.execute(
+                "UPDATE code_actions SET response = ? WHERE id = ?;",
+                rusqlite::params![response, code_action_id],
+            ) {
+                debug!("record_code_action_response failed: {}", e);
+            }
+        }
+    }
+
+    /// INSERT INTO code_action_candidates。
+    pub(crate) fn record_code_action_candidate(
+        &self,
+        code_action_id: i64,
+        rank: usize,
+        candidate: &str,
+    ) {
+        if let Some(db) = self.conn.try_lock_for(std::time::Duration::from_secs(1)) {
+            if let Err(e) = db.execute(
+                indoc!(
+                    "INSERT INTO code_action_candidates
+                    (code_action_id, rank, candidate)
+                    VALUES (?,?,?);"
+                ),
+                rusqlite::params![code_action_id, rank as i64, candidate],
+            ) {
+                debug!("record_code_action_candidate failed: {}", e);
+            }
+        }
+    }
+
     pub(crate) fn record_character_update(&self, uri: &str, model: &str, prompt: &str) -> i64 {
         let db = self.conn.lock();
         db.query_row(
@@ -275,6 +341,25 @@ impl FlightRecorder {
         &self,
         _uri: &str,
         _content_changes: &[TextDocumentContentChangeEvent],
+    ) {
+    }
+
+    pub(crate) fn record_code_action(
+        &self,
+        _uri: &str,
+        _mode: &str,
+        _target_text: &str,
+        _model: &str,
+        _prompt: &str,
+    ) -> i64 {
+        -1
+    }
+    pub(crate) fn record_code_action_response(&self, _code_action_id: i64, _response: &str) {}
+    pub(crate) fn record_code_action_candidate(
+        &self,
+        _code_action_id: i64,
+        _rank: usize,
+        _candidate: &str,
     ) {
     }
 

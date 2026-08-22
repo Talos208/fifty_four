@@ -137,7 +137,17 @@ impl SemanticToken {
 pub struct Highlighter {
     /// Lindera トークナイザ。キャラ名のユーザー辞書差し替え(`rebuild_user_dictionary`)が
     /// あるため RwLock で内部可変にしている。
-    tokenizer: RwLock<lindera::tokenizer::Tokenizer>,
+    ///
+    /// IPADIC 辞書のビルドは(特に最適化無しの debug ビルドで)数百ms〜数秒かかる重い処理。
+    /// `Backend::new()` は LSP のメッセージループが始まる前に同期実行されるため、ここで
+    /// 即座に構築すると `initialize` への応答そのものが遅延し、Zed 側のワークスペース
+    /// 復元(タブの一括 didOpen)と競合して semantic tokens が塗られないタブが生じる
+    /// (実測: debug ビルドで `initialize` 応答が同一マシン上の他の LSP の約10倍かかっていた)。
+    /// `OnceLock` にして `new()` ではバックグラウンドスレッドに構築を投げるだけにし、
+    /// `initialize` を即座に返せるようにする。実際にトークナイズが必要になった時点
+    /// (`tokenizer()`)で初めて `get_or_init` が走り、未完了ならそこだけ待つ
+    /// (通常運用ではバックグラウンド構築が先に終わっているためほぼ待たない)。
+    tokenizer: std::sync::Arc<std::sync::OnceLock<RwLock<lindera::tokenizer::Tokenizer>>>,
 }
 
 impl std::fmt::Debug for crate::highlight::Highlighter {
@@ -150,6 +160,21 @@ impl std::fmt::Debug for crate::highlight::Highlighter {
 
 impl Highlighter {
     pub fn new() -> Self {
+        let tokenizer = std::sync::Arc::new(std::sync::OnceLock::new());
+        {
+            let tokenizer = tokenizer.clone();
+            std::thread::spawn(move || {
+                tokenizer.get_or_init(Self::build_tokenizer);
+            });
+        }
+        Self { tokenizer }
+    }
+
+    /// IPADIC 辞書からトークナイザを構築する。`OnceLock::get_or_init` から呼ばれる
+    /// ことを前提としており、バックグラウンドスレッドと実利用側のどちらが先に
+    /// 呼んでも二重構築は起きない(`OnceLock` が排他する)。
+    #[instrument]
+    fn build_tokenizer() -> RwLock<lindera::tokenizer::Tokenizer> {
         // IPADIC を使用する設定でトークナイザを作成
         let tokenizer = TokenizerBuilder::new()
             .unwrap()
@@ -158,10 +183,12 @@ impl Highlighter {
             // .set_segmenter_user_dictionary("")
             .build()
             .expect("failed to create lindera tokenizer");
+        RwLock::new(tokenizer)
+    }
 
-        Self {
-            tokenizer: RwLock::new(tokenizer),
-        }
+    /// トークナイザ本体を取得する。バックグラウンド構築が未完了ならここで待つ。
+    fn tokenizer(&self) -> &RwLock<lindera::tokenizer::Tokenizer> {
+        self.tokenizer.get_or_init(Self::build_tokenizer)
     }
 
     /// 与えられたトークン(品詞details+表層形)がハイライト対象の人名かどうかを判定する。
@@ -188,8 +215,7 @@ impl Highlighter {
     /// lindera 2.3.2 はCSVファイル経由でしかユーザー辞書を構築できないため、一時ファイルに
     /// 書き出してロード後に削除する。`Tokenizer.segmenter.user_dictionary` が pub なので、
     /// 埋め込みIPADIC の再ロードなしに辞書だけを差し替えられる。
-    #[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
-    #[instrument]
+    #[instrument(skip(self), ret)]
     pub fn rebuild_user_dictionary(&self, names: &HashSet<String>) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind};
 
@@ -208,7 +234,7 @@ impl Highlighter {
             .collect();
 
         if rows.is_empty() {
-            self.tokenizer.write().segmenter.user_dictionary = None;
+            self.tokenizer().write().segmenter.user_dictionary = None;
             debug!("rebuild_user_dictionary: 登録名なし、ユーザー辞書を解除");
             return Ok(());
         }
@@ -223,7 +249,7 @@ impl Highlighter {
         std::fs::write(&path, rows.join("\n"))?;
 
         let result = {
-            let mut tok = self.tokenizer.write();
+            let mut tok = self.tokenizer().write();
             match lindera::dictionary::load_user_dictionary_from_csv(
                 &tok.segmenter.dictionary.metadata,
                 &path,
@@ -265,7 +291,7 @@ impl Highlighter {
 
     #[instrument]
     pub fn text_to_lindera_token(&self, text: &str) -> Vec<CachedLinderaToken> {
-        let tokenizer = self.tokenizer.read();
+        let tokenizer = self.tokenizer().read();
         tokenizer
             .tokenize(text)
             .expect("failed to tokenize text")
@@ -461,7 +487,7 @@ impl Highlighter {
     /// 人名(固有名詞・人名)は `allowed` (キャラ一覧の名前+aliases) に含まれる場合のみ
     /// ハイライトする。組織名・地域名の判定は無効化(コメントアウト)しているが、
     /// 将来再度有効化できるようロジックは残してある。
-    #[instrument]
+    // #[instrument]
     fn classify_normal(
         details: &[String],
         surface: &str,
@@ -499,7 +525,7 @@ impl Highlighter {
     /// 括弧内モードでの品詞→トークン種別マッピング。
     ///
     /// 人名の絞り込みは `classify_normal` と同様。組織名・地域名の判定は無効化(コメントアウト)。
-    #[instrument]
+    // #[instrument]
     fn classify_bracket(
         details: &[String],
         surface: &str,
