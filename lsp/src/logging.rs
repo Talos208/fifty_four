@@ -268,7 +268,7 @@ fn prepare_network_tracing(acp: bool) -> Logger {
             .with_filter(otel_filter())
     });
 
-    // stderr へは絶対に何も出さない(要望どおり、ネットワーク行きのときは無出力)。
+    // stderr へは何も出さない。
     tracing_subscriber::registry()
         .with(otel_log_layer)
         .with(otel_trace_layer)
@@ -281,12 +281,29 @@ fn prepare_network_tracing(acp: bool) -> Logger {
     }
 }
 
+/// 秒精度(UTC)の時刻フォーマッタ。背景は `docs/observability.md` 参照
+#[cfg(all(feature = "otel", debug_assertions))]
+struct SecondsUtcTime;
+
+#[cfg(all(feature = "otel", debug_assertions))]
+impl fmt::time::FormatTime for SecondsUtcTime {
+    fn format_time(&self, w: &mut fmt::format::Writer<'_>) -> std::fmt::Result {
+        static FORMAT: std::sync::LazyLock<
+            Vec<time::format_description::BorrowedFormatItem<'static>>,
+        > = std::sync::LazyLock::new(|| {
+            time::format_description::parse_borrowed::<2>(
+                "[year]-[month]-[day]T[hour]:[minute]:[second]Z",
+            )
+            .expect("static time format description is valid")
+        });
+
+        let now = time::OffsetDateTime::now_utc();
+        let s = now.format(&*FORMAT).map_err(|_| std::fmt::Error)?;
+        write!(w, "{}", s)
+    }
+}
+
 /// stderr 向けの素のログ行フォーマッタ。
-///
-/// 標準の(JSON以外の)`Format` には span コンテキストの表示を消すオプションが無く
-/// (`with_current_span`/`with_span_list` は JSON 専用)、素のログ行だけにするには
-/// 自前の `FormatEvent` が要る。span/イベントの一覧(`ctx.event_scope()`)には
-/// 意図的に触れず、レベル・ターゲット・メッセージだけを書く。
 #[cfg(all(feature = "otel", debug_assertions))]
 struct PlainFormat;
 
@@ -305,17 +322,23 @@ where
         use fmt::time::FormatTime;
         use tracing_log::NormalizeEvent;
 
-        fmt::time::SystemTime.format_time(&mut writer)?;
-        // `log::` マクロ経由のイベントは tracing-log のブリッジで target/level が
-        // 静的な "log" プレースホルダになる(実体は `log.target` 等のフィールドに
-        // 入る)。`normalized_metadata()` で元の target/level を復元する
-        // (`tracing_subscriber` の既定フォーマッタと同じ手順)。
+        SecondsUtcTime.format_time(&mut writer)?;
+        // `log::` 経由のイベントは file/line が失われるため normalized_metadata() で復元する。
+        // target(モジュールパス)は意図的に出さない(`docs/observability.md` 参照)。
         let normalized_meta = event.normalized_metadata();
-        let (level, target) = match &normalized_meta {
-            Some(meta) => (meta.level(), meta.target()),
-            None => (event.metadata().level(), event.metadata().target()),
+        let (level, file, line) = match &normalized_meta {
+            Some(meta) => (meta.level(), meta.file(), meta.line()),
+            None => {
+                let meta = event.metadata();
+                (meta.level(), meta.file(), meta.line())
+            }
         };
-        write!(writer, " {:>5} {}: ", level, target)?;
+        write!(writer, " {:>5} ", level)?;
+        match (file, line) {
+            (Some(file), Some(line)) => write!(writer, "{}:{}: ", file, line)?,
+            (Some(file), None) => write!(writer, "{}: ", file)?,
+            (None, _) => {}
+        }
         ctx.field_format().format_fields(writer.by_ref(), event)?;
         writeln!(writer)
     }
@@ -326,6 +349,8 @@ where
 /// ANSI エスケープシーケンスによる色装飾も無効化する。
 #[cfg(all(feature = "otel", debug_assertions))]
 fn prepare_stderr_tracing() {
+    use tracing_subscriber::filter::{FilterExt, filter_fn};
+
     tracing_subscriber::registry()
         .with(
             fmt::layer()
@@ -333,7 +358,12 @@ fn prepare_stderr_tracing() {
                 .with_ansi(false)
                 .with_span_events(FmtSpan::NONE)
                 .event_format(PlainFormat)
-                .with_filter(suppress_transport_noise(EnvFilter::from_default_env())),
+                .with_filter(
+                    // "message" フィールドの有無で #[instrument(ret)] の戻り値イベントを 除外する(span は残す)。`docs/observability.md` 参照。
+                    suppress_transport_noise(EnvFilter::from_default_env()).and(filter_fn(
+                        |meta| !meta.is_event() || meta.fields().field("message").is_some(),
+                    )),
+                ),
         )
         .init();
 

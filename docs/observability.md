@@ -88,6 +88,31 @@ stderr はどこにも再送されないためこの心配はなく、対象外�
 （`#[cfg(debug_assertions)]`）。配布バイナリ（`--release`）には含まれない。
 LSP・ACP とも stdin/stdout を JSON-RPC チャネルとして使うため、ログは常に stderr。
 
+## stderr フォーマッタ(`PlainFormat` / `SecondsUtcTime`)
+
+開発ビルドの stderr ミラーは `tracing_subscriber::fmt` の既定フォーマッタを使わず、
+`lsp/src/logging.rs` の `PlainFormat`(`FormatEvent`)と `SecondsUtcTime`(`FormatTime`)を
+自前実装している。背景:
+
+- **`with_line_number`/`with_file`/`with_target` は効かない**: これらは
+  `fmt::layer()` が内蔵する既定 `Format` 用のオプションで、`.event_format(PlainFormat)`
+  で丸ごと差し替えると黙って無視される。そのため file:line の表示と target(モジュール
+  パス)の非表示は `PlainFormat::format_event` 内で手書きしている(target は「file:line の
+  方がエディタからジャンプできて情報として上位互換」という判断で意図的に省いている)。
+- **`FmtSpan::NONE` は `#[instrument(ret)]` の戻り値イベントを止めない**: `FmtSpan` が
+  抑制するのは fmt レイヤ自身が合成する ENTER/EXIT 等の span ライフサイクルイベントのみで、
+  `#[instrument(ret)]` が関数終了時に発行する戻り値イベントは通常の `Event`(span ではない)
+  として素通りする。これは `log!`/`tracing::info!` 等と違い `"message"` フィールドを持たず
+  `"return"` フィールドのみを持つため、`prepare_stderr_tracing()` では
+  `meta.fields().field("message").is_some()` を条件にした `filter_fn` を `EnvFilter` に
+  `.and()` で重ねて除外している(`Metadata::fields()` はコールサイトで静的に決まるフィールド
+  名の集合なので、実行時コストなしに判別できる)。span 自体は `is_event()` で除外対象から
+  外し、通常の span 伝播は妨げない。
+- **時刻は秒精度**: 既定の `fmt::time::SystemTime` はナノ秒まで出て冗長なため、
+  `time` クレート(既存依存、`parse_borrowed` は実行時パース。マクロ版
+  `time::macros::format_description!` を使うと "macros" feature が余分に要るため避けた)
+  で `YYYY-MM-DDTHH:MM:SSZ`(UTC)に固定している。
+
 ## トレース伝播とバックグラウンドタスク
 
 `tracing` のスパンコンテキストはスレッドローカル管理のため、`tokio::spawn(...)` で
