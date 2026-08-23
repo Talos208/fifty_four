@@ -150,20 +150,9 @@ impl Provider {
         }
     }
 
-    /// xAI (Grok) はモデルごとに reasoning_effort の対応が大きく割れているため、
-    /// モデル名から判定する。2026-08 時点の x.ai 公式ドキュメント準拠:
-    /// - `grok-4.20-0309-reasoning` / `-non-reasoning`: reasoning 深度がスナップショット
-    ///   に固定されており reasoning_effort 自体が非対応(送ると 400)。
-    /// - `grok-4.20-multi-agent`: reasoning_effort は「エージェント数(4 or 16)」の指定に
-    ///   転用されており、値の意味が他モデルと異なる点に注意。
-    /// - `grok-4.3` / `grok-4.5`: 通常どおり reasoning 深度として対応(grok-4.5 は
-    ///   none 不可＝無効化できない)。
-    ///
-    /// 未知のモデル名は安全側に倒し reasoning_effort を送らない
-    /// (静的表が古くなった場合は 400 の自己修復リトライ(`unsupported_param_from_error_body`)で吸収する)。
-    ///
-    /// 判定順序に注意: "grok-4.20-multi-agent" は "grok-4.20" のプレフィックスにも
-    /// マッチするため、multi-agent の判定を先に行う。
+    /// xAI (Grok) のモデル別 `reasoning_effort` 対応表。詳細・出典は `docs/lsp-handlers.md`
+    /// の「xAI (Grok) の reasoning_effort 対応」参照。未知のモデル名は安全側に倒し非対応扱い。
+    /// 判定順序注意: "grok-4.20-multi-agent" は "grok-4.20" のプレフィックスにもマッチするため先に判定する。
     #[instrument(ret)]
     fn xai_capabilities(model: &str) -> ModelCapability {
         let base = ModelCapability::STRUCTURED_OUTPUT | ModelCapability::TOOL_CALLING;
@@ -267,23 +256,10 @@ fn lmstudio_api_root(base_url: &str) -> String {
     trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
 }
 
-/// LM Studio の `/api/v0/models` と、可能なら HuggingFace の GGUF リポジトリメタデータから
-/// `ModelCapability` を自動推定する。
-///
-/// 判定の根拠(詳細は `docs/lsp-handlers.md` 参照):
-/// - `/api/v0` は LM Studio 0.3.6+ にのみ存在する名前空間なので、**到達できたこと自体**が
-///   「json_schema (GBNF grammar によるサーバ側制約) を強制できるサーバである」証拠になる。
-///   json_schema 対応はモデルではなくサーバの機能のため、モデルが一覧に見つからなくても
-///   `STRUCTURED_OUTPUT` は付与する。
-/// - モデルエントリの `capabilities` に `tool_use` があれば `TOOL_CALLING` を付与する。
-/// - `publisher` + `id` から HuggingFace の GGUF リポジトリを復元できた場合のみ、
-///   `chat_template` を追加のヒントとして重ねる(`capabilities_from_chat_template` 参照)。
-///   HF 側は repo 名の正規化に失敗して外れることがある(LM Studio のカタログ id が
-///   実際の HF repo 名と一致しない場合があるため)ので、あくまで上乗せに留め、
-///   外れても LM Studio 側の判定はそのまま活かす。
-///
-/// ネットワーク不通・タイムアウト・パース失敗など、あらゆる失敗は `debug!` に留めて
-/// `None` を返す。LSP の初期化をローカルサーバの疎通性に依存させないため。
+/// LM Studio の `/api/v0/models` と HuggingFace の GGUF メタデータから `ModelCapability` を
+/// 自動推定する。判定根拠は `docs/lsp-handlers.md` の「LMStudio の capability 自動推定」参照。
+/// 到達不能・タイムアウト・パース失敗は `debug!` に留めて `None`(ローカルサーバの疎通性で
+/// LSP 初期化を止めないため)。
 #[instrument(ret)]
 async fn probe_lmstudio_capabilities(base_url: &str, model: &str) -> Option<ModelCapability> {
     let root = lmstudio_api_root(base_url);

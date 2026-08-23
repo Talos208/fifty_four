@@ -401,6 +401,11 @@ Agent Panel にモデルと思考レベル(effort)のセレクタが出る。中
 同じ経路)。会話の文脈は CLI 側の永続化に残っているため引き継がれるが、
 プロセスの起こし直しで1〜2秒ほど待ち時間が入る。
 
+**まだ一度も応答していないセッションでは `--resume` ではなく `--session-id`
+(新規扱い)で起動する**(`acp.rs` の `has_replied` 参照)。`claude` CLI 側にその
+IDの会話記録がまだ無いため、無条件に `--resume` すると「No conversation found」
+で失敗する。
+
 モデル候補は `default`(既定・CLI任せ)/ `opus` / `sonnet` / `haiku` / `fable` の
 エイリアスに加え、`anthropic-agent-sdk` の `supported_models()` が返す
 バージョン固定IDを並べている。エイリアスは `claude` CLI 側で常に最新の

@@ -29,21 +29,12 @@ pub(crate) enum ActionMode {
     Rephrase,
 }
 
-/// `code_action` ジョブの同一性キー。
+/// `code_action` ジョブの同一性キー。1回目のリクエストから即座に LLM を起動し、
+/// 同一キー(選択範囲・対象テキストが同じ)への後続リクエストはジョブに合流させる
+/// (`decide_job` 参照)。この設計の理由(Zed の shortcut が新規リクエストを送らない挙動)は
+/// `docs/zed-code-action-polling.md` 参照。
 ///
-/// Zed の shortcut(`editor: toggle code actions`)は LSP へ新規リクエストを送らず、
-/// 選択変更のたびの自動ポーリングが `code_actions_for_selection` に置いた結果を
-/// 表示するだけ(Zed本体 `crates/editor/src/code_actions.rs` の `toggle_code_actions`)。
-/// つまり「同一選択への2回目のリクエスト」は基本的に来ない。よって「1回目は記録だけ」
-/// という判別は成立せず、**最初のリクエストで即座に LLM を起動する**。
-///
-/// その代わり、同一キー(選択範囲・対象テキストが同じ)への後続リクエストは新規に
-/// LLM を呼ばず、進行中/完了済みのジョブに合流する(`decide_job` 参照)。これにより
-/// Zed が同じ選択に対して複数回リクエストを送ってきても二重に LLM を呼ばず、かつ
-/// 完了済みの結果はキャッシュとして再利用される。
-///
-/// `target_text` そのものではなくハッシュを持つのは、キーの比較・保持を軽くするため
-/// (document version は持たない設計なので、テキストが変われば別ジョブとして扱われれば十分)。
+/// `target_text` そのものではなくハッシュを持つのは、キーの比較・保持を軽くするため。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JobKey {
     pub(crate) range: Range,

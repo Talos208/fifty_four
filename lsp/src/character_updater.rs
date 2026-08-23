@@ -285,15 +285,9 @@ fn strip_attribute_label(text: &str, attr: &CharacterAttribute) -> String {
     }
 }
 
-/// Alias(呼称)属性専用の決定的マージ。呼称は名前の列挙であり自由記述ではないため、
-/// LLM による意味マージ(1行の文章に統合されてしまう)ではなく `split_aliases` で
-/// 分割した別名リストを箇条書きとして順序保持のまま結合する。
-/// `char_name` 自身と一致する別名は除外する。新規に追加される別名が無ければ `None`。
-///
-/// `split_aliases` は「：」「:」を分割文字に含まないため、過去のバグで
-/// 「呼称：飛騨艦長」のように属性ラベルが1トークンに混入したまま保存された旧データが
-/// 残っている場合がある。各トークンに `strip_attribute_label` を適用してから比較することで、
-/// 新しく来た清潔な「飛騨艦長」と同一別名として認識し、重複を防぀つつ自己修復する。
+/// Alias(呼称)属性専用の決定的マージ(LLM を使わない理由は `docs/character-updater.md`
+/// の「実装上の注意点」参照)。`char_name` 自身と一致する別名は除外する。
+/// 新規に追加される別名が無ければ `None`。
 #[instrument]
 fn merge_alias_bodies(old_body: &str, new_text: &str, char_name: &str) -> Option<String> {
     let dedup_excluding_self = |raw: Vec<String>| -> Vec<String> {
@@ -564,13 +558,9 @@ impl Drop for RunningGuard {
 }
 
 /// キャラクター更新タスクの本体。`did_change` から spawn される唯一の非同期タスク。
-/// `full_text` は発火時にスナップショットした編集ファイルの全文テキスト。
-/// 完了時は `running = false` に戻すだけで、カウンタはリセットしない
-/// (発火時に既にリセット済み・実行中に入った編集を保持するため)。
-/// `workspace` は呼び出し元(`Backend::record_change`)が発火元ドキュメントのURIから
-/// `CharacterStore::resolve_workspace_for` で解決済みのものを渡す(旧: `workspace_arc.first()`
-/// を常に使っていたため、複数ワークスペースを開いていると誤ったワークスペースに書き込む
-/// バグがあった)。
+/// `full_text` は発火時にスナップショットした編集ファイルの全文テキスト。完了時は
+/// `running = false` に戻すだけでカウンタはリセットしない(実行中に入った編集を保持するため)。
+/// `workspace` の解決元については `docs/character-updater.md` の「実装上の注意点」参照。
 #[instrument(skip(llm, recorder))]
 pub async fn run(
     uri: String,

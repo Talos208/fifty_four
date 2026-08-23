@@ -1,38 +1,12 @@
 //! 執筆相談エージェントへの入口。
 //!
-//! Claude Agent SDK(`anthropic-agent-sdk` クレート)への依存を**このモジュールだけ**に
-//! 閉じ込める。`crate::acp` は [`WritingAgent`] トレイト越しにしか触らないので、
-//! クレートを直接 `claude` CLI 駆動へ差し替えるときの影響範囲がここで止まる。
+//! Claude Agent SDK(`anthropic-agent-sdk` クレート、Anthropic 公式ではなく第三者製)への
+//! 依存を**このモジュールだけ**に閉じ込める。`crate::acp` は [`WritingAgent`] トレイト
+//! 越しにしか触らないので、クレートを直接 `claude` CLI 駆動へ差し替えるときの影響範囲が
+//! ここで止まる。
 //!
-//! # クレートについて
-//!
-//! `anthropic-agent-sdk` は Anthropic 公式ではなく第三者製(MIT)。公式の Agent SDK は
-//! Python と TypeScript のみで、他言語には「`claude` CLI をサブプロセスで駆動せよ」と
-//! 案内されている。このクレートも中身は同じで CLI のラッパーなので、いざとなれば
-//! 同じフラグを自前で組み立てる実装に置き換えられる(下記 `CLI フラグ`参照)。
-//!
-//! # グローバル設定は読ませない、ワークスペース側は読む
-//!
-//! コーディング向けの `~/.claude/CLAUDE.md`(や output styles / settings.json)が
-//! 執筆用エージェントに混ざると邪魔になるので、`setting_sources` に
-//! [`SettingSource::Project`] だけを渡す(`User`/`Local` は含めない)。これにより
-//! クレートは `--setting-sources project` を渡し、**グローバル側は締め出したまま**
-//! ワークスペース側(原稿を置いているディレクトリ)の `.claude/` だけを読む。
-//! これは skill(`<workspace>/.claude/skills/<name>/SKILL.md`)をワークスペース側に
-//! 置いて使うための変更(詳細は [`docs/acp-agent.md`] の「skill」節)。
-//! 加えて [`SystemPrompt::String`] を使うので `--system-prompt` となり、
-//! Claude Code の既定プロンプトも丸ごと置き換わる(こちらは `setting_sources` とは
-//! 独立で、`project` を有効にしても既定プロンプトが復活するわけではない)。
-//!
-//! # CLI フラグ
-//!
-//! このモジュールの設定が最終的に `claude` へ渡す形:
-//!
-//! ```text
-//! --system-prompt <data/system_chat.md の中身>
-//! --setting-sources project
-//! --allowedTools Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Skill
-//! ```
+//! `setting_sources`/`system_prompt`/`allowedTools` の設定意図(グローバル設定を読ませない
+//! 理由、最終的に `claude` へ渡る CLI フラグ)は `docs/acp-agent.md` 参照。
 
 use crate::acp_config::SessionConfig;
 use anthropic_agent_sdk::{
@@ -205,16 +179,8 @@ impl ClaudeAgent {
     }
 
     /// `Message::Result{is_error:true}` を分かりやすい `AgentError` へ変換する。
-    ///
-    /// `--resume` で起動したセッションが実は `claude` CLI 側に存在しない場合、
-    /// `ClaudeSDKClient::new()` の接続自体は成功してしまい、`friendly_agent_error` の
-    /// `Transport` 検出では捕まえられない。実際の失敗は最初の応答がこの形
-    /// (`Message::Result{is_error:true}`)で返ってきたときに初めて分かる
-    /// (`claude` CLI 自身は stderr に "No conversation found with session ID: ..." を
-    /// 出すが、こちらのプロセスからは見えない)。`--resume` 起動だった場合は
-    /// `friendly_agent_error` の `Transport` と同じ文言に寄せ、詳細はログにだけ残す。
-    /// 新規セッションでの失敗は本当に別の理由(実際のAPIエラー等)の可能性があるため、
-    /// 詳細をそのままユーザーへ返す。
+    /// `--resume` 先のセッションが CLI 側に実在しない場合の検出経緯は
+    /// `docs/acp-agent.md` の「セッションの再開」参照。
     #[instrument]
     fn result_error(
         &self,
@@ -279,17 +245,9 @@ fn windows_npm_fallback() -> Option<PathBuf> {
     None
 }
 
-/// 解決した `cli_path` がそのまま起動できない形式なら理由を返す。
-///
-/// `npm install -g @anthropic-ai/claude-code` はWindowsでは `claude.cmd` という
-/// バッチラッパーを生成する(ネイティブインストーラの `claude.exe` とは別物)。
-/// `.cmd`/`.bat` を `std::process::Command` へ渡すと、Rust標準ライブラリの
-/// 引数エスケープ制限(CVE-2024-24576対策。バッチファイルは `cmd.exe` 経由で
-/// 実行されるため、`"`/`&`/`^` 等を含む複雑な引数を安全にエスケープできない場合に
-/// 拒否する)に引っかかり、`claude` へ渡す長いシステムプロンプトが原因で
-/// 「batch file arguments are invalid」という原因の分からないOSエラーになる
-/// (実機で確認済み)。起動を試みる前にこの形式を検出し、分かりやすい理由で
-/// 早期に失敗させる。
+/// 解決した `cli_path` がそのまま起動できない形式(Windows の `claude.cmd` ラッパー)なら
+/// 理由を返す。背景(CVE-2024-24576 由来の引数エスケープ制限)は `docs/acp-agent.md` の
+/// 「Windows での注意」参照。起動を試みる前に検出し、分かりやすい理由で早期に失敗させる。
 #[cfg(windows)]
 #[instrument]
 fn unsupported_cli_reason(path: &Path) -> Option<AgentError> {

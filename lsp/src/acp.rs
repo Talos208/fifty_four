@@ -1,41 +1,13 @@
-//! ACP (Agent Client Protocol) エージェント。
+//! ACP (Agent Client Protocol) エージェント。`fifty_four_lsp --acp` で起動したときのモード。
 //!
-//! `fifty_four_lsp --acp` で起動したときのモード。Zed の Agent Panel から stdio 越しに
-//! 接続され、作者の相談相手として応答する。中身は Claude Agent SDK
-//! ([`crate::writing_agent`])で、原稿ディレクトリのファイルを読み書きしながら話す。
+//! Zed の Agent Panel から stdio 越しに接続され、作者の相談相手として応答する
+//! (中身は [`crate::writing_agent`] 経由の Claude Agent SDK)。目的はチャットそのもの
+//! ではなく、**会話の要約を [`crate::chat_context`] へ書き出し、LSP の補完・code action
+//! プロンプトへ `{{CHAT}}` として渡す**こと。
 //!
-//! 目的はチャット機能そのものではなく、**作者が「いま何を書こうとしているか」を
-//! LSP の短文生成へ渡す**こと。1ターンごとに会話を要約して [`crate::chat_context`] の
-//! ファイルへ書き出し、LSP 側が補完・code action のプロンプトへ `{{CHAT}}` として埋め込む。
-//!
-//! # 構成
-//!
-//! ```text
-//! Zed ──stdio──> fifty_four_lsp --acp
-//!                  └─ ClaudeAgent (Claude Agent SDK → claude CLI)  … 会話本体
-//!                  └─ llm.rs 経由の LLM (Gemini 等)                … 会話の要約
-//!                       │                    └── <workspace>/.fifty_four/chat_context.md
-//!                       │                           ↑ LSP サーバ(別プロセス)が補完時に読む
-//! ```
-//!
-//! Zed は LSP サーバ(拡張経由)と ACP エージェント(`agent_servers` 設定経由)を
-//! **別プロセス**として起動する。Zed の拡張 API には ACP を登録する口が無い
-//! (language server / MCP context server / DAP のみ)ため、この分離は避けられない。
-//! 受け渡しは `.fifty_four/chat_context.md` の1ファイルで、`plot.md` を毎回読み直す
-//! [`crate::tools`] と同じ方式にしている。
-//!
-//! # 認証
-//!
-//! **会話本体**は Claude Agent SDK 経由、つまり `claude` CLI の認証をそのまま使う。
-//! `ANTHROPIC_API_KEY` を設定しなければ、ログイン済み CLI のサブスクリプション枠で動く。
-//!
-//! **要約(chat digest)** は [`update_digest`] が `crate::llm` 経由で別 provider
-//! (既定は Gemini)を呼ぶ。`--acp` 時も `.env` を読むようになった([`crate::main`] の
-//! `load_dev_env`)ため provider の API キーはここから取れるが、Anthropic の資格情報は
-//! 読み込み直後に必ず取り除かれる(`scrub_anthropic_credentials`)ので、会話本体が
-//! 誤って API キー課金になることはない。使う provider/model は環境変数
-//! `FIFTY_FOUR_ACP_LLM` で `{"provider": "...", "model": "..."}` 形式で指定でき、
-//! 無ければ既定(Gemini)にフォールバックする([`digest_llm_config`] 参照)。
+//! 構成・認証(会話本体は `claude` CLI のサブスク枠、要約は別 provider で
+//! `scrub_anthropic_credentials` により資格情報混線を防いでいる)の詳細は
+//! `docs/acp-agent.md` 参照。
 
 use crate::acp_config::{self, SessionConfig};
 use crate::writing_agent::{AgentError, ClaudeAgent, WritingAgent};
@@ -264,23 +236,13 @@ pub(crate) async fn run() -> Result<(), String> {
             },
             agent_client_protocol::on_receive_request!(),
         )
-        // `session/load`: プロセス再起動等でメモリ上の状態が失われたセッションを、
-        // `claude` CLI 側の永続化された会話履歴から再開する。
-        // `Session::turns` はプロセスのメモリ上にしか無いため、[`crate::session_log`] へ
-        // 逐次追記してある過去ターンを読み戻し、ACP の仕様通り `session/update` 通知として
-        // 応答の前にリプレイする(仕様は "MUST replay" と明記している)。
+        // `session/load`: セッションを CLI 側の永続化履歴から再開する。
+        // 詳細(過去ターンのリプレイ、旧形式ID非対応の理由)は `docs/acp-agent.md` の「セッションの再開」参照
         .on_receive_request(
             async move |req: LoadSessionRequest, responder, connection| {
                 debug!("acp session/load: id={} cwd={:?}", req.session_id, req.cwd);
 
-                // `claude` CLI の `--resume` はUUID形式のセッションIDしか受け付けない。
-                // 今回の実装より前に発行された旧形式(`ff-{pid}-{n}`)のIDがZed側の履歴に
-                // 残っていると、UUIDでないIDをそのまま `--resume` に渡すことになり、
-                // CLIプロセスが起動直後に引数エラーで自己終了する。その場合
-                // `ClaudeAgent::start` 自体は(spawn/connectまでは)成功として返ってしまい、
-                // 実際の失敗は次の `session/prompt` での書き込み時に「パイプが閉じている」
-                // という分かりにくいエラーとして先送りされる。ここで事前に弾くことで、
-                // `session/load` の時点で分かりやすく失敗させる。
+                // 旧形式ID(UUID以外)は `--resume` に渡すと分かりにくく失敗するため、ここで弾く。
                 if uuid::Uuid::parse_str(&req.session_id.0).is_err() {
                     warn!(
                         "acp session/load: 不正な形式のセッションID: {}",
@@ -443,14 +405,8 @@ pub(crate) async fn run() -> Result<(), String> {
                         .respond_with_internal_error(format!("unknown session: {}", session_id));
                 };
 
-                // GUI で選ばれた設定がまだ反映されていなければ、ここ(会話の切れ目)で
-                // `claude` プロセスを起こし直す。`anthropic-agent-sdk` はセッション途中の
-                // 切替を非対応なので、同じセッションIDで `--resume` することで
-                // 会話の文脈を保ったまま設定だけ変える(`session/load` と同じ経路)。
-                // まだ一度も応答していないセッションでは `claude` CLI 側にそのIDの
-                // 会話記録が無いため、`--resume` ではなく `--session-id`(新規扱い)で
-                // 起動する(`has_replied` 参照。無条件に `--resume` すると
-                // 「No conversation found」で失敗する)。
+                // モデル/思考レベル切替はセッション途中は非対応なので、ここ(会話の切れ目)で `claude` プロセスを起こし直す。
+                // `has_replied` で `--resume`/`--session-id` を切り分ける理由は `docs/acp-agent.md` の「モデル・思考レベルの変更」参照
                 if let Some(new_config) = pending {
                     let prompt = match system_prompt() {
                         Ok(p) => p,
@@ -631,17 +587,11 @@ async fn drain_digests(state: &AgentState) {
     }
 }
 
-/// 要約(chat digest)用 LLM の provider/model 設定。
+/// 要約(chat digest)用 LLM の provider/model 設定。`FIFTY_FOUR_ACP_LLM` 環境変数の
+/// 形式・既定値は `docs/acp-agent.md` の「プロンプト」参照。
 ///
-/// 環境変数 `FIFTY_FOUR_ACP_LLM` に `{"provider": "...", "model": "..."}`
-/// (`crate::llm::LlmClientBuilder::from_value` が受ける形。LSP の `llm.ondemand` /
-/// `llm.deferred` と同じ)を渡すと差し替えられる。ACP には LSP の
-/// `initialization_options` に相当する経路が無いため、Zed の `agent_servers.env`
-/// 経由で渡す想定(`docs/acp-agent.md` に `RUST_LOG` を渡す前例がある)。
-///
-/// 未設定・パース失敗・`provider` が既知の値でない場合は既定(Gemini)へフォールバックする。
-/// `crate::llm::LlmClientBuilder::from_value` は不正な `provider` を `unwrap()` で
-/// panic させるため、**ここで必ず検証してから返す**。
+/// `LlmClientBuilder::from_value` は不正な `provider` を `unwrap()` で panic させるため、
+/// **ここで必ず検証してから返す**。
 #[instrument(ret)]
 fn digest_llm_config() -> serde_json::Value {
     const DEFAULT: &str = r#"{"provider": "google"}"#;

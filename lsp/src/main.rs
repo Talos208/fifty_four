@@ -66,18 +66,9 @@ fn load_dev_env() {
 }
 
 /// `claude` CLI にサブスクリプション枠を使わせるため、Anthropic の API 資格情報を
-/// プロセス環境から取り除く。
-///
-/// SDK は子プロセスへ親の環境を丸ごと渡すので(`env::vars()` → `Command::envs`)、
-/// `ClaudeAgentOptions::env` では打ち消せない。認証解決は
-/// `ANTHROPIC_API_KEY` → `ANTHROPIC_AUTH_TOKEN` → ログイン済みプロファイルの順で、
-/// キーが在る限り先に勝つため、実際に消すしかない。
-///
-/// `--acp` は要約(chat digest)用に `load_dev_env()` で `.env` を読むようになった
-/// (`crate::acp::update_digest` 参照)ため、シェル/Zed からの継承だけでなく `.env` に
-/// `ANTHROPIC_API_KEY` があるケースもここで弾く。**`load_dev_env()` の直後に呼ぶこと**
-/// (`main()` 参照。順序を逆にすると `.env` のキーが残ったまま `claude` CLI が起動し、
-/// サブスク枠ではなく API キー課金で動いてしまう)。
+/// プロセス環境から取り除く。**`load_dev_env()` の直後に呼ぶこと**(順序を逆にすると
+/// `.env` のキーが残ったまま `claude` CLI が起動し、API キー課金で動いてしまう)。
+/// 背景(SDK が環境を打ち消せない理由・認証解決順)は `docs/acp-agent.md` の「認証」参照。
 ///
 /// # Safety
 /// `remove_var` は他スレッドが環境を読んでいると UB。tokio ランタイムを起こす前の
@@ -98,22 +89,10 @@ fn scrub_anthropic_credentials() {
     }
 }
 
-/// `--acp` 時、`RUST_LOG` がこのバイナリ向けに指定されていなければ ACP 関連モジュール
-/// だけ既定で debug にする。
-///
-/// Zed は `agent_servers` 経由でこのバイナリを直接起動するため、ターミナルから
-/// `RUST_LOG=fifty_four_lsp=debug` を渡す手段が事実上無い(`docs/acp-agent.md` の
-/// 動作確認手順はターミナルから直接起動する前提で書かれている)。env_logger の
-/// 既定(`error`のみ)だと `session/new` → `session/prompt` の流れや、実際に失敗する
-/// 手前の文脈が何も残らない。そこで ACP 関連モジュールに限定して debug を既定化する。
-///
-/// `RUST_LOG` が既に設定されていても、値にこのバイナリの crate 名
-/// (`fifty_four_lsp`)が含まれていなければ上書きする。Zed 自身が `RUST_LOG=lsp=trace`
-/// のような自分用の値を設定した状態で起動され、それが素通しで子プロセスへ継承される
-/// ケースがあるため(`lsp` というターゲットはこの crate のどのモジュールパスにも
-/// マッチせず、かつベアのデフォルトレベルも無いディレクティブなので、素通しすると
-/// ACP のログ・トレースが一切出なくなる)。ユーザーが `agent_servers` の `env` 経由で
-/// `fifty_four_lsp=...` を明示していれば、それは尊重して上書きしない。
+/// `--acp` 時、`RUST_LOG` にこの crate 名への言及が無ければ ACP 関連モジュールだけ
+/// 既定で debug にする。背景(Zed からは `RUST_LOG` を渡す手段が事実上無いこと、
+/// 「言及が無ければ」という判定にしている理由)は `docs/observability.md` の
+/// 「`RUST_LOG` のスコープ」参照。
 ///
 /// # Safety
 /// `set_var` は他スレッドが環境を読んでいると UB。tokio ランタイムを起こす前の

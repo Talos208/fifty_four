@@ -1,26 +1,7 @@
-//! ACP セッションの会話ログを、プロセス再起動をまたいで永続化する。
-//!
-//! [`crate::acp`] の `Session::turns` はプロセスのメモリ上にしか無く、
-//! `fifty_four_lsp --acp` が再起動すると失われる。ACP の仕様は `session/load` で
-//! 会話全体を `session/update` 通知としてリプレイすることを要求しているため
-//! (応答を返す前に MUST)、リプレイ元になるデータをどこかへ残しておく必要がある。
-//!
-//! `claude` CLI 自身もディスクへ会話を永続化しているが、保存先パス(cwdを
-//! ハッシュ化したディレクトリ名)は非公開仕様でバージョン間の互換性が保証されない。
-//! そこで `chat_context.rs` と同じ発想で、こちらの管理下にある
-//! `.fifty_four/sessions/<session_id>.jsonl.gz` へ自前で逐次追記する。
-//!
-//! # フォーマット
-//!
-//! 1ターン = 1行の JSON([`crate::acp::ChatTurn`] をそのままシリアライズしたもの)を、
-//! gzip の「独立したメンバーを単純に連結してよい」という性質を使って1メンバーずつ
-//! 追記する。これにより `chat_context::write_digest` と同じ append-only な書き方を、
-//! 圧縮ありのまま維持できる(読み直し・再圧縮が不要)。読み出し側は
-//! [`flate2::read::MultiGzDecoder`] を使うことで、連結された複数メンバーを
-//! 意識せず1本のストリームとして読める。
-//!
-//! 保持期間の制限(TTL)は設けていない。ログは増え続けるので、容量が気になる場合は
-//! [`crate::chat_context::DEFAULT_TTL_SECS`] と同様の仕組みをここへ足す余地がある。
+//! ACP セッションの会話ログを、プロセス再起動をまたいで永続化する
+//! (`.fifty_four/sessions/<session_id>.jsonl.gz`、1ターン=1行のJSONをgzipメンバー
+//! として逐次追記)。`session/load` でのリプレイに使う。背景・フォーマットの詳細は
+//! `docs/acp-agent.md` の「セッションの再開」参照。
 
 use crate::acp::ChatTurn;
 use flate2::Compression;

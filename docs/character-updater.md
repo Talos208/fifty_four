@@ -55,6 +55,20 @@ flowchart TD
 
 - 外見、性格、背景、関係性 等（`main.rs` の `CharacterAttribute` enum）
 
+## 実装上の注意点
+
+- **`run` へ渡す `workspace` は呼び出し元で解決済みのものを使う。** 発火元ドキュメントの
+  URI から `CharacterStore::resolve_workspace_for` で都度解決する(`Backend::record_change`)。
+  以前は常に最初に開いたワークスペース(`workspace_arc.first()`)を使っていたため、複数
+  ワークスペースを開いていると誤ったワークスペースへ書き込むバグがあった。
+- **Alias(呼称)属性は LLM ではなく決定的マージ。** 呼称は名前の列挙であり自由記述では
+  ないため、`merge_alias_bodies` が `split_aliases` で分割した別名リストを順序保持のまま
+  結合する(LLM の意味マージだと1行の文章に統合されてしまう)。`split_aliases` は「：」
+  「:」を分割文字に含まないため、過去のバグで属性ラベルが1トークンに混入したまま
+  保存された旧データ(例:「呼称：飛騨艦長」)が残っている場合がある。各トークンに
+  `strip_attribute_label` を適用してから比較することで、新しく来た清潔な形と同一別名として
+  認識し、重複を防ぎつつ自己修復する。
+
 ## 設定
 
 `initialize` の `character_updater` オプション、または `did_change_configuration` で変更可能。

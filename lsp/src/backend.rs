@@ -1206,14 +1206,8 @@ impl LanguageServer for Backend {
         }
     }
 
-    /// plot.md を開いたとき、各 `# 章名` 見出し行末に「現文字数/予定文字数」を表示する。
-    /// plot.md 以外のドキュメントには何も返さない。
-    ///
-    /// 章の現文字数は、対応する `<章名>.txt` が開いていればそのバッファ(編集中の内容)を
-    /// 優先し、無ければディスクから読む(`collect_references` と同じ方針。
-    /// `open_txt_buffers` を共有している)。front matter に `episodes`/`average_chars` が
-    /// 両方あれば、front matter を閉じる行にも作品全体の合計進捗
-    /// (現文字数合計/`episodes * average_chars`)を表示する。
+    /// plot.md の各章見出しへ「現文字数/予定文字数」を表示する
+    /// 詳細は`docs/lsp-handlers.md` の `inlay_hint` の項参照
     #[instrument(ret, skip(self))]
     async fn inlay_hint(
         &self,
@@ -1445,14 +1439,8 @@ impl LanguageServer for Backend {
                 },
             );
 
-            // Zed は補完候補を「カーソル直前の語」で暗黙にフィルタし、候補の
-            // label.filter_text()(既定では label 自身)と照合する。filter_text
-            // フィールドは label 文字列に含まれる部分でなければ無視される
-            // (crates/language_core/src/code_label.rs の filter_range 構築)ため、
-            // label に無い任意の文字列を仕込んでフィルタを回避することはできない。
-            // 通常の LSP 補完と同じ作法(直前の語トークンを置換し、newText を
-            // トークンで始める)に合わせることで、Zed のクエリ(=そのトークン)が
-            // 必ず label の接頭辞になり表示される。
+            // Zed の補完フィルタ対策で直前の語トークンを算出する。
+            // 理由は `docs/zed-completion-filtering.md` 参照。
             let precursor_token = tmp
                 .get(line_no)
                 .map(|l| precursor_word(l.text.as_str(), offset).to_string()) // TODO: precursor_tokenが長すぎる
@@ -1550,15 +1538,9 @@ impl LanguageServer for Backend {
 
                 let mut pending: Vec<PendingCandidate> = Vec::new();
 
-                // Zed は補完候補を「カーソル直前の語」で暗黙にフィルタし、
-                // 候補の label.filter_text()(既定では label 自身)と照合する。
-                // filter_text フィールドは label 文字列に含まれる部分文字列でなければ
-                // 無視されるため、label に無い任意の文字列でフィルタを回避することはできない
-                // (crates/language_core/src/code_label.rs の filter_range 構築を確認済み)。
-                // そこで通常の LSP 補完と同じ作法を取る: 直前の語トークン
-                // (precursor_token)を置換対象にし、newText/label をトークンで始める。
-                // これで Zed のクエリ(=そのトークン)が必ず label の接頭辞になり表示される。
-                // トークンが空(句点・改行・括弧の直後)ならクエリも空になり従来どおり表示される。
+                // precursor_token(直前の語)を置換対象にし newText/label をその語で
+                // 始める(Zed の補完フィルタ対策。`docs/zed-completion-filtering.md` 参照)
+                // トークンが空(句点・改行・括弧の直後)なら従来どおりの表示になる
                 let cursor = Position::new(line_no as u32, offset as u32);
                 let precursor_len = crate::types::utf16_len(&precursor_token) as u32;
                 let edit_start = Position::new(
@@ -1645,19 +1627,10 @@ impl LanguageServer for Backend {
     /// - 対象内に「※」があれば、そこに当てはまる語の候補を複数提示する
     /// - 無ければ、意味を変えずに表現を改善した候補を複数提示する
     ///
-    /// Zed はガター電球の表示判定のため、選択/カーソル移動のたびにこのハンドラを叩く
-    /// (詳細は `docs/zed-code-action-polling.md`)。しかも Zed の shortcut(`editor: toggle
-    /// code actions`)は LSP へ新規リクエストを送らず、自動ポーリングが置いた結果を表示
-    /// するだけ(Zed 本体 `crates/editor/src/code_actions.rs` の `toggle_code_actions`)。
-    /// つまり「同一選択への2回目のリクエスト」は基本的に来ない。そこで:
-    /// 1. `trigger_kind == INVOKED`、または `trigger_kind` 未送信(`None`)かつ選択範囲が
-    ///    ある場合のみ先へ進む(`AUTOMATIC`、または未送信でカーソルのみは `Ok(None)`)。
-    /// 2. 通ったリクエストは(1回目でも)即座に LLM を起動する。ただし呼び出し本体は
-    ///    detached task に切り出し、リクエストの `$/cancelRequest` に巻き込まれないように
-    ///    する。同一の(選択範囲, 対象テキスト)への後続リクエストは新規に LLM を呼ばず、
-    ///    同じジョブに合流する(進行中なら合流して待ち、完了済みならキャッシュとして
-    ///    即座に返す。判定は `code_action::decide_job` に切り出し)。選択が別の範囲へ
-    ///    切り替わった場合は、古いジョブを中断してから新しいジョブを起動する。
+    /// Zed は `trigger_kind` を送らず選択/カーソル移動のたびにこのハンドラを自動ポーリング
+    /// する(`docs/zed-code-action-polling.md` 参照)。そのためゲートは選択範囲の有無のみで
+    /// 行い、通ったリクエストは1回目でも即座に LLM を起動する(`code_action::decide_job` で
+    /// 同一選択への後続リクエストをジョブへ合流させ、二重起動を防ぐ)。
     #[instrument(ret, skip(self))]
     async fn code_action(
         &self,

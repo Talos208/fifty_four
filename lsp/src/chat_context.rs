@@ -1,23 +1,9 @@
 //! ACP エージェント(`--acp`)と LSP サーバの間で「いま話している内容」を受け渡す。
+//! 別プロセス同士のため、ワークスペース直下の `.fifty_four/chat_context.md` を
+//! 唯一の受け渡し点とする(書き手は ACP、読み手は LSP の補完・code action)。
 //!
-//! Zed は LSP サーバ(拡張経由)と ACP エージェント(`agent_servers` 設定経由)を
-//! それぞれ別プロセスとして起動するため、両者はメモリを共有できない。そこで
-//! ワークスペース直下の `.fifty_four/chat_context.md` を唯一の受け渡し点とする。
-//! `plot.md` やキャラクター設定を呼ばれるたびディスクから読み直す
-//! [`crate::tools`] と同じ方式で、プロセス間の同期機構を持ち込まずに済ませる。
-//!
-//! - 書き手は ACP エージェント(1ターンごとに要約を上書き)
-//! - 読み手は LSP サーバ(補完・code action のプロンプト組み立て時)
-//!
-//! # 所有者マーカー
-//!
-//! `chat_context.md` はワークスペースに1つしか無いため、複数の ACP セッションが
-//! 同じワークスペースで行き来すると「どのセッションの要約か」が分からなくなる。
-//! これをかつては時間(TTL)で誤魔化していたが、[`crate::session_log`] により
-//! セッションごとの会話履歴を正確に扱えるようになったので、代わりに
-//! `chat_context.owner`(中身はセッションID1行)へ所有者を記録し、
-//! [`crate::acp`] がセッションの境界(`session/new`/`session/load`)で
-//! 明示的に切り替える方式にした。
+//! `chat_context.owner` によるセッション単位の所有権管理の背景は `docs/acp-agent.md`
+//! の「セッションの再開」参照。
 
 use std::path::{Path, PathBuf};
 use tracing::instrument;
@@ -91,18 +77,11 @@ pub(crate) fn write_digest(root: &Path, digest: &str, session_id: &str) -> std::
     write_atomic(&dir, OWNER_FILE_NAME, session_id)
 }
 
-/// 要約を読み出す。プロンプトへ埋め込めない状態なら `None`。
+/// 要約を読み出す。プロンプトへ埋め込めない状態(ファイル無し・空白のみ)なら `None`。
 ///
-/// `None` を返すのは次の場合:
-/// - ファイルが無い(まだ一度もチャットしていない)
-/// - 中身が空白のみ
-///
-/// `max_chars` を超える場合は**古い側(先頭)から**切り落とす。要約は
-/// 新しい話題ほど後ろに来るため、末尾を残す方が「いま何を書こうとしているか」に近い。
-///
-/// 以前は「最終更新から一定時間(TTL)を過ぎたら無効」という鮮度チェックもあったが、
-/// [`owner`] によるセッション単位の明示的な切り替え([`crate::acp`] 参照)に
-/// 置き換えたため廃止した。
+/// `max_chars` 超過時は**古い側(先頭)から**切り落とす。新しい話題ほど後ろに来るため、
+/// 末尾を残す方が「いま何を書こうとしているか」に近い。鮮度チェック(TTL)廃止の経緯は
+/// `docs/acp-agent.md` の「セッションの再開」参照。
 #[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
 #[instrument]
 pub(crate) fn read_digest(root: &Path, max_chars: usize) -> Option<String> {

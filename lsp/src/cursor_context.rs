@@ -361,12 +361,8 @@ pub fn before_sentences_upto(
 
     let mut last_byte = crate::types::utf16_to_byte_offset(&text[line_no].text, utf16_offset);
 
-    // カーソルがトークン上(境界含む)にある場合でも、ここではそのトークンを consume しない。
-    // last_byte をカーソル位置のままにしておけば、直後の 'outer ループが
-    // [直前トークンの byte_start .. カーソル位置) をまとめて取り込むため、
-    // カーソルより後方の文字の混入やトークンの二重計上なしに「カーソル直前まで」が集まる。
-    // (以前はカーソルトークン全体を push + last_byte を byte_end へ進めていたため、
-    //  閉じ括弧直前などトークン境界にカーソルがあると後方文字の混入・重複が起きていた)
+    // カーソルがトークン上(境界含む)にある場合でも consume しない(理由は
+    // `docs/completion.md` の「文脈取得」参照)。last_byte はカーソル位置のまま残す。
     let mut tkn_ix: i64 = text[line_no]
         .tokens
         .iter()
@@ -374,14 +370,8 @@ pub fn before_sentences_upto(
         .map(|ix| ix as i64)
         .unwrap_or_else(|| {
             // last_byte を含むトークンが無い場合(行頭の空白の直前、行末など)。
-            // last_byte 以前に完全に収まっているトークンの数を数えれば、それが
-            // 「カーソルの直前にあるトークンの次のインデックス」になる。
-            // カーソルが最初のトークンより前(行頭の空白等)なら 0 に、
-            // 最後のトークンより後(行末)なら tokens.len() になり、どちらの端でも
-            // 正しく振る舞う。以前は無条件に tokens.len()(行末扱い)へ倒していたため、
-            // 行頭で一致しないケースを行末と誤認し、後段のスライスで
-            // `line.text[行末トークンのbyte_start..last_byte(=0)]` という
-            // 逆転レンジを作ってpanicしていた。
+            // last_byte 未満に収まるトークン数がそのままインデックスになる
+            // (過去の逆転レンジpanicの経緯は `docs/completion.md` 参照)。
             text[line_no]
                 .tokens
                 .iter()
@@ -460,18 +450,8 @@ pub fn before_sentences_upto(
     result
 }
 
-/// LLM の生レスポンスを、候補行の列へ分割する。
-///
-/// モデルはまれに「これから挙げる候補の意図」を独り言のように書き出してから
-/// 空行を挟んで実際の候補を続けることがある(観測例: 意図説明2行 + 空行 + 実際の
-/// 候補3行、という計6行の応答)。これをそのまま `.lines()` するとダミー候補が
-/// 混入し、空行自体も `decorate_candidate` の既定分岐で「。」だけの幽霊候補になる。
-///
-/// このため、応答内に空行があれば**最後の空行より後ろ**を実際の候補群とみなし、
-/// そこに実質的な行が1つでもあればそちらを採用する(モデルが前置きと本題を
-/// 空行で区切る、という観測された振る舞いに対する経験則)。空行が無い、または
-/// 空行の後ろに実質的な行が無い(末尾の空行のみ等)場合は、全体から空行だけを
-/// 除いたものを返す。
+/// LLM の生レスポンスを、候補行の列へ分割する。前置きの独り言を空行で切り捨てる
+/// 経験則の詳細は `docs/completion.md` の「候補の後処理」参照。
 #[instrument(ret)]
 pub(crate) fn extract_candidate_lines(response: &str) -> Vec<&str> {
     let lines: Vec<&str> = response.split_ascii_whitespace().collect();
