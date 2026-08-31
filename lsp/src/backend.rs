@@ -23,9 +23,7 @@ use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use tower_lsp_server::lsp_types::request::{
-    GotoImplementationParams, GotoImplementationResponse, Request,
-};
+use tower_lsp_server::lsp_types::request::{GotoImplementationParams, GotoImplementationResponse};
 use tower_lsp_server::lsp_types::*;
 use tower_lsp_server::{Client, LanguageServer, UriExt};
 use tracing::instrument;
@@ -86,15 +84,10 @@ pub(crate) struct Backend {
 #[instrument(ret)]
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
-        // UTF-16 は LSP の必須ベースラインで全クライアントがサポートするため、
-        // クライアントの general.positionEncodings を確認せず常に宣言してよい。
-        // (実クライアントの Zed も utf-16 のみをオファーする)
         position_encoding: Some(PositionEncodingKind::UTF16),
-        // キャラ名にカーソルを合わせた際、そのキャラの設定をMarkdownで表示する。
-        hover_provider: Some(HoverProviderCapability::Simple(true)),
-        // save 通知(did_save)を有効化するため Kind ではなく Options 形式にする。
-        // キャラクター設定ファイル保存時に character_store を調和(reconcile)するために使う。
+        hover_provider: Some(HoverProviderCapability::Simple(true)), // キャラ名にカーソルを合わせた際、そのキャラの設定をMarkdownで表示する。
         text_document_sync: Some(TextDocumentSyncCapability::Options(
+            // キャラクター設定ファイル保存時に character_store を調和(reconcile)するために使う
             TextDocumentSyncOptions {
                 open_close: Some(true),
                 change: Some(TextDocumentSyncKind::INCREMENTAL),
@@ -103,23 +96,19 @@ fn server_capabilities() -> ServerCapabilities {
             },
         )),
         selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
-        // キャラ名(表示名・別名とも)にカーソルを合わせて Go to Definition すると、
-        // characters.md / characters/*.md の該当キャラ見出しへジャンプする。
-        definition_provider: Some(OneOf::Left(true)),
-        // plot.md の `# 章名` 見出しで Go to Implementation すると、対応する
-        // `<章名>.txt` へジャンプする(無ければ作成する)。
-        implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
-        // キャラ名(表示名・別名とも)の登場箇所をワークスペース直下の本文 `.txt` から
-        // 横断検索する(Find All References)。
-        references_provider: Some(OneOf::Left(true)),
-        // `.md`(characters.md / plot.md / memo/*.md)の見出し一覧をアウトライン・
-        // パンくずとして提供する。FiftyFour 言語は tree-sitter 文法を持たないため、
-        // Zed 側で `"document_symbols": "on"` にしないとこの capability は使われない
-        // (docs/lsp-handlers.md 参照)。
-        document_symbol_provider: Some(OneOf::Left(true)),
-        // plot.md の各 `# 章名` 見出し行末に「現文字数/予定文字数」を表示する。
-        // plot.md 以外のドキュメントには何も返さない(inlay_hint ハンドラ側でガード)。
-        inlay_hint_provider: Some(OneOf::Left(true)),
+        definition_provider: Some(OneOf::Left(true)), // キャラ名(表示名・別名とも)からcharacters.md / characters/*.md の該当キャラ見出しへジャンプする
+        implementation_provider: Some(
+            // plot.md の `# 章名` 見出しで対応する`<章名>.txt` へジャンプする
+            ImplementationProviderCapability::Simple(true),
+        ),
+        references_provider: Some(OneOf::Left(true)), // キャラ名(表示名・別名とも)の登場箇所をワークスペース直下の本文 `.txt` から横断検索する(Find All References)
+        document_symbol_provider: Some(OneOf::Left(true)), // 見出し一覧をアウトライン・パンくずとして提供する
+        inlay_hint_provider: Some(OneOf::Left(true)), // plot.md の各 `# 章名` 見出し行末に「現文字数/予定文字数」を表示する
+        document_link_provider: Some(DocumentLinkOptions {
+            // `.md` 内の `[[ページ名]]` wikilink をクリックジャンプ可能にする
+            resolve_provider: Some(false),
+            work_done_progress_options: Default::default(),
+        }),
         semantic_tokens_provider: Some(
             SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
                 SemanticTokensRegistrationOptions {
@@ -158,6 +147,7 @@ fn server_capabilities() -> ServerCapabilities {
                                 SemanticTokenType::REGEXP,
                                 SemanticTokenType::OPERATOR,
                                 SemanticTokenType::DECORATOR,
+                                SemanticTokenType::new("wikiLink"),
                             ],
                             token_modifiers: vec![],
                         },
@@ -224,10 +214,37 @@ fn server_capabilities() -> ServerCapabilities {
     }
 }
 
+/// `Backend::refresh_highlight_names` の実体。`character_updater::run` の spawn タスクなど、
+/// `&Backend` を持ち込めない `'static` タスクからも共有ハンドルの clone 経由で呼べるよう
+/// 自由関数にしてある。character_store の全ワークスペース合計の許可名集合で Lindera
+/// ユーザー辞書を再構築し、トークンキャッシュを破棄したうえでクライアントへ
+/// semanticTokens の再取得を要求する。
+#[instrument(skip(character_store, highlighter, text, client))]
+async fn refresh_highlight_names_with(
+    character_store: &CharacterStore,
+    highlighter: &Highlighter,
+    text: &DashMap<String, Vec<LineData>>,
+    client: &Client,
+) {
+    let names = character_store.all_allowed_names();
+    debug!(
+        "refresh_highlight_names: {} 件の許可名(全ワークスペース合計)",
+        names.len()
+    );
+    if let Err(e) = highlighter.rebuild_user_dictionary(&names) {
+        warn!("ユーザー辞書の再構築に失敗: {}", e);
+    }
+    for mut entry in text.iter_mut() {
+        for line in entry.value_mut().iter_mut() {
+            line.tokens.clear();
+        }
+    }
+    if let Err(e) = client.semantic_tokens_refresh().await {
+        warn!("semantic_tokens_refresh failed: {:?}", e);
+    }
+}
+
 /// 指定 URI のトークン列を組み立てる。`uri` が未オープン(`text` に無い)なら `None`。
-/// `Client` を持たないのでテストから直接呼べる。`semantic_tokens_full` から
-/// ロジックを分離するために切り出した(ハンドラ側は Client 経由のワークスペース解決・
-/// initialized 待ちを担当し、こちらは純粋なトークン化のみを担当する)。
 #[instrument(skip(text, highlighter, allowed), ret)]
 fn build_semantic_tokens(
     text: &DashMap<String, Vec<LineData>>,
@@ -507,46 +524,39 @@ impl LanguageServer for Backend {
             scope_uri: None,
             section: None,
         }];
-        // 失敗しても致命的ではないので warn に落として続行する
-        // (以前は unwrap() で panic していた)。
         match self.client.configuration(req).await {
             Ok(res) => debug!("{:?}", res),
-            Err(e) => warn!("workspace/configuration の取得に失敗: {:?}", e),
+            Err(e) => {
+                // 失敗しても致命的ではないので warn出すだけ
+                warn!("workspace/configuration の取得に失敗: {:?}", e);
+            }
         }
 
-        // (a) ワークスペース初期化時にキャラクターファイルを能動スキャンし character_store へ
-        // ロードする。LLM補完のtool calling実行を待たずに、人名ハイライトの絞り込みをすぐ
-        // 使えるようにするため。
+        // (a) ワークスペース初期化時にキャラクターファイルを能動スキャンし character_store へロードする。
+        // LLM補完のtool calling実行を待たずに、人名ハイライトの絞り込みをすぐ使えるようにするため。
         let workspace_paths: Vec<PathBuf> = self.workspace.lock().await.clone();
         for ws in &workspace_paths {
             self.character_store.load_workspace(ws).await;
         }
 
-        // (c) 外部エディタ/gitなどによるキャラクターファイルの変更も検知できるよう、
-        // workspace/didChangeWatchedFiles を動的登録する。クライアントが対応していない場合は
-        // register_capability がエラーを返すが、致命的ではないのでログのみで継続する。
+        // (c) 外部エディタ/gitなどによるキャラクターファイルの変更も検知できるよう、workspace/didChangeWatchedFiles を動的登録する。
         let registration = Registration {
             id: "fifty-four-watch-characters".to_string(),
             method: "workspace/didChangeWatchedFiles".to_string(),
             register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
-                watchers: vec![
-                    FileSystemWatcher {
-                        glob_pattern: GlobPattern::String("**/characters.md".to_string()),
-                        kind: None,
-                    },
-                    FileSystemWatcher {
-                        glob_pattern: GlobPattern::String("**/characters/*.md".to_string()),
-                        kind: None,
-                    },
-                ],
+                // `characters.md` に加え、そこから [[wikilink]] で辿られる任意の .md も
+                // 追跡対象になりうるため、.md 全体を監視する。実際に取り込むかどうかは
+                // `did_change_watched_files` 側で「characters.md または追跡済み」に絞る
+                // (そうしないと plot.md の見出しがキャラクターとして取り込まれてしまう)。
+                watchers: vec![FileSystemWatcher {
+                    glob_pattern: GlobPattern::String("**/*.md".to_string()),
+                    kind: None,
+                }],
             })
             .ok(),
         };
         if let Err(e) = self.client.register_capability(vec![registration]).await {
-            warn!(
-                "workspace/didChangeWatchedFiles の動的登録に失敗（クライアント未対応の可能性）: {:?}",
-                e
-            );
+            warn!("workspace/didChangeWatchedFiles の動的登録に失敗: {:?}", e);
         }
 
         self.refresh_highlight_names().await;
@@ -573,8 +583,7 @@ impl LanguageServer for Backend {
             .collect();
         self.update_all(params.text_document.uri.as_str(), 0, texts);
 
-        // plot_sync: baseline(ディスク上の .txt 群と一致していると信じる章名の並び)を
-        // 開いた時点の内容で種付けする。
+        // plot_sync: baseline(ディスク上の .txt 群と一致していると信じる章名の並び)を開いた時点の内容で種付けする。
         if self
             .plot_md_workspace(&params.text_document.uri)
             .await
@@ -608,27 +617,23 @@ impl LanguageServer for Backend {
         let _ = self.client.show_document(params);
     }
 
-    /// (b) キャラクター設定ファイル保存時、character_store を調和(reconcile)する。
-    /// 保存直後の内容をディスクから読み直し、自己書き込みのエコーでなければ(＝内容が
-    /// character_updater による直前の書き込みと一致しなければ)取り込んで許可名集合へ反映する。
+    /// (b) キャラクター設定ファイル保存時、character_store をreconcileする。
     #[instrument(ret, skip(self))]
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri.as_str();
 
-        // plot.md の inlay hint(各章の現文字数)は対応する .txt の内容に依存する。
-        // plot.md 自身が開いていなければクライアントは再取得しないので、保存のたびに
-        // 明示的に再取得を促す(plot.md 側の編集による更新はクライアントが自前で行う)。
+        // plot.md の inlay hintは対応する .txt の内容に依存する。plot.md 自身が開いていなければ
+        // クライアントは再取得しないので、保存のたびに明示的に再取得を促す
         if uri.ends_with(".txt") {
             let _ = self.client.inlay_hint_refresh().await;
         }
 
-        // plot_sync: 保存は「編集の確定」の明確なシグナルなので、debounce を待たず
-        // 即座に章名変更を判定・実行する。
+        // plot_sync: 保存は「編集の確定」の明確なシグナルなので、debounce を待たず即座に章名変更を判定・実行する。
         if let Some(ws) = self.plot_md_workspace(&params.text_document.uri).await {
             self.flush_plot_sync(&params.text_document.uri, ws).await;
         }
 
-        if !self.is_character_file(uri) {
+        if !uri.ends_with(".md") {
             return;
         }
         let Some(path) = params.text_document.uri.to_file_path() else {
@@ -639,6 +644,11 @@ impl LanguageServer for Backend {
             warn!("did_save[{}]: 所属ワークスペースが特定できない", uri);
             return;
         };
+        // characters.md 自身に加え、wikilink 経由で追跡対象へ昇格したファイルも取り込む
+        // (昇格したまま同期されないと、次の自動更新が古い内容で上書きしてしまう)。
+        if !self.is_character_file(uri) && !self.character_store.is_tracked(&ws, &path) {
+            return;
+        }
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => {
@@ -648,20 +658,21 @@ impl LanguageServer for Backend {
         };
         if self.character_store.reconcile(&ws, &path, content) {
             debug!("did_save[{}]: 外部変更として取り込み", uri);
+            // wikilink 先の変更を、それを参照する追跡ファイルの included_* へ波及させる。
+            self.character_store.refresh_included(&ws);
             self.refresh_highlight_names().await;
         } else {
             debug!("did_save[{}]: 自己書き込みのエコーのため無視", uri);
         }
     }
 
-    /// (c) workspace/didChangeWatchedFiles: エディタ外(他プログラム・git等)での
-    /// キャラクター設定ファイル変更を検知し character_store を調和(reconcile)する。
-    /// `initialized` で動的登録した watcher からの通知を受ける。
+    /// (c) workspace/didChangeWatchedFiles: エディタ外(他プログラム・git等)でのキャラクター設定ファイル変更を検知し
+    /// character_store を調和(reconcile)する。`initialized` で動的登録した watcher からの通知を受ける。
     #[instrument(ret, skip(self))]
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        let mut any_changed = false;
-        // plot.md の inlay hint(各章の現文字数)は対応する .txt の内容に依存するため、
-        // エディタ外での .txt 変更(削除・作成・他プログラムによる書き換え)も追随させる。
+        // 変更を取り込んだワークスペース(refresh_included は root 単位で行うため)
+        let mut changed_workspaces: HashSet<PathBuf> = HashSet::new();
+        // エディタ外での .txt 変更(削除・作成・他プログラムによる書き換え)にも追随
         let mut any_txt_changed = false;
         for change in params.changes {
             let Some(path) = change.uri.to_file_path().map(|p| p.into_owned()) else {
@@ -688,11 +699,22 @@ impl LanguageServer for Backend {
             };
             match change.typ {
                 FileChangeType::DELETED => {
-                    debug!("did_change_watched_files: removing {:?} from store", path);
-                    self.character_store.remove(&ws, &path);
-                    any_changed = true;
+                    // 追跡していないファイルの削除は無視する(watcher は .md 全体に張っている)。
+                    if self.character_store.is_tracked(&ws, &path) {
+                        debug!("did_change_watched_files: removing {:?} from store", path);
+                        self.character_store.remove(&ws, &path);
+                        changed_workspaces.insert(ws.clone());
+                    }
                 }
                 _ => {
+                    // watcher は `**/*.md` 全体に張っているため、キャラクター設定として
+                    // 取り込むべきファイルだけに絞る(そうしないと plot.md の見出しが
+                    // キャラクターとして登録されてしまう)。
+                    if !self.is_character_file(change.uri.as_str())
+                        && !self.character_store.is_tracked(&ws, &path)
+                    {
+                        continue;
+                    }
                     let content = match tokio::fs::read_to_string(&path).await {
                         Ok(c) => c,
                         Err(e) => {
@@ -705,7 +727,7 @@ impl LanguageServer for Backend {
                             "did_change_watched_files: 外部変更として取り込み: {:?}",
                             path
                         );
-                        any_changed = true;
+                        changed_workspaces.insert(ws.clone());
                     } else {
                         debug!(
                             "did_change_watched_files: 自己書き込みのエコーのため無視: {:?}",
@@ -715,7 +737,11 @@ impl LanguageServer for Backend {
                 }
             }
         }
-        if any_changed {
+        if !changed_workspaces.is_empty() {
+            // wikilink 先の変更を、それを参照する追跡ファイルの included_* へ波及させる。
+            for ws in &changed_workspaces {
+                self.character_store.refresh_included(ws);
+            }
             self.refresh_highlight_names().await;
         }
         if any_txt_changed {
@@ -723,10 +749,8 @@ impl LanguageServer for Backend {
         }
     }
 
-    /// plot_sync の逆方向(`.txt` リネーム → plot.md 見出し書き換え)。`initialize` で宣言した
-    /// `workspace.fileOperations.didRename`(`**/*.txt` フィルタ)に対してクライアントから届く。
-    /// 順方向(plot.md → txt)自身が起こしたリネームは `pending_self_renames` で無視し、
-    /// 無限ループを防ぐ。
+    /// `.txt` リネーム → plot.md 見出し書き換え。`workspace.fileOperations.didRename`がクライアントから届く
+    /// 順方向(plot.md → txt)自身が起こしたリネームは `pending_self_renames` で無視し、無限ループを防ぐ。
     #[instrument(ret, skip(self))]
     async fn did_rename_files(&self, params: RenameFilesParams) {
         if !self
@@ -864,18 +888,19 @@ impl LanguageServer for Backend {
         }
     }
 
+    async fn semantic_tokens_range(
+        &self,
+        _params: SemanticTokensRangeParams,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<SemanticTokensRangeResult>> {
+        Ok(None)
+    }
+
     /// ドキュメント全体に対する semantic tokens の問い合わせに応答します。
-    ///
-    /// `.md` ファイルでは見出し行(front matter・コードフェンス内の `#` は除く)を
-    /// 通常のキャラ名/会話ハイライトから除外し、代わりに見出し用の装飾を1トークンで
-    /// 出す(`# ` はレベル1、`## ` 以降はまとめてレベル2以上として区別する)。
     #[instrument(ret, skip(self))]
     async fn semantic_tokens_full(
         &self,
         params: SemanticTokensParams,
     ) -> tower_lsp_server::jsonrpc::Result<Option<SemanticTokensResult>> {
-        debug!("semantic_token_full");
-
         let uri = params.text_document.uri.as_str();
         let allowed = match self.resolve_workspace(&params.text_document.uri).await {
             Some(ws) => self.character_store.allowed_names(&ws),
@@ -895,10 +920,7 @@ impl LanguageServer for Backend {
 
         let Some(vec) = build_semantic_tokens(&self.text, &self.highlighter, uri, is_md, &allowed)
         else {
-            // did_open 前(あるいは既に did_close 済み)の URI。未オープンの文書に
-            // トークンを返す意味は無いので黙って None を返す(以前は expect() で panic
-            // していた: panic するとハンドラの応答が永久に返らず、Zed 側では
-            // そのタブだけ semantic tokens が効かなくなる)。
+            // did_open 前(あるいは既に did_close 済み)の URIは色変えの意味なし
             debug!("semantic_tokens_full[{}]: 未オープンの URI", uri);
             return Ok(None);
         };
@@ -919,8 +941,8 @@ impl LanguageServer for Backend {
         let line_no = pos.position.line as usize;
         let utf16_offset = pos.position.character as usize;
 
-        // カーソル位置のドキュメントが属するワークスペースを特定する。マッチしなければ
-        // hoverを出さない(誤って別ワークスペースのキャラ情報を出さないための安全側の判断)。
+        // カーソル位置のドキュメントが属するワークスペースとマッチしなければhoverを出さない
+        // 誤って別ワークスペースのキャラ情報を出さないように
         let Some(ws) = self.resolve_workspace(&pos.text_document.uri).await else {
             return Ok(None);
         };
@@ -966,8 +988,7 @@ impl LanguageServer for Backend {
         }))
     }
 
-    /// キャラ名(表示名・別名とも)にカーソルを合わせた際、`characters.md`
-    /// (または`characters/*.md`)の該当キャラ見出しへジャンプする。
+    /// キャラ名(表示名・別名とも)にカーソルが合ってたら、該当キャラ見出しへジャンプする。
     /// 対象語が未登録のキャラ名でなければ `Ok(None)` を返す(hoverと同一判定基準)。
     #[instrument(ret, skip(self))]
     async fn goto_definition(
@@ -1008,8 +1029,7 @@ impl LanguageServer for Backend {
         drop(tmp);
 
         let allowed = self.character_store.allowed_names(&ws);
-        // hoverと同一の判定基準(品詞=固有名詞,人名 かつ 許可名一致)を通ったトークンのみ
-        // ジャンプ対象にする。ハイライト・hover・definitionで対象語を一致させるため。
+        // hoverと同一の判定基準(品詞=固有名詞,人名 かつ 許可名一致)を通ったトークンのみジャンプ対象
         if !Highlighter::is_recognized_name(&tkn.details, &surface, &allowed) {
             return Ok(None);
         }
@@ -1024,14 +1044,13 @@ impl LanguageServer for Backend {
             })
             .collect();
 
-        // カーソルが既に定義位置(キャラ見出し行)にある場合、定義へ飛んでも動かない。
-        // 代わりに参照一覧を返す(rust-analyzer / IntelliJ 等と同じ振る舞い)。本文中で
-        // 呼んだ場合はこの条件に該当しないため、従来通り定義へジャンプする。
+        // カーソルが既にキャラ見出し行にある場合、代わりに参照一覧を返す(rust-analyzer / IntelliJ 等と同じ振る舞い)。
         let cur_path: Option<PathBuf> =
             pos.text_document.uri.to_file_path().map(|p| p.into_owned());
         let already_at_definition = cur_path.is_some()
             && locations.iter().any(|loc| {
                 loc.range.start.line == line_no as u32
+                    // 本文中で呼んだ場合はこの条件に該当しないため、従来通り定義へジャンプする。
                     && loc.uri.to_file_path().map(|p| p.into_owned()) == cur_path
             });
         if already_at_definition {
@@ -1051,9 +1070,8 @@ impl LanguageServer for Backend {
         }
     }
 
-    /// plot.md の `# 章名` 見出し行にカーソルを合わせた際、対応する `<章名>.txt`
-    /// (本文ファイル)へジャンプする。ファイルがまだ無ければ空ファイルとして作成してから
-    /// ジャンプする(Zed 側がジャンプ先を開く際にファイルの存在を要求するため)。
+    /// plot.md の `# 章名` 見出し行にカーソルを合わせた際、対応する `<章名>.txt`(本文ファイル)へジャンプする。
+    /// ファイルがまだ無ければ空ファイルとして作成してからジャンプする
     /// plot.md 以外、または見出し行以外では `Ok(None)`。
     #[instrument(ret, skip(self))]
     async fn goto_implementation(
@@ -1113,6 +1131,63 @@ impl LanguageServer for Backend {
         })))
     }
 
+    /// `.md` 内の `[[ページ名]]` wikilink をクリックジャンプ可能にする。記法・解決規則は
+    /// `docs/lsp-handlers.md` 参照。リンク先が実在しない場合はリンクとして出さない
+    /// (自動作成しない。`goto_implementation` とは対照的な挙動)。
+    #[instrument(ret, skip(self))]
+    async fn document_link(
+        &self,
+        params: DocumentLinkParams,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<Vec<DocumentLink>>> {
+        let uri = &params.text_document.uri;
+        let Some(lines) = self.text.get(uri.as_str()) else {
+            return Ok(None);
+        };
+        let Some(current_path) = uri.to_file_path() else {
+            return Ok(None);
+        };
+        let is_md = current_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("md"));
+        if !is_md {
+            return Ok(None);
+        }
+        let Some(current_dir) = current_path.parent() else {
+            return Ok(None);
+        };
+
+        let text = lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        drop(lines);
+
+        let links: Vec<DocumentLink> = crate::wikilink::find_wikilinks(&text)
+            .into_iter()
+            .filter_map(|m| {
+                let target_path = crate::wikilink::resolve_target(current_dir, &m.target)?;
+                let target_uri = Uri::from_file_path(&target_path)?;
+                Some(DocumentLink {
+                    range: Range::new(
+                        Position::new(m.line, m.start_utf16),
+                        Position::new(m.line, m.end_utf16),
+                    ),
+                    target: Some(target_uri),
+                    tooltip: None,
+                    data: None,
+                })
+            })
+            .collect();
+
+        if links.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(links))
+        }
+    }
+
     /// キャラ名(表示名・別名とも)にカーソルを合わせて Find All References すると、
     /// ワークスペース直下(非再帰)の本文 `.txt` から登場箇所を横断検索して返す。
     /// 対象語が未登録のキャラ名でなければ `Ok(None)` を返す(hover/goto_definitionと同一判定基準)。
@@ -1158,9 +1233,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
 
-        // `include_declaration` は本来「定義位置(見出し行)を含めるか」を制御するが、
-        // 参照検索の対象は .txt のみで定義位置は .md 側にしか無いため、両者が重なることは
-        // そもそも無い。よってここでは特に分岐しない。
+        // 参照検索の対象は .txt のみで定義位置は .md 側にしか無いため、気にしない
         let names = self.character_store.lookup_names(&ws, &surface);
         let locations = self.collect_references(&ws, &names).await;
 
@@ -1185,9 +1258,8 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
 
-        // inlay_hint と同じく、開いているバッファ(編集中の内容)から全文を復元する。
-        // ここは選択ジャンプ先を返すだけの読み取り専用処理なので、書き込みロック付きの
-        // `try_get_mut` ではなく `get` でよい。
+        // inlay_hint と同じく、開いているバッファ(編集中の内容)から全文を復元する
+        // ここは選択ジャンプ先を返すだけの読み取り専用処理なので、書き込みロック無しの`get` でよい
         let Some(lines) = self.text.get(uri) else {
             return Ok(None);
         };
@@ -1243,9 +1315,7 @@ impl LanguageServer for Backend {
 
         let plot = crate::plot::parse_plot(&content);
 
-        // 合計進捗の hint を出すべきか(front matter が揃っていて、かつその行が
-        // ビューポート内にある場合のみ)。これが false なら、範囲外の章の文字数を
-        // わざわざディスクから読みには行かない。
+        // 合計進捗の hint を出すのは、front matter が揃っていて、かつその行がビューポート内にある場合のみ
         let want_total = match (
             plot.front_matter_end_line,
             plot.meta.episodes,
@@ -1430,17 +1500,13 @@ impl LanguageServer for Backend {
                 tmp.as_mut_slice(),
                 line_no,
                 offset,
-                // このクロージャはカーソル行より後方の行(next_token フォールバック)専用。
-                // 後方行の tag は in_bracket 判定に使われない(in_bracket はカーソル以前の
-                // before_tkn のみ参照し、EmptyBracket/BeforeClosingBracket は品詞ベースの
-                // is_bracket_close で判定する)ため、深さ未考慮のトークン化で問題ない。
                 |line| {
+                    // 後方行の tag は in_bracket 判定に使われなため、深さ未考慮のトークン化で問題ない。
                     line.tokens = highlighter.text_to_lindera_token(line.text.as_str());
                 },
             );
 
-            // Zed の補完フィルタ対策で直前の語トークンを算出する。
-            // 理由は `docs/zed-completion-filtering.md` 参照。
+            // Zed の補完フィルタ対策で直前の語トークンを算出する。`docs/zed-completion-filtering.md` 参照。
             let precursor_token = tmp
                 .get(line_no)
                 .map(|l| precursor_word(l.text.as_str(), offset).to_string()) // TODO: precursor_tokenが長すぎる
@@ -1491,13 +1557,10 @@ impl LanguageServer for Backend {
         let prompt = crate::frontmatter::expand(&prompt, &vars);
 
         // 直前テキストの末尾文字。候補への句点前置要否の判定に使う
-        // (decorate_candidate参照。読点等の直後には句点を重ねない)。
         let prev_tail = text_body.chars().next_back();
 
-        // LLM 応答待ちの間、クライアントへ進捗を表示する(Zed の activity indicator)。
-        // クライアントがリクエストに付けた workDoneToken があれば優先し、
-        // 無ければサーバ発トークンを window/workDoneProgress/create で登録する。
-        // Drop ガードで必ずprogressの終了がが送られる
+        // LLM 応答待ちの間、クライアントへ進捗を表示する。Drop ガードで必ずprogressの終了がが送られる
+        // クライアントがリクエストに付けた workDoneToken があれば優先し無ければサーバ発トークンを window/workDoneProgress/create で登録する。
         let _progress = CompletionProgress::begin(
             &self.client,
             self.work_done_progress_supported
@@ -2336,11 +2399,11 @@ impl Backend {
         self.workspace.lock().await.append(&mut paths);
     }
 
-    /// URI がキャラクター設定ファイルかどうかを判定する。
-    /// characters/*.md または characters.md は更新タスクの対象外とする(自己ループ防止)。
+    /// URI がキャラクター設定ファイル(`characters.md`)かどうかを判定する。
+    /// 更新タスクの対象外とする(自己ループ防止)。
     #[instrument(skip(self))]
     fn is_character_file(&self, uri: &str) -> bool {
-        uri.contains("/characters/") || uri.ends_with("/characters.md")
+        uri.ends_with("/characters.md")
     }
 
     /// URIから、それを含む最長一致のワークスペースrootを解決する。
@@ -2668,31 +2731,17 @@ impl Backend {
     /// クライアントへ semanticTokens の再取得を要求する。トークナイズ品質の担保だけが
     /// 目的で、どのワークスペースの名前かはここでは区別しない
     /// (ハイライト・hoverの最終判定はワークスペーススコープの許可名集合で別途行う)。
+    /// 実体は `refresh_highlight_names_with`(`character_updater::run` の spawn タスク内など、
+    /// `&Backend` を持ち込めない箇所とも共有する自由関数)。
     #[instrument(skip(self))]
     async fn refresh_highlight_names(&self) {
-        let names = self.character_store.all_allowed_names();
-        debug!(
-            "refresh_highlight_names: {} 件の許可名(全ワークスペース合計)",
-            names.len()
-        );
-        if let Err(e) = self.highlighter.rebuild_user_dictionary(&names) {
-            warn!("ユーザー辞書の再構築に失敗: {}", e);
-        }
-        self.invalidate_token_caches();
-        if let Err(e) = self.client.semantic_tokens_refresh().await {
-            warn!("semantic_tokens_refresh failed: {:?}", e);
-        }
-    }
-
-    /// 全バッファの Lindera トークンキャッシュを破棄する(次回アクセス時に遅延再トークナイズされる)。
-    /// ユーザー辞書の差し替え後、旧辞書による分割結果を捨てるために使う。
-    #[instrument(skip(self))]
-    fn invalidate_token_caches(&self) {
-        for mut entry in self.text.iter_mut() {
-            for line in entry.value_mut().iter_mut() {
-                line.tokens.clear();
-            }
-        }
+        refresh_highlight_names_with(
+            &self.character_store,
+            &self.highlighter,
+            &self.text,
+            &self.client,
+        )
+        .await;
     }
 
     /// did_change イベントの情報を更新状態に記録し、発火判定を行う。
@@ -2824,15 +2873,33 @@ impl Backend {
                 uri,
                 text.chars().count()
             );
-            let fut = crate::character_updater::run(
-                uri.to_string(),
-                workspace,
-                self.character_store.clone(),
-                text,
-                self.background_llm.clone(),
-                self.db.clone(),
-                state_arc.clone(),
-            );
+            // character_updater::run の書き込みは character_store.write() 経由でメモリへ
+            // 即反映されるが、Lindera ユーザー辞書(全ワークスペース許可名の再構築)は
+            // did_save/did_change_watched_files からしか呼ばれておらず、この自動更新サイクル
+            // 経由の自己書き込みは reconcile のエコー検出で無視されるため did_save 側からも
+            // 発火しない。run 完了後にここで明示的に呼ぶ(&Backendはspawnへ持ち込めないため
+            // 共有ハンドルをclone)。
+            let character_store = self.character_store.clone();
+            let highlighter = self.highlighter.clone();
+            let text_store = self.text.clone();
+            let client = self.client.clone();
+            let background_llm = self.background_llm.clone();
+            let db = self.db.clone();
+            let uri_owned = uri.to_string();
+            let fut = async move {
+                crate::character_updater::run(
+                    uri_owned,
+                    workspace,
+                    character_store.clone(),
+                    text,
+                    background_llm,
+                    db,
+                    state_arc.clone(),
+                )
+                .await;
+                refresh_highlight_names_with(&character_store, &highlighter, &text_store, &client)
+                    .await;
+            };
             // tokio::spawn は別タスクとして切り離すため、tracing のスパンコンテキストは
             // 明示的に運ばないと引き継がれない(このままだと character_updater::run の
             // #[instrument] が新しい独立したトレースを作ってしまい、did_change 側の

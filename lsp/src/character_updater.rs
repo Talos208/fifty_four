@@ -771,15 +771,10 @@ enum ResolvedOp {
         body: String,
         records: Vec<RecordInfo>,
     },
-    /// 単一ファイル形式への新規キャラブロック追記(全属性を1ブロックへ集約)。
+    /// 新規キャラブロックの追記(全属性を1ブロックへ集約)。宛先は常に既存ファイル
+    /// (`characters.md`、または既にそのキャラを定義しているファイル)。
     AppendCharacter {
         file: PathBuf,
-        name: String,
-        sections: Vec<(&'static str, String)>,
-        records: Vec<RecordInfo>,
-    },
-    /// フォルダ形式の新規キャラファイル作成(全属性を集約)。
-    CreateFile {
         name: String,
         sections: Vec<(&'static str, String)>,
         records: Vec<RecordInfo>,
@@ -803,14 +798,14 @@ fn section_display_heading(tags: &[CharacterAttribute]) -> String {
         .join("・")
 }
 
-/// 未解決(新規)キャラへの更新を、同一キャラにつき1つの CreateFile/AppendCharacter へ集約する。
+/// 未解決(新規)キャラへの更新を、同一キャラにつき1つの AppendCharacter へ集約する。
 /// 既出の新規キャラ名が今回の name を含む場合(「ジェフ・クライン」に対する「ジェフ」)も
 /// 同一キャラとみなし、逐次適用時の見出し部分一致と挙動を揃える。
 #[instrument(skip(rec))]
 fn merge_into_new(
     plan: &mut Vec<ResolvedOp>,
-    new_chars: &mut Vec<(Option<PathBuf>, String, usize)>,
-    scope: Option<PathBuf>,
+    new_chars: &mut Vec<(PathBuf, String, usize)>,
+    scope: PathBuf,
     name: &str,
     attr: &CharacterAttribute,
     new_text: &str,
@@ -824,21 +819,12 @@ fn merge_into_new(
     let Some(op_idx) = existing else {
         match build_new_section_body(attr, new_text, name) {
             Some(body) => {
-                let sections = vec![(attr.canonical_heading(), body)];
-                let op = match &scope {
-                    Some(f) => ResolvedOp::AppendCharacter {
-                        file: f.clone(),
-                        name: name.to_string(),
-                        sections,
-                        records: vec![rec],
-                    },
-                    None => ResolvedOp::CreateFile {
-                        name: name.to_string(),
-                        sections,
-                        records: vec![rec],
-                    },
-                };
-                plan.push(op);
+                plan.push(ResolvedOp::AppendCharacter {
+                    file: scope.clone(),
+                    name: name.to_string(),
+                    sections: vec![(attr.canonical_heading(), body)],
+                    records: vec![rec],
+                });
                 new_chars.push((scope, name.to_string(), plan.len() - 1));
             }
             None => plan.push(ResolvedOp::Skip {
@@ -854,9 +840,6 @@ fn merge_into_new(
     // (plan[op_idx] を可変借用中は plan.push できないため、Skip はフラグ経由で後から積む)。
     let mut skip_rec: Option<RecordInfo> = None;
     if let ResolvedOp::AppendCharacter {
-        sections, records, ..
-    }
-    | ResolvedOp::CreateFile {
         sections, records, ..
     } = &mut plan[op_idx]
     {
@@ -916,7 +899,7 @@ fn plan_updates(
     let mut append_by_attr: HashMap<(PathBuf, String, &'static str), usize> = HashMap::new();
     let mut group_by_char: HashMap<(PathBuf, String), usize> = HashMap::new();
     // 新規キャラは見出しの contains 一致で合流させるため線形走査のリストを使う
-    let mut new_chars: Vec<(Option<PathBuf>, String, usize)> = Vec::new();
+    let mut new_chars: Vec<(PathBuf, String, usize)> = Vec::new();
 
     for item in updates {
         let name = item.name.as_str();
@@ -956,35 +939,41 @@ fn plan_updates(
             new_text: new_text.clone(),
         };
 
-        // 対応ファイルを探す(見つからなければフォルダ形式の新規キャラとして集約)
-        let Some(file) = find_character_file(char_files, name).cloned() else {
-            merge_into_new(&mut plan, &mut new_chars, None, name, &attr, &new_text, rec);
-            continue;
-        };
-        let Some(content) = snapshots.get(&file) else {
-            plan.push(ResolvedOp::Skip {
-                record: rec,
-                note: "failed to read character file",
-                old: None,
-            });
-            continue;
-        };
-        let chars = parsed
-            .entry(file.clone())
-            .or_insert_with(|| parse_all_content(content));
+        // 更新先を解決する。ファイル名からの推測(stem 前方一致)はしない。候補ファイルを
+        // 横断して「実際にそのキャラの見出し/alias を持つファイル」を探し、そこへ書く。
         // 見出しの部分一致に加え、登録済み aliases との完全一致でも同一人物と判定する
         // (LLM が別呼称で返してきた場合の重複登録を防ぐ)。
-        let found = chars
-            .iter()
-            .find(|(k, entry)| k.contains(name) || entry.aliases.iter().any(|a| a == name))
-            .map(|(k, entry)| (k.clone(), entry.clone()));
+        let mut resolved: Option<(PathBuf, String, crate::character::CharacterEntry)> = None;
+        for candidate in char_files {
+            let Some(content) = snapshots.get(candidate) else {
+                continue;
+            };
+            let chars = parsed
+                .entry(candidate.clone())
+                .or_insert_with(|| parse_all_content(content));
+            if let Some((k, entry)) = chars
+                .iter()
+                .find(|(k, entry)| k.contains(name) || entry.aliases.iter().any(|a| a == name))
+            {
+                resolved = Some((candidate.clone(), k.clone(), entry.clone()));
+                break;
+            }
+        }
 
-        let Some((heading, entry)) = found else {
-            // 単一ファイル形式の新規キャラ
+        let Some((file, heading, entry)) = resolved else {
+            // 新規キャラ → 常に characters.md へ集約する。
+            let Some(aggregate) = find_aggregate_file(char_files) else {
+                plan.push(ResolvedOp::Skip {
+                    record: rec,
+                    note: "characters.md not found",
+                    old: None,
+                });
+                continue;
+            };
             merge_into_new(
                 &mut plan,
                 &mut new_chars,
-                Some(file.clone()),
+                aggregate.clone(),
                 name,
                 &attr,
                 &new_text,
@@ -1285,11 +1274,11 @@ struct OpOutcome {
     old: Option<String>,
     wrote: bool,
     note: Option<&'static str>,
-    /// 新規キャラクター作成(AppendCharacter/CreateFile)の場合に true。ログ文言の出し分けに使う。
+    /// 新規キャラクターブロックの追記(`AppendCharacter`)の場合に true。ログ文言の出し分けに使う。
     is_new_character: bool,
 }
 
-/// `Skip`/`CreateFile` 以外の `ResolvedOp` が対象とする既存ファイルパスを返す。
+/// `Skip` 以外の `ResolvedOp` が対象とするファイルパスを返す。
 #[instrument]
 fn existing_op_file(op: &ResolvedOp) -> Option<&Path> {
     match op {
@@ -1297,7 +1286,7 @@ fn existing_op_file(op: &ResolvedOp) -> Option<&Path> {
         | ResolvedOp::ReplaceAlias { file, .. }
         | ResolvedOp::AppendSection { file, .. }
         | ResolvedOp::AppendCharacter { file, .. } => Some(file.as_path()),
-        ResolvedOp::Skip { .. } | ResolvedOp::CreateFile { .. } => None,
+        ResolvedOp::Skip { .. } => None,
     }
 }
 
@@ -1449,30 +1438,15 @@ fn apply_one_op(
                 is_new_character: true,
             }
         }
-        ResolvedOp::CreateFile {
-            name,
-            sections,
-            records,
-        } => {
-            doc.append_new_character(&name, &sections);
-            OpOutcome {
-                records,
-                old: None,
-                wrote: true,
-                note: None,
-                is_new_character: true,
-            }
-        }
     }
 }
 
 /// 1ファイル宛ての `ResolvedOp` 群を、1回の read/parse/write にまとめて適用する。
-/// `is_create` はグループ内の全 op が `CreateFile`(＝対象ファイルがまだ存在しない)であることを示す。
+/// 宛先は常に既存ファイル(`characters.md` または既にそのキャラを定義しているファイル)。
 #[instrument(skip(recorder))]
 async fn apply_ops_to_file(
     file: PathBuf,
     ops: Vec<ResolvedOp>,
-    is_create: bool,
     merged_map: Option<&HashMap<(String, String), String>>,
     update_id: i64,
     workspace: &Path,
@@ -1480,36 +1454,31 @@ async fn apply_ops_to_file(
     recorder: &FlightRecorder,
 ) {
     // character_store のメモリ内容を読む(ディスクは読まない。メモリがSSoTのため)。
-    let content = if is_create {
-        String::new()
-    } else {
-        match character_store.content_of(workspace, &file) {
-            Some(c) => c,
-            None => {
-                warn!(
-                    "character_updater: {:?} が character_store に見つからない",
-                    file
+    let content = match character_store.content_of(workspace, &file) {
+        Some(c) => c,
+        None => {
+            warn!(
+                "character_updater: {:?} が character_store に見つからない",
+                file
+            );
+            for op in ops {
+                let records = match op {
+                    ResolvedOp::Merge { records, .. }
+                    | ResolvedOp::ReplaceAlias { records, .. }
+                    | ResolvedOp::AppendSection { records, .. }
+                    | ResolvedOp::AppendCharacter { records, .. } => records,
+                    ResolvedOp::Skip { .. } => unreachable!("Skip はグルーピング前に処理済み"),
+                };
+                record_all(
+                    recorder,
+                    update_id,
+                    &records,
+                    None,
+                    false,
+                    Some("character file not loaded in store"),
                 );
-                for op in ops {
-                    let records = match op {
-                        ResolvedOp::Merge { records, .. }
-                        | ResolvedOp::ReplaceAlias { records, .. }
-                        | ResolvedOp::AppendSection { records, .. }
-                        | ResolvedOp::AppendCharacter { records, .. }
-                        | ResolvedOp::CreateFile { records, .. } => records,
-                        ResolvedOp::Skip { .. } => unreachable!("Skip はグルーピング前に処理済み"),
-                    };
-                    record_all(
-                        recorder,
-                        update_id,
-                        &records,
-                        None,
-                        false,
-                        Some("character file not loaded in store"),
-                    );
-                }
-                return;
             }
+            return;
         }
     };
 
@@ -1626,13 +1595,9 @@ async fn apply_plan(
     character_store: &CharacterStore,
     recorder: &FlightRecorder,
 ) {
-    let chars_dir = workspace.join("characters");
-
-    // ファイルパス(既存ファイル、または CreateFile 用に新規算出したパス)ごとに op をまとめる。
-    // 出現順を保つため、初出順のキー列を別途持つ。
+    // 宛先ファイルごとに op をまとめる。出現順を保つため、初出順のキー列を別途持つ。
     let mut order: Vec<PathBuf> = Vec::new();
     let mut groups: HashMap<PathBuf, Vec<ResolvedOp>> = HashMap::new();
-    let mut create_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for op in plan {
         let path = match &op {
@@ -1652,29 +1617,8 @@ async fn apply_plan(
                 );
                 continue;
             }
-            ResolvedOp::CreateFile { name, records, .. } => {
-                let stem = sanitize_file_stem(name);
-                if stem.trim_matches('_').is_empty() {
-                    error!(
-                        "character_updater: cannot convert character name {:?} to a file name",
-                        name
-                    );
-                    record_all(
-                        recorder,
-                        update_id,
-                        records,
-                        None,
-                        false,
-                        Some("failed to create character file"),
-                    );
-                    continue;
-                }
-                let path = chars_dir.join(format!("{}.md", stem));
-                create_paths.insert(path.clone());
-                path
-            }
             _ => existing_op_file(&op)
-                .expect("Skip/CreateFile 以外は必ず file を持つ")
+                .expect("Skip 以外は必ず file を持つ")
                 .to_path_buf(),
         };
 
@@ -1688,11 +1632,9 @@ async fn apply_plan(
         let Some(ops) = groups.remove(&path) else {
             continue;
         };
-        let is_create = create_paths.contains(&path);
         apply_ops_to_file(
             path,
             ops,
-            is_create,
             merged_map,
             update_id,
             workspace,
@@ -1720,15 +1662,17 @@ async fn apply_updates(
 
     // (A) 計画: character_store 上の現在のメモリ内容(＝正本)から宛先を確定する。
     // ディスクを読み直さない(メモリがSSoTのため、ディスクは書き込み専用のdump先)。
-    let char_files = character_store.files_in(workspace);
-    let snapshots: HashMap<PathBuf, String> = char_files
-        .iter()
-        .filter_map(|f| {
-            character_store
-                .content_of(workspace, f)
-                .map(|c| (f.clone(), c))
-        })
-        .collect();
+    // 追跡ファイル(characters.md/characters/*.md)だけでなく、そこから [[wikilink]] で
+    // 到達可能なファイルも候補に含める。これにより wikilink 経由でしか定義されていない
+    // キャラ(例: characters.md → hoge/ijn.md → hoge/高柳.md の「高柳」)への更新が、
+    // 実際に定義されているファイルへ書き込まれるようになる(`find_character_file` は
+    // ファイル名 stem の前方一致で解決するため)。
+    let snapshots: HashMap<PathBuf, String> =
+        character_store.files_reachable_via_wikilink(workspace);
+    // 同じキャラが複数ファイルに現れた場合にどれが宛先になるかを安定させるため、
+    // パスの昇順に固定する(`HashMap` の走査順は不定なため)。
+    let mut char_files: Vec<PathBuf> = snapshots.keys().cloned().collect();
+    char_files.sort();
     let (plan, groups) = plan_updates(updates, &char_files, &snapshots);
 
     // (B) バッチマージ(対象が無ければ LLM を呼ばない)
@@ -1754,36 +1698,21 @@ async fn apply_updates(
         recorder,
     )
     .await;
+
+    // wikilink 先ファイルへの書き込みが、それを参照する追跡ファイルの included_characters/
+    // included_character_files キャッシュへ波及するよう再計算する。
+    character_store.refresh_included(workspace);
 }
 
-/// ファイル一覧からキャラ名に対応するファイルを探す。
-/// - 単一ファイル形式(`characters.md`): 全キャラを束ねる集約ファイルなので、名前に関係なくヒットさせる。
-/// - フォルダ形式(`characters/<名>.md`): ファイル名(stem)の前方一致で個別ファイルを探す。
+/// 候補ファイル一覧から集約ファイル(`characters.md`)を探す。新規キャラの書き込み先は
+/// キャラ名に依らず常にここになる(ファイル名からキャラを推測しないため。
+/// `docs/character-updater.md` 参照)。`CharacterStore::load_workspace` が存在を保証するので
+/// 通常は必ず見つかる。
 #[instrument]
-fn find_character_file<'a>(files: &'a [PathBuf], name: &str) -> Option<&'a PathBuf> {
-    files.iter().find(|p| {
-        p.file_stem()
-            .map(|s| {
-                let stem = s.to_string_lossy();
-                stem == "characters" || stem.starts_with(name)
-            })
-            .unwrap_or(false)
-    })
-}
-
-/// ファイル stem として使えない文字(`/ \ : * ? " < > |` および制御文字)を `_` に置換する。
-/// キャラクター見出し(`# name`)には原名を使うため、このサニタイズはパス生成のみに適用する。
-#[instrument]
-fn sanitize_file_stem(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect()
+fn find_aggregate_file(files: &[PathBuf]) -> Option<&PathBuf> {
+    files
+        .iter()
+        .find(|p| p.file_name().and_then(|s| s.to_str()) == Some("characters.md"))
 }
 
 #[cfg(test)]
@@ -2325,33 +2254,82 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_updates_aggregates_new_character_into_single_create() {
-        // 対応ファイルが無い名前 → CreateFile 1つに全属性を集約(順序依存の排除)
+    fn test_plan_updates_aggregates_new_character_into_single_append() {
+        // どのファイルにも見出しが無い名前 → characters.md への AppendCharacter 1つに
+        // 全属性を集約(順序依存の排除)
+        let file = PathBuf::from("/ws/characters.md");
+        let snapshots = HashMap::from([(file.clone(), String::new())]);
         let updates = plan_input(&[
             ("新キャラ", "性格", "- 明るい。"),
             ("新キャラ", "背景", "- 謎の過去。"),
         ]);
-        let (plan, groups) = plan_updates(&updates, &[], &HashMap::new());
+        let (plan, groups) = plan_updates(&updates, std::slice::from_ref(&file), &snapshots);
         assert!(
             groups.is_empty(),
             "新規キャラは LLM マージ対象にならないこと"
         );
-        let creates: Vec<_> = plan
+        let appends: Vec<_> = plan
             .iter()
-            .filter(|op| matches!(op, ResolvedOp::CreateFile { .. }))
+            .filter(|op| matches!(op, ResolvedOp::AppendCharacter { .. }))
             .collect();
         assert_eq!(
-            creates.len(),
+            appends.len(),
             1,
-            "同一新規キャラは1つの CreateFile に集約されること"
+            "同一新規キャラは1つの AppendCharacter に集約されること"
         );
-        if let ResolvedOp::CreateFile {
-            sections, records, ..
-        } = creates[0]
+        if let ResolvedOp::AppendCharacter {
+            file: dest,
+            sections,
+            records,
+            ..
+        } = appends[0]
         {
+            assert_eq!(*dest, file, "新規キャラは characters.md へ書かれること");
             assert_eq!(sections.len(), 2);
             assert_eq!(records.len(), 2);
         }
+    }
+
+    #[test]
+    fn test_plan_updates_new_character_never_targets_unrelated_note() {
+        // 候補に memo/原稿メモ.md があっても、新規キャラ「原」の宛先は characters.md。
+        // (旧実装はファイル名 stem の前方一致で memo/原稿メモ.md を選びえた)
+        let characters = PathBuf::from("/ws/characters.md");
+        let memo = PathBuf::from("/ws/memo/原稿メモ.md");
+        let snapshots = HashMap::from([
+            (characters.clone(), String::new()),
+            (memo.clone(), "# 取材メモ\n\n本文。\n".to_string()),
+        ]);
+        let mut files = vec![characters.clone(), memo];
+        files.sort();
+        let updates = plan_input(&[("原", "役割", "- 少将。")]);
+        let (plan, _) = plan_updates(&updates, &files, &snapshots);
+        let dest = plan.iter().find_map(|op| match op {
+            ResolvedOp::AppendCharacter { file, .. } => Some(file.clone()),
+            _ => None,
+        });
+        assert_eq!(dest, Some(characters));
+    }
+
+    #[test]
+    fn test_plan_updates_existing_character_targets_its_defining_file() {
+        // 既存キャラは、ファイル名と一致しなくても実際に定義されているファイルへ書く
+        // (hoge/ijn.md の「原顕三郎」。旧実装は characters.md へ重複ブロックを作っていた)
+        let characters = PathBuf::from("/ws/characters.md");
+        let ijn = PathBuf::from("/ws/hoge/ijn.md");
+        let snapshots = HashMap::from([
+            (characters.clone(), "# 近藤\n\n## 役割\n外務省職員。\n".to_string()),
+            (ijn.clone(), "# 原顕三郎\n\n## 呼称\n- 原\n".to_string()),
+        ]);
+        let mut files = vec![characters, ijn.clone()];
+        files.sort();
+        let updates = plan_input(&[("原顕三郎", "役割", "- 遣泰艦隊司令。")]);
+        let (plan, _) = plan_updates(&updates, &files, &snapshots);
+        let dest = plan.iter().find_map(|op| match op {
+            ResolvedOp::AppendSection { file, .. } => Some(file.clone()),
+            _ => None,
+        });
+        assert_eq!(dest, Some(ijn), "定義元の hoge/ijn.md へ追記されること");
     }
 
     // FlightRecorder::new(パス指定) は debug ビルドにしか無いため(release は no-op スタブ)、
@@ -2391,6 +2369,94 @@ mod tests {
             PLAN_MD,
             "マージ結果欠落時はファイルが書き換えられないこと"
         );
+        drop(recorder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // FlightRecorder::new(パス指定) は debug ビルドにしか無いため cfg で囲う(上のテストと同じ理由)。
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn test_apply_updates_writes_wikilink_only_character_to_its_defining_file() {
+        // characters.md → hoge/ijn.md → hoge/高柳.md という2段の wikilink 構成で、
+        // 「高柳」への更新が hoge/高柳.md 自体へ書き込まれ、characters.md には
+        // 重複したブロックが作られないことを確認する回帰テスト
+        // (find_character_file が常に characters.md へフォールバックしてしまう旧バグの再現)。
+        let dir = std::env::temp_dir().join("ff_apply_updates_wikilink_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("hoge")).unwrap();
+
+        let characters_md = "[[hoge/ijn.md]]\n\n# 近藤\n\n## 役割\n外務省職員。\n";
+        let ijn_md = "[[高柳.md]]\n\n# 原顕三郎\n\n## 呼称\n- 原\n";
+        let takayanagi_md = "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n";
+        std::fs::write(dir.join("characters.md"), characters_md).unwrap();
+        std::fs::write(dir.join("hoge/ijn.md"), ijn_md).unwrap();
+        std::fs::write(dir.join("hoge/高柳.md"), takayanagi_md).unwrap();
+
+        let store = CharacterStore::new();
+        store.reconcile(&dir, &dir.join("characters.md"), characters_md.to_string());
+
+        let recorder = FlightRecorder::new(&dir.join("flight.db"));
+        let update_id = recorder.record_character_update("test://uri", "test-model", "prompt");
+        let updates = plan_input(&[("高柳", "role", "戦艦「飛騨」の艦長。")]);
+        let mut llm_client = FakeLlmClient::with_responses(&[]);
+
+        apply_updates(&updates, update_id, &store, &dir, &recorder, &mut llm_client).await;
+
+        let takayanagi_after = std::fs::read_to_string(dir.join("hoge/高柳.md")).unwrap();
+        assert!(
+            takayanagi_after.contains("戦艦「飛騨」の艦長"),
+            "hoge/高柳.md へ更新が書き込まれること: {:?}",
+            takayanagi_after
+        );
+        let characters_after = std::fs::read_to_string(dir.join("characters.md")).unwrap();
+        assert_eq!(
+            characters_after, characters_md,
+            "characters.md には重複ブロックが作られないこと: {:?}",
+            characters_after
+        );
+
+        drop(recorder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn test_apply_updates_writes_to_defining_file_when_filename_differs_from_name() {
+        // ファイル名(ijn)とキャラ名(原顕三郎)が一致しないケース。ファイル名からの推測を
+        // やめたので、実際に見出しを持つ hoge/ijn.md が宛先になる
+        // (旧実装は characters.md へ重複ブロックを作っていた)。
+        let dir = std::env::temp_dir().join("ff_apply_updates_name_mismatch_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("hoge")).unwrap();
+
+        let characters_md = "[[hoge/ijn.md]]\n\n# 近藤\n\n## 役割\n外務省職員。\n";
+        let ijn_md = "# 原顕三郎\n\n## 呼称\n- 原\n";
+        std::fs::write(dir.join("characters.md"), characters_md).unwrap();
+        std::fs::write(dir.join("hoge/ijn.md"), ijn_md).unwrap();
+
+        let store = CharacterStore::new();
+        store.reconcile(&dir, &dir.join("characters.md"), characters_md.to_string());
+
+        let recorder = FlightRecorder::new(&dir.join("flight.db"));
+        let update_id = recorder.record_character_update("test://uri", "test-model", "prompt");
+        let updates = plan_input(&[("原顕三郎", "role", "遣泰艦隊司令。")]);
+        let mut llm_client = FakeLlmClient::with_responses(&[]);
+
+        apply_updates(&updates, update_id, &store, &dir, &recorder, &mut llm_client).await;
+
+        let ijn_after = std::fs::read_to_string(dir.join("hoge/ijn.md")).unwrap();
+        assert!(
+            ijn_after.contains("遣泰艦隊司令"),
+            "定義元 hoge/ijn.md へ書き込まれること: {:?}",
+            ijn_after
+        );
+        let characters_after = std::fs::read_to_string(dir.join("characters.md")).unwrap();
+        assert_eq!(
+            characters_after, characters_md,
+            "characters.md には重複が作られないこと: {:?}",
+            characters_after
+        );
+
         drop(recorder);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2487,52 +2553,18 @@ mod tests {
     }
 
     #[test]
-    fn test_find_character_file_single() {
-        // 単一ファイル形式: characters.md はどのキャラ名でもヒットする(集約ファイル)
-        let files = vec![PathBuf::from("/ws/characters.md")];
-        assert_eq!(
-            find_character_file(&files, "ジェフ"),
-            Some(&files[0]),
-            "単一 characters.md は名前に関係なくヒットすること"
-        );
-        assert_eq!(find_character_file(&files, "シルビア"), Some(&files[0]));
-    }
-
-    #[test]
-    fn test_find_character_file_folder() {
-        // フォルダ形式: characters/<名>.md はファイル名の前方一致で個別に探す
+    fn test_find_aggregate_file_picks_characters_md() {
         let files = vec![
-            PathBuf::from("/ws/characters/ジェフ.md"),
-            PathBuf::from("/ws/characters/シルビア.md"),
+            PathBuf::from("/ws/hoge/高柳.md"),
+            PathBuf::from("/ws/characters.md"),
         ];
-        assert_eq!(find_character_file(&files, "ジェフ"), Some(&files[0]));
-        assert_eq!(find_character_file(&files, "シルビア"), Some(&files[1]));
-        assert_eq!(find_character_file(&files, "存在しない"), None);
+        assert_eq!(find_aggregate_file(&files), Some(&files[1]));
     }
 
     #[test]
-    fn test_sanitize_file_stem_normal() {
-        // 通常の日本語名はそのまま
-        assert_eq!(sanitize_file_stem("ジェフ"), "ジェフ");
-        assert_eq!(sanitize_file_stem("シルビア・アロン"), "シルビア・アロン");
-    }
-
-    #[test]
-    fn test_sanitize_file_stem_invalid_chars() {
-        // Windows/POSIX で使えない文字は '_' に置換される
-        assert_eq!(sanitize_file_stem("alice/bob"), "alice_bob");
-        assert_eq!(sanitize_file_stem("a:b"), "a_b");
-        assert_eq!(sanitize_file_stem("a*b?c"), "a_b_c");
-        assert_eq!(sanitize_file_stem("a<b>c|d"), "a_b_c_d");
-        assert_eq!(sanitize_file_stem("a\"b"), "a_b");
-        assert_eq!(sanitize_file_stem("a\\b"), "a_b");
-    }
-
-    #[test]
-    fn test_sanitize_file_stem_control_chars() {
-        // 制御文字も '_' に置換される
-        let name_with_null = "a\x00b";
-        assert_eq!(sanitize_file_stem(name_with_null), "a_b");
+    fn test_find_aggregate_file_none_when_absent() {
+        let files = vec![PathBuf::from("/ws/hoge/高柳.md")];
+        assert_eq!(find_aggregate_file(&files), None);
     }
 
     // ---- 応答正規化のテスト ----

@@ -97,6 +97,8 @@ LLM の生応答は `extract_candidate_lines`(`cursor_context.rs`)で候補行�
 
 `completion`(および `code_action`)は、カーソル位置が章のどのあたりかを `{{PROGRESS}}` としても埋め込む。分子は「バッファ先頭からカーソル位置までの文字数」(`Backend::chars_before_cursor`)、分母は `plot.md` の front matter にある `average_chars`(1話あたりの予定文字数)。`plot.md` が無い・`average_chars` 未設定の場合は空文字列になる(`{{PROGRESS}}` プレースホルダ自体がプロンプトに残ることはない。`frontmatter::expand` は未知のプレースホルダのみ `{{NAME}}` の形で残す仕様なので、空文字列を明示的に渡す必要がある)。LLM はこの進捗を手がかりに、`PlotInfoTool` で取得したプロット全体のうち今の進行度に対応する箇所を選んで参照する。
 
+`CharacterInfoTool` の実体である `CharacterStore::search` は `included_characters`(`[[wikilink]]` 先を `#include` のように推移的に展開してからパースした結果)を検索するため、`characters.md` 自身に見出しの無い、wikilink 経由でしか定義されていないキャラも見つかる(要約はしない。常に全文を渡す。`PlotInfoTool` には実装していない。詳細は `docs/lsp-handlers.md` の「wikilink」参照)。
+
 ## debug 記録
 
 debug ビルドでは `FlightRecorder` が補完リクエストと候補を SQLite に記録する。

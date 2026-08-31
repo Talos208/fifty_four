@@ -93,6 +93,9 @@ impl LlmTool for CharacterInfoTool {
         // character_store はワークスペース全ファイルをメモリに保持しているため、
         // 1ファイルへの決め打ちをせず全件横断で検索する
         // (呼称が複数ありうる問題は store 側の全件検索で解消済み)。
+        // `search` は `included_characters`(wikilink先を#include展開済み)を見るため、
+        // characters.md自身に見出しの無いキャラも見つかる(`docs/lsp-handlers.md` の
+        // 「wikilink」参照)。ここで改めて展開する必要はない。
         let result = self.store.search(&self.workspace, name, &tags);
         debug!("\t{:?}", result.as_ref().map(|r| shorten_middle(r, 40)));
         result

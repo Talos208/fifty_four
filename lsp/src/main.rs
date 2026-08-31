@@ -32,6 +32,7 @@ mod session_log;
 mod text;
 mod tools;
 mod types;
+mod wikilink;
 #[cfg(debug_assertions)]
 mod writing_agent;
 

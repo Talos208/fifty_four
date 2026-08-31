@@ -36,7 +36,7 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TD
-    A["full_text で編集ファイル全文を取得"] --> B["collect_character_files"]
+    A["full_text で編集ファイル全文を取得"] --> B["load_workspace(初回のみ)"]
     B --> C["load_prompt(prompt_character_update.md)"]
     C --> D["background_llm で JSON 応答取得"]
     D --> E["apply_updates — 既存セクション更新 / 新規属性追記 / 新規キャラ作成"]
@@ -44,10 +44,50 @@ flowchart TD
 ```
 
 1. 編集中ファイルの全文を取得(発火判定の差分カウントとは独立)
-2. ワークスペース内のキャラ MD ファイルを収集。1件も無ければ `characters.md` を新規作成して処理を続ける
-3. `prompt_character_update.md` を LLM に送信（全文テキスト）
-4. JSON 応答をパース → 各キャラの `CharacterAttribute` セクションを更新・追記、または新規キャラのファイル/ブロックを作成
+2. `character_store` が当該ワークスペース未ロードなら `load_workspace` で読み込む。1件も無ければ
+   `characters.md` を新規作成して処理を続ける
+3. `prompt_character_update.md` を LLM に送信(全文テキスト)
+4. JSON 応答をパース → `apply_updates` が更新先ファイルを解決して適用(下記「wikilink 対応」参照)
 5. debug ビルド時は `character_updates` / `character_update_sections` テーブルに記録
+
+## 更新先ファイルの解決
+
+候補ファイルは `characters.md`(追跡ファイル)だけでなく、そこから `[[wikilink]]` で推移的に
+到達可能な全ファイルまで広げてある(`CharacterStore::files_reachable_via_wikilink`)。
+その中から宛先を選ぶ規則は2段階:
+
+| ケース | 宛先 |
+|---|---|
+| 既存キャラ | **候補ファイルを横断検索**し、実際にその見出し(部分一致)または alias(完全一致)を持つファイル |
+| 新規キャラ | 常に `characters.md`(`find_aggregate_file`) |
+
+**ファイル名からキャラ名を推測しない**のが要点。以前は `find_character_file` がファイル名 stem の
+前方一致で宛先を選んでいたが、候補が任意の `.md` へ広がった今この推測は成立しない:
+
+- ファイル名とキャラ名が一致しないケース(`hoge/ijn.md` の「原顕三郎」)を取りこぼし、
+  `characters.md` へ重複ブロックを作ってしまう
+- 無関係なメモ(`memo/原稿メモ.md`)がキャラ「原」の宛先に選ばれうる
+
+横断検索は `characters/<名>.md` 相当の配置も当然カバーするため、stem マッチは完全に不要になった。
+候補の走査順は `HashMap` 由来で不定なので、`apply_updates` でパスの昇順にソートし、同じキャラが
+複数ファイルに現れた場合の宛先を安定させている。
+
+### 追跡対象への昇格と同期
+
+`files_reachable_via_wikilink` は、新たに見つけたファイルをその場で `reconcile` し追跡ファイルへ
+昇格させる。そうしないと `apply_ops_to_file` の `content_of` 呼び出しが失敗し、書き込みが黙って
+スキップされる(`CharacterStore` の読み書き系メソッドはすべてメモリ上の追跡ファイルだけを見る)。
+
+昇格したファイルが以後もディスクと同期され続ける仕組み(watcher の範囲・`is_tracked` による
+絞り込み)は `docs/lsp-handlers.md` の「追跡対象の昇格と同期」を参照。
+
+### 書き込み後の後始末
+
+- `apply_updates` は `apply_plan` の後に `character_store.refresh_included` を呼び、wikilink 先
+  ファイルの変更を参照元ファイルの `included_characters`/`included_character_files` へ波及させる。
+- `record_change`(`backend.rs`)は `run` 完了後に `refresh_highlight_names_with` を呼び、
+  自動更新で追記・更新されたキャラ名を Lindera ユーザー辞書へ反映する
+  (自己書き込みは `reconcile` のエコー検出で無視されるため、`did_save` 側では発火しない)。
 
 ## CharacterAttribute
 

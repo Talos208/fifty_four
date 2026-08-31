@@ -41,16 +41,17 @@ flowchart LR
 | `shutdown` | シャットダウン（現状は即時 OK） |
 | `did_open` | 行単位テキスト保持、セマンティックトークン refresh |
 | `did_change` | 増分更新、補完選択の記録 (debug)、キャラ更新トリガ、トークン refresh、plot.md なら plot_sync の debounce タイマー起動(下記参照) |
-| `did_save` | キャラクター設定ファイルの調和(reconcile)、`.txt` なら inlay hint 再取得、plot.md なら plot_sync を即時実行(下記参照) |
+| `did_save` | キャラクター設定ファイル(`characters.md` および wikilink 経由で追跡対象になったファイル)の調和(reconcile)、`.txt` なら inlay hint 再取得、plot.md なら plot_sync を即時実行(下記参照) |
 | `did_close` | ドキュメント状態のクリーンアップ(plot_sync 状態も含む) |
 | `did_rename_files` | plot_sync の逆方向(`.txt` リネーム → plot.md 見出し書き換え)。`workspace.fileOperations.didRename`(`**/*.txt`)で宣言(下記参照) |
 | `semantic_tokens_full` | Lindera 形態素解析 → 品詞ベースの色分け。`.md` ファイルでは見出し行(comrak ベース、front matter・コードフェンス内の `#` は除外)を通常のハイライトから除外し、代わりに見出し用の装飾に差し替える(`# ` は `Type`、`## ` 以降は `Class` としてレベル1を強調する。下記参照) |
-| `hover` | カーソル位置のキャラ名(表示名・別名とも)に対し、そのキャラの全セクションを Markdown で表示 |
-| `goto_definition` | カーソル位置のキャラ名(表示名・別名とも)から `characters.md` / `characters/*.md` の該当キャラ見出しへジャンプ。同名キャラが複数ファイルにあれば候補一覧を返す。判定基準は `hover` と共通(ハイライトされない語では発動しない)。**カーソルが既に定義位置(キャラ見出し行)にある場合は `references` にフォールバックする**(rust-analyzer / IntelliJ 等と同じ振る舞い) |
+| `hover` | カーソル位置のキャラ名(表示名・別名とも)に対し、そのキャラの全セクションを Markdown で表示。`[[wikilink]]` 先で定義されたキャラも対象(下記「wikilink」参照) |
+| `goto_definition` | カーソル位置のキャラ名(表示名・別名とも)から `characters.md`(および wikilink 先ファイル)の該当キャラ見出しへジャンプ。同名キャラが複数ファイルにあれば候補一覧を返す。判定基準は `hover` と共通(ハイライトされない語では発動しない)。**カーソルが既に定義位置(キャラ見出し行)にある場合は `references` にフォールバックする**(rust-analyzer / IntelliJ 等と同じ振る舞い) |
 | `goto_implementation` | `plot.md` の `# 章名` 見出し行にカーソルを合わせて Go to Implementation すると、対応する `<章名>.txt`(本文ファイル)へジャンプする。ファイルがまだ無ければ空ファイルとして作成してから返す(Zed はジャンプ先ファイルの存在を前提にするため)。`plot.md` 以外、または見出し行以外では `Ok(None)` |
 | `references` | カーソル位置のキャラ名(表示名・別名とも)の登場箇所を、ワークスペース直下(非再帰)の本文 `.txt` から横断検索して返す(Find All References)。判定基準は `hover`/`goto_definition` と共通。`characters.md` 等の設定・メモ類はスキャンしない |
 | `inlay_hint` | `plot.md` の各 `# 章名` 見出し行末に「現文字数/予定文字数」を表示する。`plot.md` 以外のドキュメントには何も返さない。現文字数は対応する `<章名>.txt` から算出(開いていればバッファ優先、無ければディスク)。front matter に `episodes`/`average_chars` があれば予定文字数も表示し、front matter を閉じる行に作品全体の合計進捗も出す |
 | `document_symbol` | `.md`(characters.md / plot.md / memo/\*.md)の見出し一覧を階層構造(`DocumentSymbol` の木)で返す。アウトラインパネル・パンくず・`editor: toggle outline` のデータ源。`.txt` には見出し概念が無いため何も返さない。front matter は見出しとして混入させない(下記参照) |
+| `document_link` | `.md` 内の `[[ページ名]]` wikilink をクリックジャンプ可能にする(下記「wikilink」参照) |
 | `completion` | カーソル文脈に応じた LLM 補完候補生成。カーソル位置が章の何割地点かを `{{PROGRESS}}` としてプロンプトへ渡す(`docs/completion.md` 参照) |
 | `code_action` | 選択範囲(無ければカーソルの文)を LLM で書き換える。対象に「※」があればそこに当てはまる語、無ければ表現改善の候補を複数提示する。候補はメニューにそのまま複数の `CodeAction`(`title` = 候補文、`kind: REFACTOR_REWRITE`)として返す(下記参照)。先頭には「↻ 候補を作り直す」を挿入する(`execute_command` 参照)。ゲートを通ったリクエストは(1回目でも)即座に LLM を起動する。LLM 呼び出しは detached task に切り出し、リクエストがキャンセルされても走り続け、同一の(選択範囲, 対象テキスト)への後続リクエストはそのジョブに合流・結果を再利用する(`code_action::decide_job`)。結果を配達したジョブはその場でキャッシュから破棄するため、実際に新規リクエストが届けば必ず LLM を呼び直す。`completion` と同じく `{{PROGRESS}}`(対象範囲開始位置基準)をプロンプトへ渡す |
 | `execute_command` | `code_action` が返す「↻ 候補を作り直す」(`fifty_four.codeActionRegenerate`)専用。既存のジョブ・キャッシュを問答無用で破棄し、`code_action` と同じ経路(`Backend::start_code_action_job`)で LLM を呼び直す。得られた最初の候補を `workspace/applyEdit` で直接適用する(LSP には「候補一覧メニューを開き直す」手段が無いため、選ぶと同時に書き換わる) |
@@ -76,7 +77,100 @@ flowchart LR
 | `referencesProvider` | 有効。キャラ名(表示名・別名とも)の登場箇所をワークスペース直下の本文 `.txt` から横断検索 |
 | `inlayHintProvider` | 有効。`plot.md` の章見出しに現文字数/予定文字数を表示(下記参照) |
 | `documentSymbolProvider` | 有効。`.md` の見出し一覧をアウトラインとして提供(下記参照) |
+| `documentLinkProvider` | 有効(`resolveProvider: false`)。`.md` 内の `[[wikilink]]` をクリックジャンプ可能にする(下記参照) |
 | `workspace.fileOperations.didRename` | `**/*.txt`(`FileOperationPatternKind::File`)。plot_sync の逆方向用(下記参照) |
+
+## wikilink(`[[ページ名]]`)
+
+ワークスペース内の `.md`(plot.md / characters.md / memo/\*.md、将来追加される
+ものも含め全 `.md`)同士を、Obsidian ライクな `[[ページ名]]` 記法で繋ぐ。実装は `lsp/src/wikilink.rs`
+(LSP に依存しない純粋関数群)。検出は `crate::character::comrak_options()`(プロジェクト共通の
+comrak パースオプション)の `wikilinks_title_before_pipe` 拡張(AST の `NodeValue::WikiLink`)を使う。
+
+### 記法と解決規則
+
+- `[[ページ名]]`、または pipe 付き `[[表示名|ページ名]]`。**`wikilinks_title_before_pipe(true)`
+  (`WikiLinksMode::TitleFirst`)の設定により、表示名が先・実際のリンク先(ページ名)が後**という
+  順序になる(Obsidian の `[[ページ名|表示名]]` とは pipe の前後が逆なので注意)
+- **解決は現在のファイルのディレクトリ相対のみ**(ワークスペース全体の再帰探索はしない)。
+  拡張子が省略されていれば `.md` を補う
+- **解決できない(実在しない)場合は何もしない**(自動作成しない。`goto_implementation` とは対照的。
+  存在しない裸ページ名が解決できず見た目上何も起きない状態を「document_link が動いていない」と
+  誤認しやすいので注意)
+
+### 位置(UTF-16)の扱い
+
+comrak の `Sourcepos`/`LineColumn` は 1-based の行番号 + **UTF-8 バイトオフセットの列**
+(`comrak::nodes::LineColumn` のドキュメントに明記。UTF-16 でも文字数でもない)。LSP の
+`Position` は 0-based 行番号 + UTF-16 コード単位の列を要求するため、`find_wikilinks` が
+`crate::types::utf16_len` で変換してから返す(`code_action.rs` 等と同じ既存パターン)。
+変換しないまま使うと、日本語がリンクより前にある行で範囲がずれる。
+
+さらに `end.column` は**末尾 `]` の列(inclusive)**である点に注意
+(comrak 側は `make_inline(.., startpos - 1, scanner.pos - 1)` の両引数に `+1` する)。
+排他的な終端バイトオフセットは `end.column - 1` ではなく `end.column` そのもの。
+`-1` すると `]` を1バイト取りこぼし、`document_link` の範囲が1文字短くなる。
+
+### 用途1: クリックジャンプ(`document_link`)
+
+エディタ上で `[[ページ名]]` をクリックすると解決先へジャンプする。ジャンプ先の存在確認のみで、
+内容の展開は行わない。
+
+### 用途2: キャラクターファイルの `#include`(`characters` / `included_characters` の二層構造)
+
+キャラクター設定の**分割手段は wikilink に一本化**してある。`CharacterStore` が直接追跡するのは
+`characters.md` 単一ファイルのみで(`discover_character_files`)、複数ファイルに分けたい場合は
+そこから `[[wikilink]]` を張る。かつて存在した `characters/*.md` フォルダ形式は、同じ役割を持つ
+第二の分割機構になり更新先の解決を複雑にしていたため廃止した。
+
+`CharacterStore`(`character.rs`)は `characters.md` を読み込む際、本文中の `[[wikilink]]` を
+C の `#include` のように**推移的に展開してから** 2種類のインデックスを作る
+(`CharacterFile::from_content`)。
+
+| フィールド | 中身 | 位置情報 | 使う機能 |
+|---|---|---|---|
+| `characters` | そのファイル自身の見出しのみをパース | あり(`heading_line` がファイル内の実在行を指す) | `lookup_definitions`(goto_definition) |
+| `included_characters` | `wikilink::expand_files` が返す到達可能ファイル群を**ファイルごとに個別に**パースしてマージ(無関係なファイル同士の見出し構造が混ざらないよう、連結した1つのテキストとしては解析しない) | 無い(`heading_line` は展開先ファイル中の行なので、`characters` を保持するこのファイル中の実在行を指さない) | `lookup_markdown`(hover)、`lookup_names`(references)、`search`(`CharacterInfoTool`)、`allowed_names`/`all_allowed_names`(Lindera ユーザー辞書) |
+| `included_character_files` | `included_characters` の見出しキー → 実際にその見出しが存在するファイルのパス | — | `CharacterStore::files_reachable_via_wikilink`(`character_updater` の更新先ファイル解決。`docs/character-updater.md` 参照) |
+
+つまり `characters.md` から `[[hoge/ijn.md]]` → `[[高柳.md]]` のように2段リンクした先の
+「高柳」も、hover・references・`CharacterInfoTool`・ハイライト辞書からは
+**あたかも `characters.md` に直接書かれているかのように**見える。一方 goto_definition
+(「見出し行そのものへジャンプ」という操作の性質上、実在する行が必須)だけは対象外で、
+そのファイル自身に見出しが無いキャラには反応しない。
+
+`PlotInfoTool` にはリンク展開を実装していない(`plot.md` は対象外)。循環参照(A→B→A 等)は
+`expand_files`(`expand_content` はこれの薄いラッパ)が訪問済みパスの記録で防ぐ。
+
+同じ wikilink 先が複数の追跡ファイルから到達可能な場合、`included_characters` には同一の見出しが
+重複して現れる。`lookup_markdown`(hover)は `included_character_files` を使って「定義元ファイル」
+単位で重複排除し、同じ内容を繰り返し表示しない。
+
+### 追跡対象の昇格と同期
+
+`character_updater` が wikilink 先ファイルへ書き込めるようにするため、
+`files_reachable_via_wikilink` は到達したファイルをその場で `reconcile` し**追跡対象へ昇格**させる
+(`CharacterStore` の読み書き系メソッドはメモリ上の追跡ファイルしか見ないため)。
+
+昇格したファイルは `characters.md` というパターンに合致しないので、そのままでは `did_save` にも
+watcher にも拾われず、メモリ上の内容が凍結されてしまう(その状態で自動更新が走ると、ユーザーの
+編集を古い内容で上書きしてしまう)。これを防ぐため:
+
+- watcher は `**/*.md` 全体に張り、`did_change_watched_files` 側で
+  「`characters.md` または `CharacterStore::is_tracked`」に絞って取り込む
+  (絞らないと `plot.md` の見出しがキャラクターとして登録されてしまう)
+- `did_save` も同じ条件で判定する
+- 取り込みが成立したら `refresh_included` を呼び、そのファイルを参照している追跡ファイルの
+  `included_characters`/`included_character_files` を再計算する
+
+### 既知の制約
+
+- `memo/*.md` は既定では `FiftyFour` 言語として認識されない(`extension/languages/fiftyfour/config.toml`
+  の `path_suffixes` が `["txt", "plot.md", "characters.md"]` のみのため)。wikilink を使うには
+  Zed 側の `languages.file_types` で対象ディレクトリを明示的に割り当てる必要がある
+- Go to Definition 化・Find All References(バックリンク)化はしていない(document_link のみ)
+- `#include` 展開されるのはキャラクターファイル本文中の wikilink のみ(`plot.md`/`memo/*.md`
+  自体に書かれた wikilink はまだ対象外)
 
 ## plot.md の章見出しと `<章名>.txt` のリネーム同期(plot_sync)
 
@@ -507,7 +601,7 @@ DashMap<uri, (JobKey, RunningJob)>`、判定は `code_action::decide_job`):
 
 ## 見出し行の装飾(semantic_tokens_full)
 
-`.md` ファイル(`plot.md` / `characters.md` / `characters/*.md` / `memo/*.md`)の見出し行では、
+`.md` ファイル(`plot.md` / `characters.md` / `memo/*.md`)の見出し行では、
 本来キャラ名や会話文に付くはずのハイライト(`highlight.rs::tokenize_with_depth`)を止め、
 代わりに見出し全体(`#` 記号込みの行全文)を1つの装飾トークンとして出す。実装は
 `outline::heading_line_levels`(`markdown_symbols` と同じ comrak ベースの見出し検出を共有

@@ -134,6 +134,10 @@ impl SemanticToken {
     }
 }
 
+/// `Clone` は `Arc` の参照カウント増加のみ。トークナイザ実体は clone 間で共有され、
+/// どの clone から `rebuild_user_dictionary` を呼んでも全 clone に反映される
+/// (`character_updater::run` 完了後の辞書再構築を spawn タスク内から行うために必要)。
+#[derive(Clone)]
 pub struct Highlighter {
     /// Lindera トークナイザ。キャラ名のユーザー辞書差し替え(`rebuild_user_dictionary`)が
     /// あるため RwLock で内部可変にしている。

@@ -103,23 +103,58 @@ pub(crate) struct CharacterEntry {
 pub(crate) struct CharacterFile {
     /// 現在のMarkdown全文。書き込み(character_updater)・外部変更取り込みの両方でここが更新される。
     pub(crate) content: String,
-    /// `content` から派生した読み取り用インデックス(ハイライト許可名・hover検索用)。
-    /// `content` を更新するたびに再計算する。
+    /// `content` から派生した読み取り用インデックス(hover検索・goto_definition用)。
+    /// 見出し行(`heading_line`)は `content` 中の実在行を指すため、このファイル自身の
+    /// 見出しのみを対象にする(wikilink先の内容は含めない)。`content` を更新するたびに
+    /// 再計算する。
     pub(crate) characters: HashMap<String, CharacterEntry>,
+    /// `content` 中の `[[wikilink]]` を推移的に `#include` 展開したうえでパースした結果
+    /// (hover/references/`CharacterInfoTool` 用)。`characters` とは違い `heading_line` が
+    /// このファイル自身の実在行を指さないため、goto_definition等の位置参照には使えない
+    /// (用途は名前・本文の検索のみ)。`expand_content` は自ファイルの内容も含めて返すため、
+    /// wikilink が無いファイルでは実質 `characters` と同じ内容になる。
+    pub(crate) included_characters: HashMap<String, CharacterEntry>,
+    /// `included_characters` の見出しキーが実際にどのファイルの内容から得られたか
+    /// (`character_updater` の更新先ファイル解決用)。wikilink 先ファイルのみに存在する
+    /// キャラは `content` のパスとは別のパスを指す。
+    pub(crate) included_character_files: HashMap<String, PathBuf>,
     /// 直前にこのプロセス自身が書き込んだ内容のハッシュ。watcherイベントの内容ハッシュと
     /// 一致すれば自己書き込みのエコーとして無視する(`CharacterStore::reconcile` が使う)。
     pub(crate) last_written_hash: Option<u64>,
 }
 
 impl CharacterFile {
-    fn from_content(content: String) -> Self {
+    fn from_content(content: String, path: &Path) -> Self {
         let characters = parse_all_content(&content);
+        let (included_characters, included_character_files) = parse_included(path, &content);
+
         Self {
             content,
             characters,
+            included_characters,
+            included_character_files,
             last_written_hash: None,
         }
     }
+}
+
+/// wikilink で推移的に到達可能な全ファイルを、ファイルごとに個別にパースしてマージする
+/// (無関係なファイル同士の見出し構造が混ざって `detect_char_level` を誤らせないよう、
+/// 連結した1つの巨大テキストとしては解析しない)。同じ見出しキーが複数ファイルに
+/// 存在する場合は `expand_files` の走査順(開始ファイル→リンク先の深さ優先)で後勝ち。
+fn parse_included(
+    path: &Path,
+    content: &str,
+) -> (HashMap<String, CharacterEntry>, HashMap<String, PathBuf>) {
+    let mut included_characters = HashMap::new();
+    let mut included_character_files = HashMap::new();
+    for (file_path, file_content) in crate::wikilink::expand_files(path, content) {
+        for (heading_key, entry) in parse_all_content(&file_content) {
+            included_character_files.insert(heading_key.clone(), file_path.clone());
+            included_characters.insert(heading_key, entry);
+        }
+    }
+    (included_characters, included_character_files)
 }
 
 fn hash_content(s: &str) -> u64 {
@@ -181,31 +216,17 @@ impl CharacterStore {
         }))
     }
 
-    /// `root`配下のキャラクターファイル一覧を検出する(`characters.md`単一ファイル形式・
-    /// `characters/*.md`フォルダ形式の両対応)。`Backend`/`character_updater`どちらからも
-    /// 使う唯一のファイル探索実装。
+    /// `root`配下のキャラクターファイルを検出する。追跡対象は `characters.md` 単一ファイルのみ
+    /// (`characters/*.md` フォルダ形式は廃止。分割したい場合は `[[wikilink]]` で
+    /// `#include` する。`docs/lsp-handlers.md` の「wikilink」参照)。
     #[cfg_attr(feature = "otel", tracing::instrument())]
     pub(crate) fn discover_character_files(root: &Path) -> Vec<PathBuf> {
-        let mut files = Vec::new();
-
-        let single = root.join("characters").with_extension("md");
+        let single = root.join("characters.md");
         if single.is_file() {
-            files.push(single);
+            vec![single]
+        } else {
+            Vec::new()
         }
-
-        let dir = root.join("characters");
-        if dir.is_dir()
-            && let Ok(entries) = dir.read_dir()
-        {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
-                    files.push(path);
-                }
-            }
-        }
-
-        files
     }
 
     /// `root`配下のキャラクターファイルを列挙・読込・パースしてメモリへロードする。
@@ -234,7 +255,8 @@ impl CharacterStore {
         for path in files {
             match tokio::fs::read_to_string(&path).await {
                 Ok(content) => {
-                    loaded.insert(path, CharacterFile::from_content(content));
+                    let file = CharacterFile::from_content(content, &path);
+                    loaded.insert(path, file);
                 }
                 Err(e) => debug!(
                     "CharacterStore::load_workspace: 読み込み失敗 {:?}: {}",
@@ -258,13 +280,14 @@ impl CharacterStore {
     }
 
     /// 指定ワークスペースの許可名集合を構築する(人名ハイライトの絞り込み用)。
+    /// 各ファイルの `included_characters`(wikilink先を#include展開済み)から名前を集める。
     #[instrument]
     pub(crate) fn allowed_names(&self, workspace_root: &Path) -> std::collections::HashSet<String> {
         let mut names = std::collections::HashSet::new();
         let guard = self.0.workspaces.lock();
         if let Some(files) = guard.get(workspace_root) {
             for file in files.values() {
-                collect_names_from(&file.characters, &mut names);
+                collect_names_from(&file.included_characters, &mut names);
             }
         }
         names
@@ -278,7 +301,7 @@ impl CharacterStore {
         let guard = self.0.workspaces.lock();
         for files in guard.values() {
             for file in files.values() {
-                collect_names_from(&file.characters, &mut names);
+                collect_names_from(&file.included_characters, &mut names);
             }
         }
         names
@@ -287,6 +310,10 @@ impl CharacterStore {
     /// 指定ワークスペース内のみを対象にした、`surface`(表示名/alias)に一致する
     /// キャラクターの Markdown 化した説明文を返す(hover表示用)。
     /// 同名のキャラが複数ファイルに存在する場合は "---" 区切りで連結して返す。
+    ///
+    /// 同じ wikilink 先が複数の追跡ファイルから到達可能だと、`included_characters` に
+    /// 同一の見出しが重複して現れる。`included_character_files`(見出し → 実際の定義ファイル)
+    /// で「定義元」単位に重複排除し、同じ内容を繰り返し表示しないようにする。
     #[instrument]
     pub(crate) fn lookup_markdown(&self, workspace_root: &Path, surface: &str) -> Option<String> {
         if surface.is_empty() {
@@ -294,17 +321,36 @@ impl CharacterStore {
         }
         let guard = self.0.workspaces.lock();
         let files = guard.get(workspace_root)?;
-        let hits: Vec<String> = files
-            .values()
-            .flat_map(|f| f.characters.iter())
-            .filter(|(heading_key, entry)| matches_surface(heading_key, entry, surface))
-            .map(|(heading_key, entry)| character_entry_to_markdown(heading_key, entry))
-            .collect();
-        if hits.is_empty() {
-            None
-        } else {
-            Some(hits.join("\n\n---\n\n"))
+        let mut seen: std::collections::HashSet<(&Path, &str)> = std::collections::HashSet::new();
+        let mut hits: Vec<((&Path, &str), String)> = Vec::new();
+        for file in files.values() {
+            for (heading_key, entry) in &file.included_characters {
+                if !matches_surface(heading_key, entry, surface) {
+                    continue;
+                }
+                let origin = file
+                    .included_character_files
+                    .get(heading_key)
+                    .map(|p| p.as_path())
+                    // 定義元が引けない場合は自ファイル扱い(重複排除の粒度が落ちるだけ)。
+                    .unwrap_or(Path::new(""));
+                let key = (origin, heading_key.as_str());
+                if seen.insert(key) {
+                    hits.push((key, character_entry_to_markdown(heading_key, entry)));
+                }
+            }
         }
+        if hits.is_empty() {
+            return None;
+        }
+        // `HashMap` の走査順は不定なので、表示順を (定義元, 見出し) で安定させる。
+        hits.sort_by(|(a, _), (b, _)| a.cmp(b));
+        Some(
+            hits.into_iter()
+                .map(|(_, md)| md)
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n"),
+        )
     }
 
     /// `surface`(表示名/alias)に一致するキャラクターの、表示名と全別名の集合を返す
@@ -326,7 +372,7 @@ impl CharacterStore {
             return names;
         };
         for file in files.values() {
-            for (heading_key, entry) in &file.characters {
+            for (heading_key, entry) in &file.included_characters {
                 if !matches_surface(heading_key, entry, surface) {
                     continue;
                 }
@@ -399,7 +445,8 @@ impl CharacterStore {
             });
         };
         for file in files.values() {
-            let Some((_, entry)) = file.characters.iter().find(|(k, _)| k.contains(name)) else {
+            let Some((_, entry)) = file.included_characters.iter().find(|(k, _)| k.contains(name))
+            else {
                 continue;
             };
             let matched: Vec<&str> = entry
@@ -429,13 +476,16 @@ impl CharacterStore {
         new_content: String,
     ) -> std::io::Result<()> {
         let hash = hash_content(&new_content);
-        {
-            let mut guard = self.0.workspaces.lock();
-            let files = guard.entry(workspace_root.to_path_buf()).or_default();
-            let mut file = CharacterFile::from_content(new_content.clone());
-            file.last_written_hash = Some(hash);
-            files.insert(path.to_path_buf(), file);
-        }
+        // from_content は wikilink 展開で再帰的にディスクを読むため、ロック取得の前に構築する
+        // (臨界区間でブロッキング I/O をしない)。
+        let mut file = CharacterFile::from_content(new_content.clone(), path);
+        file.last_written_hash = Some(hash);
+        self.0
+            .workspaces
+            .lock()
+            .entry(workspace_root.to_path_buf())
+            .or_default()
+            .insert(path.to_path_buf(), file);
         tokio::fs::write(path, new_content).await
     }
 
@@ -451,17 +501,23 @@ impl CharacterStore {
         disk_content: String,
     ) -> bool {
         let hash = hash_content(&disk_content);
-        let mut guard = self.0.workspaces.lock();
-        let files = guard.entry(workspace_root.to_path_buf()).or_default();
-        if let Some(existing) = files.get(path)
-            && existing.last_written_hash == Some(hash)
+        // エコー判定だけを先に済ませてロックを解放する(from_content は wikilink 展開で
+        // 再帰的にディスクを読むため、臨界区間でブロッキング I/O をしない)。
         {
-            return false;
+            let guard = self.0.workspaces.lock();
+            if let Some(existing) = guard.get(workspace_root).and_then(|f| f.get(path))
+                && existing.last_written_hash == Some(hash)
+            {
+                return false;
+            }
         }
-        files.insert(
-            path.to_path_buf(),
-            CharacterFile::from_content(disk_content),
-        );
+        let file = CharacterFile::from_content(disk_content, path);
+        self.0
+            .workspaces
+            .lock()
+            .entry(workspace_root.to_path_buf())
+            .or_default()
+            .insert(path.to_path_buf(), file);
         true
     }
 
@@ -484,6 +540,18 @@ impl CharacterStore {
             .unwrap_or_default()
     }
 
+    /// 指定パスが追跡対象(メモリ上に正本を持つ)かどうか。`characters.md` のほか、
+    /// wikilink 経由で到達し昇格したファイルも `true` になる。
+    /// 呼び出し側はこれを見て、監視イベントを取り込むべきファイルかを判定する。
+    #[instrument(skip(self), ret)]
+    pub(crate) fn is_tracked(&self, workspace_root: &Path, path: &Path) -> bool {
+        self.0
+            .workspaces
+            .lock()
+            .get(workspace_root)
+            .is_some_and(|files| files.contains_key(path))
+    }
+
     /// 指定ワークスペースの、指定パスの現在のMarkdown全文を返す。
     #[instrument(skip(self), ret)]
     pub(crate) fn content_of(&self, workspace_root: &Path, path: &Path) -> Option<String> {
@@ -493,6 +561,82 @@ impl CharacterStore {
             .get(workspace_root)?
             .get(path)
             .map(|f| f.content.clone())
+    }
+
+    /// 追跡ファイル(`files_in`)に加え、それらから `[[wikilink]]` で推移的に到達可能な
+    /// 全ファイルの (パス, 内容) を返す(`character_updater` の更新先候補列挙用)。
+    /// 到達可能なパスの集合は追跡ファイルの `included_character_files` から得られるが、
+    /// 内容そのものは(追跡ファイル自身を除き)メモリに保持していないためディスクから読む。
+    ///
+    /// 新たに見つかったファイルはその場で `reconcile` し、以後は他ファイルと同様に
+    /// `content_of`/`write` から見える「追跡ファイル」へ昇格させる(そうしないと、
+    /// このメソッドが返した候補ファイルへ `character_updater` が書き込もうとしても
+    /// `apply_ops_to_file` の `content_of` 呼び出しが失敗し、書き込みが黙ってスキップされる)。
+    #[instrument(skip(self), ret)]
+    pub(crate) fn files_reachable_via_wikilink(
+        &self,
+        workspace_root: &Path,
+    ) -> HashMap<PathBuf, String> {
+        let mut out = HashMap::new();
+        let extra_paths: std::collections::HashSet<PathBuf> = {
+            let guard = self.0.workspaces.lock();
+            let Some(files) = guard.get(workspace_root) else {
+                return out;
+            };
+            for (path, file) in files.iter() {
+                out.insert(path.clone(), file.content.clone());
+            }
+            files
+                .values()
+                .flat_map(|f| f.included_character_files.values().cloned())
+                .filter(|p| !out.contains_key(p))
+                .collect()
+        };
+        for path in extra_paths {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                self.reconcile(workspace_root, &path, content.clone());
+                out.insert(path, content);
+            }
+        }
+        out
+    }
+
+    /// 追跡ファイルの `content`(変更なし)を起点に `included_characters`/
+    /// `included_character_files` だけを再計算する。wikilink 先ファイルの内容が
+    /// (`character_updater` の書き込み等で)変わった際、その変更を波及させるために呼ぶ。
+    #[instrument(skip(self), ret)]
+    pub(crate) fn refresh_included(&self, workspace_root: &Path) {
+        // (path, content) だけを取り出してロックを解放し、展開・パースはロック外で行う
+        // (parse_included は wikilink 展開で再帰的にディスクを読むため)。
+        let sources: Vec<(PathBuf, String)> = {
+            let guard = self.0.workspaces.lock();
+            let Some(files) = guard.get(workspace_root) else {
+                return;
+            };
+            files
+                .iter()
+                .map(|(p, f)| (p.clone(), f.content.clone()))
+                .collect()
+        };
+        let recomputed: Vec<(PathBuf, _, _)> = sources
+            .into_iter()
+            .map(|(path, content)| {
+                let (chars, char_files) = parse_included(&path, &content);
+                (path, chars, char_files)
+            })
+            .collect();
+
+        let mut guard = self.0.workspaces.lock();
+        let Some(files) = guard.get_mut(workspace_root) else {
+            return;
+        };
+        for (path, chars, char_files) in recomputed {
+            // ロックを離している間に消えた/差し替わったファイルは触らない。
+            if let Some(file) = files.get_mut(&path) {
+                file.included_characters = chars;
+                file.included_character_files = char_files;
+            }
+        }
     }
 
     /// ワークスペースroot単位の書き込みロックを取得する。`character_updater::run`が
@@ -789,7 +933,9 @@ mod tests {
     );
 
     /// テスト用: 単一ワークスペース("/ws")に`files`(ファイル名, Markdown全文)を
-    /// 全て読み込んだ`CharacterStore`を作る。
+    /// 全て読み込んだ`CharacterStore`を作る。ディスクI/Oをしない(`wikilink::expand_content`
+    /// はリンク先を実際に読もうとするが、ファイルが実在しなければ黙ってスキップされるだけ
+    /// なので、wikilink展開を検証しないテストではこのまま使ってよい)。
     fn make_store(files: &[(&str, &str)]) -> (CharacterStore, PathBuf) {
         let store = CharacterStore::new();
         let root = PathBuf::from("/ws");
@@ -797,6 +943,267 @@ mod tests {
             store.reconcile(&root, &root.join(name), md.to_string());
         }
         (store, root)
+    }
+
+    /// `make_store` のディスクI/O版。wikilink展開(`expand_content`)は実ファイルを
+    /// 読むため、リンク先の解決を検証するテストは一時ディレクトリへ実際に書き出す必要がある
+    /// (`wikilink.rs`のテストと同じ方針。`tempfile`クレートは使わない)。
+    ///
+    /// `tracked_files` は `CharacterStore::reconcile` で実際に追跡させるファイル
+    /// (本番での `characters.md`/`characters/*.md` 相当)。`link_only_files` は
+    /// wikilink解決のためディスクには書くが reconcile はしない(本番の memo/*.md 相当。
+    /// これを追跡させてしまうと、リンク先自体が独立したキャラファイルとして扱われ、
+    /// 「#include で名前だけ取り込む」検証にならない)。
+    fn make_store_on_disk(
+        name: &str,
+        tracked_files: &[(&str, &str)],
+        link_only_files: &[(&str, &str)],
+    ) -> (CharacterStore, PathBuf) {
+        let root = std::env::temp_dir().join(format!("ff_character_wikilink_test_{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let store = CharacterStore::new();
+        for (rel, md) in link_only_files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, md).unwrap();
+        }
+        for (rel, md) in tracked_files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, md).unwrap();
+            store.reconcile(&root, &path, md.to_string());
+        }
+        (store, root)
+    }
+
+    #[test]
+    fn test_allowed_names_transitive_two_hops() {
+        // characters.md → hoge/ijn.md → hoge/高柳.md の2段リンクでも、
+        // 最終到達先(高柳)の見出し・aliasが allowed_names に含まれること。
+        let (store, root) = make_store_on_disk(
+            "transitive_two_hops",
+            &[(
+                "characters.md",
+                "[[hoge/ijn.md]]\n\n# チャーチル\n\n## 役割\n本文。\n",
+            )],
+            &[
+                (
+                    "hoge/ijn.md",
+                    "[[高柳.md]]\n\n\n# 原顕三郎\n\n## 呼称\n- 原艦長\n",
+                ),
+                ("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n"),
+            ],
+        );
+        let names = store.allowed_names(&root);
+        assert!(names.contains("チャーチル"), "{:?}", names);
+        assert!(names.contains("原顕三郎"), "1段目のリンク先: {:?}", names);
+        assert!(names.contains("高柳"), "2段目(推移的)のリンク先: {:?}", names);
+        assert!(names.contains("飛騨艦長"), "2段目リンク先のalias: {:?}", names);
+    }
+
+    #[test]
+    fn test_allowed_names_includes_wikilink_target_file_characters() {
+        // characters.md から memo/サブキャラ.md への wikilink を #include 展開し、
+        // リンク先の見出しから抽出された名前も allowed_names に含まれること。
+        let (store, root) = make_store_on_disk(
+            "expand_names",
+            &[(
+                "characters.md",
+                "## ジェフ・クライン（艦長）\n### 背景・立場\n[[memo/サブキャラ]]も参照。\n",
+            )],
+            &[(
+                "memo/サブキャラ.md",
+                "## エルミア（副長）\n### 背景・立場\n- 副長。\n",
+            )],
+        );
+        let names = store.allowed_names(&root);
+        assert!(names.contains("ジェフ・クライン"), "{:?}", names);
+        assert!(names.contains("エルミア"), "{:?}", names);
+    }
+
+    #[test]
+    fn test_characters_index_does_not_include_wikilink_target_entries() {
+        // characters(位置情報つき)はこのファイル自身の見出しのみを対象にし、
+        // wikilink先の見出しは含めない(heading_lineがこのファイル中の実在行を
+        // 指さなくなるため、goto_definition等の位置参照に使えなくなることを防ぐ)。
+        let (store, root) = make_store_on_disk(
+            "expand_positions",
+            &[(
+                "characters.md",
+                "## ジェフ・クライン（艦長）\n### 背景・立場\n[[memo/サブキャラ]]も参照。\n",
+            )],
+            &[(
+                "memo/サブキャラ.md",
+                "## エルミア（副長）\n### 背景・立場\n- 副長。\n",
+            )],
+        );
+        // lookup_definitions はcharactersベースなので、リンク先の名前では見つからない。
+        assert!(store.lookup_definitions(&root, "エルミア").is_empty());
+        assert!(!store.lookup_definitions(&root, "ジェフ・クライン").is_empty());
+    }
+
+    #[test]
+    fn test_lookup_markdown_finds_wikilink_only_character() {
+        // 自ファイルに見出しの無い、wikilink経由でしか定義されていないキャラでも
+        // hover表示用のMarkdownが返ること(高柳がcharacters.mdに直接無い、実機バグの回帰)。
+        let (store, root) = make_store_on_disk(
+            "lookup_markdown_wikilink_only",
+            &[(
+                "characters.md",
+                "[[hoge/ijn.md]]\n\n# 近藤\n\n## 役割\n外務省職員。\n",
+            )],
+            &[
+                ("hoge/ijn.md", "[[高柳.md]]\n\n# 原顕三郎\n\n## 呼称\n- 原\n"),
+                ("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n"),
+            ],
+        );
+        let markdown = store.lookup_markdown(&root, "高柳");
+        assert!(markdown.is_some(), "wikilink経由のキャラでもhoverが出ること");
+        assert!(markdown.unwrap().contains("飛騨艦長"));
+        // 自ファイルの見出しも従来通り引ける(回帰確認)。
+        assert!(store.lookup_markdown(&root, "近藤").is_some());
+    }
+
+    #[test]
+    fn test_lookup_names_finds_wikilink_only_character_aliases() {
+        let (store, root) = make_store_on_disk(
+            "lookup_names_wikilink_only",
+            &[("characters.md", "[[hoge/高柳.md]]も参照。\n")],
+            &[("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n")],
+        );
+        let names = store.lookup_names(&root, "高柳");
+        assert!(names.contains("高柳"), "{:?}", names);
+        assert!(names.contains("飛騨艦長"), "{:?}", names);
+    }
+
+    #[test]
+    fn test_search_finds_wikilink_only_character() {
+        let (store, root) = make_store_on_disk(
+            "search_wikilink_only",
+            &[("characters.md", "[[hoge/高柳.md]]も参照。\n")],
+            &[(
+                "hoge/高柳.md",
+                "# 高柳\n\n## 役割\n\n戦艦「飛騨」の艦長。\n",
+            )],
+        );
+        let result = store.search(&root, "高柳", &[CharacterAttribute::Role]);
+        assert!(result.is_ok(), "{:?}", result);
+        assert!(result.unwrap().contains("艦長"));
+    }
+
+    #[test]
+    fn test_files_reachable_via_wikilink_includes_tracked_and_linked_files() {
+        let (store, root) = make_store_on_disk(
+            "files_reachable",
+            &[(
+                "characters.md",
+                "[[hoge/ijn.md]]\n\n# 近藤\n\n## 役割\n外務省職員。\n",
+            )],
+            &[
+                ("hoge/ijn.md", "[[高柳.md]]\n\n# 原顕三郎\n\n## 呼称\n- 原\n"),
+                ("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n"),
+            ],
+        );
+        let files = store.files_reachable_via_wikilink(&root);
+        assert!(files.contains_key(&root.join("characters.md")));
+        assert!(files.contains_key(&root.join("hoge/ijn.md")));
+        assert!(files.contains_key(&root.join("hoge/高柳.md")));
+        assert!(files[&root.join("hoge/高柳.md")].contains("飛騨艦長"));
+    }
+
+    #[test]
+    fn test_refresh_included_picks_up_wikilink_target_change() {
+        // wikilink先ファイルの内容が(character_updaterの書き込み等で)ディスク上で
+        // 直接変わった後、refresh_includedを呼ぶと追跡ファイル側のincluded_charactersへ
+        // 変更が反映されること。
+        let (store, root) = make_store_on_disk(
+            "refresh_included",
+            &[("characters.md", "[[hoge/高柳.md]]も参照。\n")],
+            &[("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n")],
+        );
+        assert!(store.lookup_markdown(&root, "高柳").unwrap().contains("飛騨艦長"));
+
+        std::fs::write(
+            root.join("hoge/高柳.md"),
+            "# 高柳\n\n## 呼称\n\n- 更新後の呼称\n",
+        )
+        .unwrap();
+        store.refresh_included(&root);
+
+        let markdown = store.lookup_markdown(&root, "高柳").unwrap();
+        assert!(markdown.contains("更新後の呼称"), "{:?}", markdown);
+        assert!(!markdown.contains("飛騨艦長"), "{:?}", markdown);
+    }
+
+    #[test]
+    fn test_files_reachable_via_wikilink_promoted_file_is_tracked_and_syncable() {
+        // wikilink 先を候補として返すと追跡対象へ昇格する(書き込み先として content_of/write
+        // から見えるようにするため)。昇格後もディスクの変更を reconcile で取り込めること
+        // = 古い内容のまま固定されないこと を確認する
+        // (取り込めないと、次の自動更新サイクルがユーザーの編集を巻き戻してしまう)。
+        let (store, root) = make_store_on_disk(
+            "promoted_stays_syncable",
+            &[("characters.md", "[[hoge/高柳.md]]も参照。\n")],
+            &[("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n")],
+        );
+        let target = root.join("hoge/高柳.md");
+        assert!(!store.is_tracked(&root, &target), "初期状態では未追跡");
+
+        store.files_reachable_via_wikilink(&root);
+        assert!(store.is_tracked(&root, &target), "候補列挙で追跡対象へ昇格する");
+
+        // ユーザーがそのファイルを編集した想定(did_save 経由の取り込み)。
+        let edited = "# 高柳\n\n## 呼称\n\n- ユーザーが書いた呼称\n";
+        std::fs::write(&target, edited).unwrap();
+        assert!(
+            store.reconcile(&root, &target, edited.to_string()),
+            "昇格後も外部変更として取り込めること"
+        );
+        assert_eq!(store.content_of(&root, &target).as_deref(), Some(edited));
+
+        // 次サイクルの候補列挙が、古い内容へ巻き戻さないこと。
+        let snapshots = store.files_reachable_via_wikilink(&root);
+        assert_eq!(
+            snapshots.get(&target).map(String::as_str),
+            Some(edited),
+            "昇格済みファイルの内容が古いまま返らないこと"
+        );
+    }
+
+    #[test]
+    fn test_discover_character_files_ignores_characters_folder() {
+        // characters/ フォルダ形式は廃止(分割は wikilink で行う)。
+        let root = std::env::temp_dir().join("ff_discover_no_folder_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("characters")).unwrap();
+        std::fs::write(root.join("characters.md"), "# 近藤\n").unwrap();
+        std::fs::write(root.join("characters/ジェフ.md"), "# ジェフ\n").unwrap();
+
+        let files = CharacterStore::discover_character_files(&root);
+        assert_eq!(files, vec![root.join("characters.md")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_lookup_markdown_does_not_duplicate_shared_wikilink_target() {
+        // 同じ wikilink 先が2つの追跡ファイルから到達可能でも、hover表示は1回だけ。
+        let (store, root) = make_store_on_disk(
+            "lookup_markdown_dedup",
+            &[
+                ("characters.md", "[[hoge/高柳.md]]も参照。\n"),
+                ("other.md", "[[hoge/高柳.md]]も参照。\n"),
+            ],
+            &[("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n")],
+        );
+        let markdown = store.lookup_markdown(&root, "高柳").unwrap();
+        assert_eq!(
+            markdown.matches("飛騨艦長").count(),
+            1,
+            "同一定義元の内容が重複しないこと: {:?}",
+            markdown
+        );
+        assert!(!markdown.contains("---"), "区切りが入らないこと: {:?}", markdown);
     }
 
     #[test]
