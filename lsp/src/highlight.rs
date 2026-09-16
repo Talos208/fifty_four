@@ -1,9 +1,10 @@
 /// 会話ハイライト用のトークナイザ・ユーティリティ
 ///
 /// `lindera` を使って形態素解析を行い、会話テキストをハイライトします。
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::sync::atomic::Ordering::Relaxed;
+use std::usize;
 
 use lindera::mode::Mode;
 use lindera::tokenizer::TokenizerBuilder;
@@ -11,7 +12,7 @@ use parking_lot::RwLock;
 use strum_macros::EnumIter;
 use tracing::instrument;
 
-use crate::types::{CachedLinderaToken, LineData, TokenStatus};
+use crate::types::{CachedLinderaToken, LineData, TokenMeaning, TokenStatus, is_kanji_all};
 #[allow(unused_imports)]
 use log::{debug, trace, warn};
 
@@ -79,7 +80,6 @@ pub enum SemanticTokenType {
 impl SemanticToken {
     /// 新しいトークンを作成する簡易コンストラクタ
     #[allow(dead_code)]
-    #[instrument]
     pub fn new(start: u32, length: u32, token_type: u32, modifier: u32) -> Self {
         Self {
             start,
@@ -89,9 +89,23 @@ impl SemanticToken {
         }
     }
 
-    #[instrument]
-    pub fn from_kind(start: u32, length: u32, kind: &str) -> Self {
-        let (token_type, modifier) = Self::kind2token(kind);
+    pub fn from_meaning(start: u32, length: u32, meaning: TokenMeaning) -> Self {
+        let (token_type, modifier) = match meaning {
+            TokenMeaning::Normal => (SemanticTokenType::Undefined as u32, 0u32),
+
+            TokenMeaning::Bracket | TokenMeaning::BracketClose => {
+                (SemanticTokenType::Comment as u32, 0u32)
+            }
+            TokenMeaning::InnerBracket => (SemanticTokenType::String as u32, 0u32),
+
+            TokenMeaning::RubyBracket => (SemanticTokenType::Comment as u32, 0u32),
+            TokenMeaning::RubyBody => (SemanticTokenType::Namespace as u32, 0u32),
+            TokenMeaning::Ruby => (SemanticTokenType::String as u32, 0u32),
+
+            TokenMeaning::Characters => (SemanticTokenType::Keyword as u32, 0u32),
+
+            _ => (SemanticTokenType::Undefined as u32, 0u32),
+        };
         Self {
             start,
             length,
@@ -99,39 +113,20 @@ impl SemanticToken {
             modifier,
         }
     }
+}
 
-    #[instrument]
-    pub fn kind2token(kind: &str) -> (u32, u32) {
-        match kind {
-            "namespace" => (SemanticTokenType::Namespace as u32, 0),
-            "type" => (SemanticTokenType::Type as u32, 0),
-            "class" => (SemanticTokenType::Class as u32, 0),
-            "enum" => (SemanticTokenType::Enum as u32, 0),
-            "interface" => (SemanticTokenType::Interface as u32, 0),
-            "struct" => (SemanticTokenType::Struct as u32, 0),
-            "typeparameter" => (SemanticTokenType::TypeParameter as u32, 0),
-            "parameter" => (SemanticTokenType::Parameter as u32, 0),
-            "variable" => (SemanticTokenType::Variable as u32, 0),
-            "property" => (SemanticTokenType::Property as u32, 0),
-            "enummember" => (SemanticTokenType::EnumMember as u32, 0),
-            "event" => (SemanticTokenType::Event as u32, 0),
-            "function" => (SemanticTokenType::Function as u32, 0),
-            "method" => (SemanticTokenType::Method as u32, 0),
-            "macro" => (SemanticTokenType::Macro as u32, 0),
-            "keyword" => (SemanticTokenType::Keyword as u32, 0),
-            "modifier" => (SemanticTokenType::Modifier as u32, 0),
-            "comment" => (SemanticTokenType::Comment as u32, 0),
-            "string" => (SemanticTokenType::String as u32, 0),
-            "number" => (SemanticTokenType::Number as u32, 0),
-            "regexp" => (SemanticTokenType::Regexp as u32, 0),
-            "operator" => (SemanticTokenType::Operator as u32, 0),
-            "decorator" => (SemanticTokenType::Decorator as u32, 0),
-            _ => (
-                SemanticTokenType::Undefined as u32,
-                SemanticTokenType::Undefined as u32,
-            ),
-        }
-    }
+/// 括弧内トークンの色分け方針。
+///
+/// `.txt` 原稿本文では「」が台詞であり、地の文(括弧外)とは別の色で塗りたい。一方
+/// `.md`(`characters.md`/`plot.md` 等の設定・メモ)では括弧は単なる注釈で、台詞と
+/// 見なして塗り分けると段落全体が `string` 色に沈んで読みにくくなる。この違いを
+/// `tokenize_with_depth` の呼び出し側(`backend.rs` の `is_md`)から選べるようにする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BracketColoring {
+    /// 括弧内は台詞として `classify_bracket` で塗る(`.txt` 原稿本文)
+    Distinct,
+    /// 括弧内外を区別せず常に `classify_normal` で塗る(`.md` の設定・メモ)
+    Uniform,
 }
 
 /// `Clone` は `Arc` の参照カウント増加のみ。トークナイザ実体は clone 間で共有され、
@@ -293,10 +288,10 @@ impl Highlighter {
         )
     }
 
-    #[instrument]
+    #[instrument(skip(self), ret)]
     pub fn text_to_lindera_token(&self, text: &str) -> Vec<CachedLinderaToken> {
         let tokenizer = self.tokenizer().read();
-        tokenizer
+        let tmp2 = tokenizer
             .tokenize(text)
             .expect("failed to tokenize text")
             .into_iter()
@@ -311,160 +306,274 @@ impl Highlighter {
                 }
 
                 Some(CachedLinderaToken {
-                    details: t.details().iter().map(|s| s.to_string()).collect(),
+                    details: t
+                        .details()
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<String>>()
+                        .as_chunks::<7>()
+                        .0[0]
+                        .clone(),
                     byte_start: t.byte_start,
                     byte_end: t.byte_end,
-                    // tag は行の開始深さに依存するため、ここでは仮値。
-                    // `tag_line_depth` が深さを畳み込みながら確定させる。
-                    tag: TokenStatus::Normal,
+                    meaning: TokenMeaning::Normal,
                 })
             })
-            .collect()
+            .collect();
+        tmp2
     }
 
-    /// 単一行を `start_depth` 起点でタグ付けし、行終端の括弧深さを返す。
-    ///
-    /// - `line.tokens` が空なら Lindera で遅延トークン化する
-    /// - 各トークンの `tag` を InBracket/Normal に**明示的に**設定する
-    ///   (キャッシュ済みトークンを異なる深さで再タグ付けするケースがあるため、
-    ///    InBracket → Normal への戻しも必要)
-    /// - `line.bracket_depth_after` に終端深さをキャッシュする
-    ///
-    /// 括弧開閉トークン自身の扱い:
-    /// - 括弧開: 自身はまだ外側(処理前の深さで判定) → その後 depth+1
-    /// - 括弧閉: depth-1 → 自身はもう外側(処理後の深さで判定)
-    #[instrument]
-    fn tag_line_depth(&self, line: &mut LineData, start_depth: u32) -> u32 {
-        // 遅延解析
+    #[instrument(ret)]
+    fn process_ruby_kanji(
+        base: &[CachedLinderaToken],
+        car: CachedLinderaToken,
+        results: &mut Vec<CachedLinderaToken>,
+    ) -> TokenStatus {
+        let surface = car.details[6].as_str();
+        if is_kanji_all(surface) {
+            let mut next_base = base.iter().map(|i| i.clone()).collect::<Vec<_>>();
+            next_base.push(car);
+            TokenStatus::RubyBaseKanji(next_base)
+        } else if surface == "《" {
+            TokenStatus::Ruby(base.to_vec(), vec![car.meaning(TokenMeaning::RubyBracket)])
+        } else {
+            // TODO: ホントはバックトラック
+            for tkn in base {
+                results.push(tkn.clone());
+            }
+            results.push(car);
+            TokenStatus::Normal
+        }
+    }
+
+    #[instrument(ret)]
+    fn process_ruby_backet(
+        base: &[CachedLinderaToken],
+        car: CachedLinderaToken,
+        results: &mut Vec<CachedLinderaToken>,
+    ) -> TokenStatus {
+        let surface = car.details[6].as_str();
+        if surface == "《" {
+            TokenStatus::Ruby(base.to_vec(), vec![car.meaning(TokenMeaning::RubyBracket)])
+        } else {
+            let mut next_base = base.iter().map(|i| i.clone()).collect::<Vec<_>>();
+            next_base.push(car);
+            TokenStatus::RubyBaseBracket(next_base)
+        }
+    }
+
+    #[instrument(skip(self, line), ret)]
+    pub fn parse_line_token(
+        &self,
+        line: &mut LineData,
+        initial_state: TokenStatus,
+    ) -> (Vec<CachedLinderaToken>, TokenStatus) {
         if line.tokens.is_empty() {
-            trace!("lazy tokenize");
             line.tokens = self.text_to_lindera_token(&line.text);
         }
 
-        let mut depth = start_depth;
-        for token in line.tokens.iter_mut() {
-            match (
-                token.details[0].as_str(),
-                token.details.get(1).map(|d| d.as_str()),
-            ) {
-                ("記号", Some("括弧開")) => {
-                    token.tag = if depth > 0 {
-                        TokenStatus::InBracket
-                    } else {
+        let mut tokens: VecDeque<CachedLinderaToken> =
+            VecDeque::from_iter(line.tokens.clone().drain(..));
+        // let mut next_state = TokenStatus::Initial;
+        let mut last_state = initial_state;
+        let mut results: Vec<CachedLinderaToken> = vec![];
+        // debug!("last_state: {:?}", last_state);
+
+        while !tokens.is_empty() {
+            let car = tokens.pop_front().unwrap();
+
+            let surface = car.details[6].clone();
+            let types = car.details[0].as_str();
+            let subtypes = car.details[1].as_str();
+            // debug!("State: {:?} ({:?}, {:?})", last_state, types, subtypes);
+
+            let next_state = match last_state {
+                TokenStatus::Normal => match (types, subtypes) {
+                    ("記号", "括弧開") => TokenStatus::InBracket(
+                        surface.chars().next().unwrap_or_default(),
+                        vec![car.meaning(TokenMeaning::Bracket)],
+                    ),
+                    ("記号", "一般") if surface.as_str() == "｜" => {
+                        TokenStatus::RubyBaseBracket(vec![car])
+                    }
+                    // TODO: 固有名詞処理
+                    _ if crate::types::is_kanji_all(surface.as_str()) => {
+                        TokenStatus::RubyBaseKanji(vec![car])
+                    }
+                    _ => {
+                        results.push(car.meaning(TokenMeaning::Normal));
                         TokenStatus::Normal
-                    };
-                    depth += 1;
+                    }
+                },
+                TokenStatus::InBracket(brkt, inner) => {
+                    let close_brkt = ['〓', '《', '「', '『', '〈', '（', '【', '〔', '｛']
+                        .iter()
+                        .position(|c| *c == brkt)
+                        .map_or('〓', |ix| {
+                            ['〓', '》', '」', '』', '〉', '）', '】', '〕', '｝'][ix]
+                        });
+
+                    match (types, subtypes) {
+                        ("記号", "括弧閉")
+                            if close_brkt == surface.chars().next().unwrap_or('〓') =>
+                        {
+                            for tkn in inner.iter() {
+                                results.push(tkn.clone());
+                            }
+                            results.push(car.meaning(TokenMeaning::BracketClose));
+                            TokenStatus::Normal
+                        }
+                        _ => {
+                            // TODO: 括弧内のルビはどうしよう
+                            let mut next_inner =
+                                inner.iter().map(|i| i.clone()).collect::<Vec<_>>();
+                            next_inner.push(car.meaning(TokenMeaning::InnerBracket));
+                            TokenStatus::InBracket(brkt, next_inner)
+                        }
+                    }
                 }
-                ("記号", Some("括弧閉")) => {
-                    depth = depth.saturating_sub(1);
-                    token.tag = if depth > 0 {
-                        TokenStatus::InBracket
-                    } else {
+                TokenStatus::RubyBaseKanji(base) => {
+                    Self::process_ruby_kanji(base.as_slice(), car, &mut results)
+                }
+                TokenStatus::RubyBaseBracket(base) => {
+                    Self::process_ruby_backet(base.as_slice(), car, &mut results)
+                }
+                TokenStatus::Ruby(base, ruby) => {
+                    if surface == "》" {
+                        let mut iter = base.iter();
+                        results.push(iter.next().unwrap().meaning(TokenMeaning::RubyBracket));
+                        while let Some(tkn) = iter.next() {
+                            results.push(tkn.meaning(TokenMeaning::RubyBody));
+                        }
+
+                        let mut iter = ruby.iter();
+                        results.push(iter.next().unwrap().meaning(TokenMeaning::RubyBracket));
+                        while let Some(tkn) = iter.next() {
+                            results.push(tkn.meaning(TokenMeaning::Ruby));
+                        }
+                        results.push(car.meaning(TokenMeaning::RubyBracket));
                         TokenStatus::Normal
-                    };
+                    } else {
+                        let mut next_ruby = ruby.iter().map(|i| i.clone()).collect::<Vec<_>>();
+                        next_ruby.push(car);
+                        TokenStatus::Ruby(base, next_ruby)
+                    }
                 }
                 _ => {
-                    token.tag = if depth > 0 {
-                        TokenStatus::InBracket
-                    } else {
-                        TokenStatus::Normal
-                    };
+                    warn!("Not implemented: {:?}", last_state);
+                    TokenStatus::Undefined
                 }
+            };
+            debug!("{:?}", next_state);
+            last_state = next_state;
+        }
+        // TODO: 残ってる分のemit
+        match last_state {
+            TokenStatus::InBracket(brkt, inner) => {
+                // 各要素は追加時点で既に正しい meaning が付いている(上のコメント参照)。
+                for tkn in inner.iter() {
+                    results.push(tkn.clone());
+                }
+                last_state = TokenStatus::InBracket(brkt, vec![]);
             }
+            // 被ルビは改行をまたいだとしても確定するまで
+            _ => {}
         }
 
-        line.bracket_depth_after = Some(depth);
-        depth
+        // `results` は `parse_line_token` の戻り値としてのみ meaning を確定させていたため、
+        // `line.tokens` を直接読む cursor_context.rs 側からは常に Normal しか見えなかった。
+        // ここで書き戻すことで、以後 `line.tokens[i].meaning` を再計算なしに参照できる。
+        results
+            .iter()
+            .zip(line.tokens.iter_mut())
+            .for_each(|(l, r)| {
+                r.meaning = l.meaning;
+            });
+        line.state_after = last_state.clone();
+
+        (results, last_state)
     }
 
-    /// `line_no` 行の終端深さを保証する畳み込み。
-    ///
-    /// `bracket_depth_after` が Some ならそれを返す(O(1) 高速パス)。
-    /// None なら後方へ遡り、最寄りのキャッシュ済み行(無ければ行0, depth=0)から
-    /// `line_no` まで `tag_line_depth` で前向きに畳み直す。
-    /// 副作用として、再計算した範囲の全トークンの `tag` が正しく設定される。
-    ///
-    /// `apply_changes` が編集行以降の `bracket_depth_after` を一括 None にする規約
-    /// (前方累積量の無効化)と対になっており、定常の打鍵(編集行=カーソル行)では
-    /// 再計算は1行分だけで済む。
-    #[instrument]
-    pub fn ensure_bracket_depth(&self, lines: &mut [LineData], line_no: usize) -> u32 {
+    /// `line_no` 行移行の状態を畳み込む。
+    /// `apply_changes`などで未解決になっている行を、後方の直近解決済み行(無ければ行0/`Normal`)
+    /// から前向きに再計算し、各行の `tokens[].meaning`/`state_after` を更新する。
+    #[instrument(skip(self, lines))]
+    pub fn ensure_line_state(&self, lines: &mut [LineData], start_line_no: usize) {
         if lines.is_empty() {
-            return 0;
+            return;
         }
-        let line_no = line_no.min(lines.len() - 1);
-        if let Some(d) = lines[line_no].bracket_depth_after {
-            return d;
+        let line_no = start_line_no.min(lines.len() - 1);
+        if lines[line_no].state_after.is_resolved() {
+            return; // 高速パス
         }
 
-        // 最寄りのキャッシュ済み祖先を後方探索
+        // 最寄りの解決済み祖先を後方探索
         let mut start = line_no;
-        while start > 0 && lines[start - 1].bracket_depth_after.is_none() {
+        while start > 0 && !lines[start - 1].state_after.is_resolved() {
             start -= 1;
         }
-        let mut depth = if start == 0 {
-            0
+        // start > 0 なら直前行の状態を引き継ぐ。
+        let mut state = if start == 0 {
+            TokenStatus::Normal
         } else {
-            lines[start - 1].bracket_depth_after.unwrap()
+            lines[start - 1].state_after.clone()
         };
 
-        // キャッシュが見つかった所から line_no まで前向きに畳み直す
         for line in &mut lines[start..=line_no] {
-            depth = self.tag_line_depth(line, depth);
+            let (_tokens, s) = self.parse_line_token(line, state);
+            state = s;
         }
-        depth
     }
 
     /// テキストを受け取り、ハイライト用トークン列と行終端の括弧深さを返す。
     ///
     /// `tag_line_depth` でタグ付けした後、語種と括弧内外に基づいて
     /// ハイライト用のトークン種別を生成する。
-    #[instrument]
-    pub fn tokenize_with_depth(
+    #[instrument(skip(self), ret)]
+    pub fn tokenize_with_state(
         &self,
         line: &mut LineData,
-        start_depth: u32,
+        initial_state: TokenStatus,
+        coloring: BracketColoring,
         allowed: &HashSet<String>,
-    ) -> (Vec<SemanticToken>, u32) {
-        let end_depth = self.tag_line_depth(line, start_depth);
+    ) -> (Vec<SemanticToken>, TokenStatus) {
+        let (mut tokens, last_state) = self.parse_line_token(line, initial_state);
 
-        let mut result = Vec::new();
-        for token in line.tokens.iter() {
-            // 人名判定に使う表層文字列
-            let surface = &line.text[token.byte_start..token.byte_end];
+        (
+            tokens
+                .iter_mut()
+                .filter_map(|token| {
+                    // `.md` では括弧内外を区別しないため、InnerBracket をいったん無色に
+                    // 格下げしてから人名判定を通す(許可名一致なら Characters で復活する)。
+                    if coloring == BracketColoring::Uniform
+                        && token.meaning == TokenMeaning::InnerBracket
+                    {
+                        token.meaning = TokenMeaning::Normal;
+                    }
 
-            // 括弧開閉自身は常に "comment"。それ以外は tag(tag_line_depth が確定済み)で
-            // 括弧内外モードを分けて classify へ委譲する。
-            let kind = match (
-                token.details[0].as_str(),
-                token.details.get(1).map(|d| d.as_str()),
-            ) {
-                ("記号", Some("括弧開")) | ("記号", Some("括弧閉")) => Some("comment"),
-                _ if token.tag == TokenStatus::InBracket => {
-                    Self::classify_bracket(&token.details, surface, allowed)
-                }
-                _ => Self::classify_normal(&token.details, surface, allowed),
-            };
+                    let surface = &line.text[token.byte_start..token.byte_end];
+                    if Self::is_recognized_person_name(&token.details, surface, allowed) {
+                        token.meaning = TokenMeaning::Characters;
+                    }
 
-            if let Some(k) = kind {
-                // positionEncoding=utf-16 に合わせ、UTF-16 コード単位で位置と長さを算出する
-                let start = crate::types::utf16_len(&line.text[..token.byte_start]);
-                let length = crate::types::utf16_len(&line.text[token.byte_start..token.byte_end]);
+                    if token.meaning == TokenMeaning::Normal {
+                        return None;
+                    }
 
-                result.push(SemanticToken::from_kind(start as u32, length as u32, k));
-            }
-        }
+                    // positionEncoding=utf-16 に合わせ、UTF-16 コード単位で位置と長さを算出する
+                    let start = crate::types::utf16_len(&line.text[..token.byte_start]);
+                    let length =
+                        crate::types::utf16_len(&line.text[token.byte_start..token.byte_end]);
 
-        (result, end_depth)
-    }
-
-    /// 深さ0(括弧外)起点の `tokenize_with_depth`。単一行・深さ0前提の呼び出し向け互換ラッパ。
-    /// 本体コードは深さを明示する `tokenize_with_depth`/`ensure_bracket_depth` を使うため、
-    /// 現在はテスト専用。
-    #[allow(dead_code)]
-    #[instrument]
-    pub fn tokenize(&self, line: &mut LineData, allowed: &HashSet<String>) -> Vec<SemanticToken> {
-        self.tokenize_with_depth(line, 0, allowed).0
+                    Some(SemanticToken::from_meaning(
+                        start as u32,
+                        length as u32,
+                        token.meaning,
+                    ))
+                })
+                .collect::<Vec<_>>(),
+            last_state,
+        )
     }
 
     /// トークンが「許可名一致の人名」であるかを判定する共通述語。
@@ -474,7 +583,7 @@ impl Highlighter {
     /// hover等ハイライト以外の箇所からも同一基準で判定できるよう公開している
     /// (`Highlighter::is_recognized_name` 経由)。
     /// ここでの判定が変わらない限り hover とハイライトは常に一致する。
-    #[instrument]
+    #[instrument(ret)]
     fn is_recognized_person_name(
         details: &[String],
         surface: &str,
@@ -484,84 +593,6 @@ impl Highlighter {
             && details.get(1).map(String::as_str) == Some("固有名詞")
             && details.get(2).map(String::as_str) == Some("人名")
             && allowed.contains(surface)
-    }
-
-    /// 通常モードでの品詞→トークン種別マッピング。
-    ///
-    /// 人名(固有名詞・人名)は `allowed` (キャラ一覧の名前+aliases) に含まれる場合のみ
-    /// ハイライトする。組織名・地域名の判定は無効化(コメントアウト)しているが、
-    /// 将来再度有効化できるようロジックは残してある。
-    // #[instrument]
-    fn classify_normal(
-        details: &[String],
-        surface: &str,
-        allowed: &HashSet<String>,
-    ) -> Option<&'static str> {
-        let v = details[1..]
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        match details[0].as_str() {
-            "名詞" => match v.as_ref() {
-                ["固有名詞", "人名", ..] => {
-                    if Self::is_recognized_person_name(details, surface, allowed) {
-                        Some("keyword")
-                    } else {
-                        None
-                    }
-                }
-
-                // ["固有名詞", "組織", ..] => Some("variable"),
-
-                // ["固有名詞", "地域", "一般", ..] | ["固有名詞", "地域", "国", ..] => {
-                //     Some("function")
-                // }
-                // ["接尾", "サ変接続", ..] => Some("variable"),
-                _ => None,
-            },
-            "記号" => Some("comment"),
-            _ => None,
-        }
-    }
-
-    /// 括弧内モードでの品詞→トークン種別マッピング。
-    ///
-    /// 人名の絞り込みは `classify_normal` と同様。組織名・地域名の判定は無効化(コメントアウト)。
-    // #[instrument]
-    fn classify_bracket(
-        details: &[String],
-        surface: &str,
-        allowed: &HashSet<String>,
-    ) -> Option<&'static str> {
-        let v = details[1..]
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        match details[0].as_str() {
-            "名詞" => match v.as_ref() {
-                ["固有名詞", "人名", ..] => {
-                    if Self::is_recognized_person_name(details, surface, allowed) {
-                        Some("keyword")
-                    } else {
-                        Some("string")
-                    }
-                }
-
-                // ["固有名詞", "組織"] => Some("variable"),
-
-                // ["固有名詞", "地域", "一般"] | ["固有名詞", "地域", "国"] => {
-                //     Some("function")
-                // }
-                ["サ変接続"] | ["接尾", "サ変接続"] => Some("string"),
-                _ => Some("string"),
-            },
-            "記号" => Some("comment"),
-            _ => Some("string"),
-        }
     }
 
     /// ハイライト用トークン列をLSP用に変換する。
@@ -599,40 +630,72 @@ impl Highlighter {
         encoded
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::str::FromStr;
-
-    #[test]
-    fn highlight_token_new() {
-        let t = SemanticToken::from_kind(5, 3, "keyword");
-        assert_eq!(t.start, 5);
-        assert_eq!(t.length, 3);
-        assert_eq!(t.token_type, SemanticTokenType::Keyword as u32);
-        assert_eq!(t.modifier, 0);
-    }
 
     /// 空の許可名集合(名前判定を伴わないテスト用)。
     fn no_names() -> HashSet<String> {
         HashSet::new()
     }
 
-    /// 括弧内モード(開始深さ1)でトークン化するテスト用ヘルパ。
+    /// 通常モード(括弧外・状態Normal起点)でトークン化するテスト用ヘルパ。
+    /// 旧 `h.tokenize(line, &allowed)` 相当。
+    fn tokenize(
+        h: &Highlighter,
+        line: &mut LineData,
+        allowed: &HashSet<String>,
+    ) -> Vec<SemanticToken> {
+        h.tokenize_with_state(
+            line,
+            TokenStatus::Normal,
+            BracketColoring::Distinct,
+            allowed,
+        )
+        .0
+    }
+
+    /// `.md` 向け Uniform 配色でトークン化するテスト用ヘルパ。
+    fn tokenize_uniform(
+        h: &Highlighter,
+        line: &mut LineData,
+        allowed: &HashSet<String>,
+    ) -> Vec<SemanticToken> {
+        h.tokenize_with_state(line, TokenStatus::Normal, BracketColoring::Uniform, allowed)
+            .0
+    }
+
+    /// 括弧内モード(開始状態: `「` が開いたまま)でトークン化するテスト用ヘルパ。
+    /// 旧 `tokenize_in_bracket`(深さ1起点)相当。
     fn tokenize_in_bracket(
         h: &Highlighter,
         line: &mut LineData,
         allowed: &HashSet<String>,
     ) -> Vec<SemanticToken> {
-        h.tokenize_with_depth(line, 1, allowed).0
+        h.tokenize_with_state(
+            line,
+            TokenStatus::InBracket('「', vec![]),
+            BracketColoring::Distinct,
+            allowed,
+        )
+        .0
+    }
+
+    #[test]
+    fn highlight_token_new() {
+        let t = SemanticToken::from_meaning(5, 3, TokenMeaning::Characters);
+        assert_eq!(t.start, 5);
+        assert_eq!(t.length, 3);
+        assert_eq!(t.token_type, SemanticTokenType::Keyword as u32);
+        assert_eq!(t.modifier, 0);
     }
 
     #[test]
     fn test_tokenize_conversation_produces_tokens() {
-        let hilighter = Highlighter::new();
+        let h = Highlighter::new();
         let tokens = tokenize_in_bracket(
-            &hilighter,
+            &h,
             &mut LineData::from_str("これはテストです。").unwrap(),
             &no_names(),
         );
@@ -640,49 +703,28 @@ mod tests {
             !tokens.is_empty(),
             "tokenize_conversation should produce tokens"
         );
-
-        // 簡単な検証(括弧内モードは許可名一致以外すべて string に丸められる)
-        // "これ" -> 名詞 -> string
-        // "は" -> 助詞 -> string
-        // "テスト" -> 名詞 -> string
-        // "です" -> 助動詞 -> string
-        // "。" -> 記号 -> comment
-        assert_eq!(tokens.len(), 5);
-        assert_eq!(
-            tokens[0].token_type,
-            SemanticTokenType::String as u32,
-            "{} <> string @{}",
-            tokens[0].token_type,
-            tokens[0].start
-        ); // これ
-        assert_eq!(
-            tokens[1].token_type,
-            SemanticTokenType::String as u32,
-            "{} <> variable @{}",
-            tokens[1].token_type,
-            tokens[1].start
-        ); // は
-        assert_eq!(
-            tokens[2].token_type,
-            SemanticTokenType::String as u32,
-            "{} <> string @{}",
-            tokens[2].token_type,
-            tokens[2].start
-        ); // テスト (名詞,サ変接続 -> string)
+        // 括弧内モードでは、許可名一致以外はすべて string に丸められる。
+        assert!(
+            tokens
+                .iter()
+                .all(|t| t.token_type == SemanticTokenType::String as u32),
+            "{:?}",
+            tokens
+        );
     }
 
     #[test]
     fn test_tokenize_conversation_empty_string() {
-        let hilighter = Highlighter::new();
-        let tokens = hilighter.tokenize(&mut LineData::from_str("").unwrap(), &no_names());
+        let h = Highlighter::new();
+        let tokens = tokenize(&h, &mut LineData::from_str("").unwrap(), &no_names());
         assert!(tokens.is_empty(), "Empty string should produce no tokens");
     }
 
     #[test]
     fn test_tokenize_conversation_unknown_words() {
-        let hilighter = Highlighter::new();
+        let h = Highlighter::new();
         let tokens = tokenize_in_bracket(
-            &hilighter,
+            &h,
             &mut LineData::from_str("がびがび").unwrap(),
             &no_names(),
         );
@@ -692,8 +734,9 @@ mod tests {
 
     #[test]
     fn test_tokenize_conversation_complex_sentence() {
-        let hilighter = Highlighter::new();
-        let tokens = hilighter.tokenize(
+        let h = Highlighter::new();
+        let tokens = tokenize_in_bracket(
+            &h,
             &mut LineData::from_str("吾輩は猫である。名前はまだない。").unwrap(),
             &no_names(),
         );
@@ -703,9 +746,12 @@ mod tests {
     #[test]
     fn test_registered_person_name_is_keyword() {
         // "田中" は Lindera IPADIC で 固有名詞,人名,姓 の単一トークンになる(実測確認済み)。
+        // 漢字のみのトークンは行末で「ルビが続くかもしれない」保留状態
+        // (`TokenStatus::RubyBaseKanji`)のまま次行を待つ設計のため、単独では確定せず
+        // 出力されない。末尾に非漢字トークン(句点)を置いて確定させる。
         let h = Highlighter::new();
         let allowed = HashSet::from(["田中".to_string()]);
-        let tokens = h.tokenize(&mut LineData::from_str("田中").unwrap(), &allowed);
+        let tokens = tokenize(&h, &mut LineData::from_str("田中。").unwrap(), &allowed);
         assert_eq!(tokens.len(), 1, "{:?}", tokens);
         assert_eq!(tokens[0].token_type, SemanticTokenType::Keyword as u32);
     }
@@ -748,9 +794,11 @@ mod tests {
             josiah.details
         );
 
-        // ハイライト結果とも一致すること
-        let sem = h.tokenize(&mut LineData::from_str(text).unwrap(), &allowed);
-        assert_eq!(sem.len(), 2, "{:?}", sem); // ジョサイア(keyword) + "・"(comment) のみ
+        // ハイライト結果とも一致すること。"・"のような一般記号は(括弧内外を問わず)
+        // 無色化されるため、生き残るのはジョサイア(keyword)のみ。
+        let sem = tokenize(&h, &mut LineData::from_str(text).unwrap(), &allowed);
+        assert_eq!(sem.len(), 1, "{:?}", sem);
+        assert_eq!(sem[0].token_type, SemanticTokenType::Keyword as u32);
     }
 
     #[test]
@@ -762,7 +810,11 @@ mod tests {
         h.rebuild_user_dictionary(&allowed)
             .expect("辞書再構築に失敗");
 
-        let tokens = h.tokenize(&mut LineData::from_str("原は独りごちた").unwrap(), &allowed);
+        let tokens = tokenize(
+            &h,
+            &mut LineData::from_str("原は独りごちた").unwrap(),
+            &allowed,
+        );
         assert_eq!(
             tokens[0].token_type,
             SemanticTokenType::Keyword as u32,
@@ -771,8 +823,13 @@ mod tests {
         );
         assert_eq!(tokens[0].length, 1, "{:?}", tokens);
 
-        // フルネームは1トークンとして keyword になる(単独名との共存回帰確認)
-        let tokens = h.tokenize(&mut LineData::from_str("原顕三郎少将").unwrap(), &allowed);
+        // フルネームは1トークンとして keyword になる(単独名との共存回帰確認)。
+        // 全文字が漢字のみだとルビ保留状態のまま確定しないため、末尾に句点を置く。
+        let tokens = tokenize(
+            &h,
+            &mut LineData::from_str("原顕三郎少将。").unwrap(),
+            &allowed,
+        );
         assert_eq!(
             tokens[0].token_type,
             SemanticTokenType::Keyword as u32,
@@ -791,7 +848,7 @@ mod tests {
         h.rebuild_user_dictionary(&allowed)
             .expect("辞書再構築に失敗");
 
-        let tokens = h.tokenize(&mut LineData::from_str("シルビア").unwrap(), &allowed);
+        let tokens = tokenize(&h, &mut LineData::from_str("シルビア").unwrap(), &allowed);
         assert_eq!(tokens.len(), 1, "{:?}", tokens);
         assert_eq!(tokens[0].token_type, SemanticTokenType::Keyword as u32);
     }
@@ -806,7 +863,7 @@ mod tests {
             .expect("辞書再構築に失敗");
 
         for word in ["高原", "原因", "原則"] {
-            let tokens = h.tokenize(&mut LineData::from_str(word).unwrap(), &allowed);
+            let tokens = tokenize(&h, &mut LineData::from_str(word).unwrap(), &allowed);
             assert!(
                 tokens.is_empty(),
                 "{} が「原」の誤分割でハイライトされてしまっている: {:?}",
@@ -820,7 +877,7 @@ mod tests {
     fn test_unregistered_person_name_not_highlighted_normal() {
         // 許可名集合が空の場合、通常モードでは固有名詞人名でも一切トークンを生成しない。
         let h = Highlighter::new();
-        let tokens = h.tokenize(&mut LineData::from_str("田中").unwrap(), &no_names());
+        let tokens = tokenize(&h, &mut LineData::from_str("田中").unwrap(), &no_names());
         assert!(tokens.is_empty(), "{:?}", tokens);
     }
 
@@ -836,13 +893,11 @@ mod tests {
     #[test]
     fn test_organization_and_region_not_highlighted() {
         // 組織名("自民党": 固有名詞,組織)・地域名("東京": 固有名詞,地域,一般、"日本": 固有名詞,地域,国)は
-        // 品詞ベースの判定ロジックをコメントアウトしているため、許可名集合に入っていなければ
-        // Variable/Function は生成されない(通常モードでは None -> トークン自体が生成されない)。
-        // keyword 化は「固有名詞,人名」かつ許可名集合に一致した場合のみで、組織名・地域名は
-        // 許可名集合に入っていても対象外(classify_normal/classify_bracket 参照)。
+        // keyword 化の対象外(「固有名詞,人名」かつ許可名集合に一致した場合のみ)なので、
+        // 許可名集合が空なら通常モードでは一切トークンを生成しない。
         let h = Highlighter::new();
         for word in ["自民党", "東京", "日本"] {
-            let tokens = h.tokenize(&mut LineData::from_str(word).unwrap(), &no_names());
+            let tokens = tokenize(&h, &mut LineData::from_str(word).unwrap(), &no_names());
             assert!(
                 tokens.is_empty(),
                 "{} が組織/地域としてハイライトされてしまっている: {:?}",
@@ -854,59 +909,42 @@ mod tests {
 
     #[test]
     fn test_encode_semantic_tokens_same_line_uses_relative_start() {
-        let hilighter = Highlighter::new();
+        let h = Highlighter::new();
         let tokens = tokenize_in_bracket(
-            &hilighter,
+            &h,
             &mut LineData::from_str("これはテストです。").unwrap(),
             &no_names(),
         );
         let encoded = Highlighter::to_semantic_tokens([tokens.clone()]);
-        assert!(encoded.len() >= 3);
+        assert_eq!(tokens.len(), encoded.len());
+        assert!(encoded.len() >= 3, "{:?}", encoded);
         assert_eq!(encoded[1].delta_line, 0);
-        assert_eq!(encoded[1].delta_start, 2);
+        assert_eq!(encoded[1].delta_start, tokens[1].start - tokens[0].start);
         assert_eq!(encoded[2].delta_line, 0);
-        assert_eq!(encoded[2].delta_start, 1);
+        assert_eq!(encoded[2].delta_start, tokens[2].start - tokens[1].start);
     }
 
-    /*    #[test]
-        fn test_encode_semantic_tokens_new_line_resets_start_base() {
-            let hilighter = Highlighter::in_bracket();
-            let encoded = Highlighter::to_semantic_tokens(
-                ["これはテストです。", "これはテストです。"]
-                    .iter()
-                    .map(|s| hilighter.tokenize(&mut LineData::from_str(s).unwrap()))
-                    .collect::<Vec<_>>(),
-            );
-            assert!(encoded.len() >= 6);
-            assert_eq!(encoded[5].delta_line, 1);
-            assert_eq!(encoded[5].delta_start, 0);
-        }
-    */
     #[test]
     fn test_encode_semantic_tokens_skips_empty_lines_with_line_gap() {
-        let hilighter = Highlighter::new();
-        let encoded = Highlighter::to_semantic_tokens(
-            ["これはテストです。", "", "これはテストです。"]
-                .iter()
-                .map(|s| {
-                    tokenize_in_bracket(
-                        &hilighter,
-                        &mut LineData::from_str(s).unwrap(),
-                        &no_names(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        );
-        assert!(encoded.len() >= 6);
-        assert_eq!(encoded[5].delta_line, 2);
-        assert_eq!(encoded[5].delta_start, 0);
+        let h = Highlighter::new();
+        let per_line = ["これはテストです。", "", "これはテストです。"]
+            .iter()
+            .map(|s| tokenize_in_bracket(&h, &mut LineData::from_str(s).unwrap(), &no_names()))
+            .collect::<Vec<_>>();
+        let first_line_len = per_line[0].len();
+        let encoded = Highlighter::to_semantic_tokens(per_line);
+        assert_eq!(encoded.len(), first_line_len * 2, "{:?}", encoded);
+        // 2つ目の非空行(line_no=2)は空行(line_no=1)を挟むので、直前の非空トークンからの
+        // delta_line は2になる。
+        assert_eq!(encoded[first_line_len].delta_line, 2);
+        assert_eq!(encoded[first_line_len].delta_start, 0);
     }
 
     #[test]
     fn test_encode_semantic_tokens_preserves_length_type_modifier() {
-        let hilighter = Highlighter::new();
+        let h = Highlighter::new();
         let source = tokenize_in_bracket(
-            &hilighter,
+            &h,
             &mut LineData::from_str("これはテストです。").unwrap(),
             &no_names(),
         );
@@ -927,61 +965,77 @@ mod tests {
     /// "猫は" で形態素解析すると「猫(名詞)」「は(助詞)」に分かれることを利用する。
     #[test]
     fn test_particle_ha_is_skipped_outside_bracket() {
-        // 括弧内モードでは許可名一致以外すべて string に丸められる
+        // 通常モード(括弧外)では、許可名集合に無い名詞・助詞は無色トークンとして
+        // 一切生成されない。
         let h = Highlighter::new();
-        let tokens = tokenize_in_bracket(&h, &mut LineData::from_str("猫は").unwrap(), &no_names());
-        assert_eq!(tokens.len(), 2, "猫は should produce 2 token");
-        assert_eq!(tokens[0].token_type, SemanticTokenType::String as u32);
+        let tokens = tokenize(&h, &mut LineData::from_str("猫は").unwrap(), &no_names());
+        assert!(
+            tokens.is_empty(),
+            "猫は outside bracket should produce no tokens: {:?}",
+            tokens
+        );
     }
 
     #[test]
     fn test_bracket_open_and_close_are_comment() {
-        // 括弧開・括弧閉自体は括弧外扱いで "comment"
+        // 括弧開・括弧閉自体は "comment"、括弧内本体は "string"
         let h = Highlighter::new();
         let mut l = LineData::from_str("「テスト」").unwrap();
-        let tokens = h.tokenize(&mut l, &no_names());
-        // [「(comment), テスト(keyword/名詞), 」(comment)]
-        assert_eq!(tokens.len(), 3, "「テスト」 should produce 3 tokens");
+        let tokens = tokenize(&h, &mut l, &no_names());
+        // [「(comment), テスト(string), 」(comment)]
+        assert_eq!(
+            tokens.len(),
+            3,
+            "「テスト」 should produce 3 tokens: {:?}",
+            tokens
+        );
         assert_eq!(
             tokens[0].token_type,
             SemanticTokenType::Comment as u32,
-            "括弧開「 should be comment (bracket-external)"
+            "括弧開「 should be comment"
         );
-        assert_eq!(
-            l.tokens[0].tag,
-            TokenStatus::Normal,
-            "括弧開「 should be out of bracket"
-        );
+        assert_eq!(l.tokens[0].meaning, TokenMeaning::Bracket, "{:?}", l.tokens);
         assert_eq!(
             tokens[1].token_type,
             SemanticTokenType::String as u32,
-            "テスト(名詞,サ変接続) inside bracket should be string"
+            "テスト(名詞) inside bracket should be string"
         );
         assert_eq!(
-            l.tokens[1].tag,
-            TokenStatus::InBracket,
-            "テスト(名詞) should be inside bracket"
+            l.tokens[1].meaning,
+            TokenMeaning::InnerBracket,
+            "{:?}",
+            l.tokens
         );
         assert_eq!(
             tokens[2].token_type,
             SemanticTokenType::Comment as u32,
-            "括弧閉」 should be comment (bracket-external)"
+            "括弧閉」 should be comment"
         );
         assert_eq!(
-            l.tokens[2].tag,
-            TokenStatus::Normal,
-            "括弧閉」 should be out of bracket"
+            l.tokens[2].meaning,
+            TokenMeaning::BracketClose,
+            "{:?}",
+            l.tokens
         );
     }
 
     #[test]
     fn test_particle_inside_bracket_becomes_string() {
-        // 括弧内では _ カテゴリが "string" になる
+        // 括弧内では助詞も "string" になる。
         // "猫は" で「猫(名詞)」「は(助詞)」に分かれる → 括弧内の「は」が string になるか
         let h = Highlighter::new();
-        let tokens = h.tokenize(&mut LineData::from_str("「猫は」").unwrap(), &no_names());
-        // [「(comment), 猫(keyword), は(string), 」(comment)]
-        assert_eq!(tokens.len(), 4, "「猫は」 should produce 4 tokens");
+        let tokens = tokenize(
+            &h,
+            &mut LineData::from_str("「猫は」").unwrap(),
+            &no_names(),
+        );
+        // [「(comment), 猫(string), は(string), 」(comment)]
+        assert_eq!(
+            tokens.len(),
+            4,
+            "「猫は」 should produce 4 tokens: {:?}",
+            tokens
+        );
         assert_eq!(
             tokens[2].token_type,
             SemanticTokenType::String as u32,
@@ -990,125 +1044,741 @@ mod tests {
     }
 
     #[test]
+    fn test_uniform_coloring_in_bracket_matches_outside() {
+        // .md 向け: Uniform では括弧内外を区別せず塗る。
+        // "「猫は」" は 猫(名詞) と は(助詞) がどちらも許可名集合に無いため無色化され、
+        // 残るのは括弧記号2つ(comment)のみ。Distinct(従来の .txt 挙動)では4トークンのまま。
+        let h = Highlighter::new();
+        let tokens = tokenize_uniform(
+            &h,
+            &mut LineData::from_str("「猫は」").unwrap(),
+            &no_names(),
+        );
+        assert_eq!(tokens.len(), 2, "{:?}", tokens);
+        assert!(
+            tokens
+                .iter()
+                .all(|t| t.token_type == SemanticTokenType::Comment as u32),
+            "{:?}",
+            tokens
+        );
+
+        let distinct_tokens = tokenize(
+            &h,
+            &mut LineData::from_str("「猫は」").unwrap(),
+            &no_names(),
+        );
+        assert_eq!(
+            distinct_tokens.len(),
+            4,
+            "Distinct(.txt既定)は従来どおり4トークンのまま: {:?}",
+            distinct_tokens
+        );
+    }
+
+    #[test]
+    fn test_uniform_coloring_keeps_registered_name_keyword() {
+        // 許可名に登録した人名は Uniform の括弧内でも keyword のまま。
+        let h = Highlighter::new();
+        let allowed = HashSet::from(["田中".to_string()]);
+        let tokens = tokenize_uniform(&h, &mut LineData::from_str("「田中」").unwrap(), &allowed);
+        // [「(comment), 田中(keyword), 」(comment)]
+        assert_eq!(tokens.len(), 3, "{:?}", tokens);
+        assert_eq!(
+            tokens[1].token_type,
+            SemanticTokenType::Keyword as u32,
+            "{:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_uniform_coloring_does_not_change_meaning_tags() {
+        // 色分けだけが変わり、括弧の意味付け(補完モード判定が依存する Bracket/InnerBracket
+        // /BracketClose)自体は変化しないこと。
+        let h = Highlighter::new();
+        let mut line = LineData::from_str("「猫は」").unwrap();
+        let (_, end_state) = h.tokenize_with_state(
+            &mut line,
+            TokenStatus::Normal,
+            BracketColoring::Uniform,
+            &no_names(),
+        );
+        assert_eq!(end_state, TokenStatus::Normal);
+        assert_eq!(line.tokens[0].meaning, TokenMeaning::Bracket); // 「
+        assert_eq!(line.tokens[1].meaning, TokenMeaning::InnerBracket); // 猫
+        assert_eq!(line.tokens[2].meaning, TokenMeaning::InnerBracket); // は
+        assert_eq!(line.tokens[3].meaning, TokenMeaning::BracketClose); // 」
+    }
+
+    #[test]
     fn test_bracket_mode_persists_across_tokenize_calls() {
-        // 複数行にまたがる括弧で、深さを戻り値で次の行へ引き継ぐ
+        // 複数行にまたがる括弧で、状態を戻り値で次の行へ引き継ぐ
         let h = Highlighter::new();
         let names = no_names();
-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「猫").unwrap(), 0, &names); // 括弧開 → depth=1
-        assert_eq!(d, 1);
-        let (inside, d) =
-            h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d, &names); // 括弧内 → は が "string"
-        // [猫(keyword), は(string)]
+        let (_, s) = h.tokenize_with_state(
+            &mut LineData::from_str("「猫").unwrap(),
+            TokenStatus::Normal,
+            BracketColoring::Distinct,
+            &names,
+        ); // 括弧開 → InBracket
+        assert!(
+            matches!(s, TokenStatus::InBracket(brkt, _) if brkt == '「'),
+            "{:?}",
+            s
+        );
+
+        let (inside, s) = h.tokenize_with_state(
+            &mut LineData::from_str("猫は").unwrap(),
+            s,
+            BracketColoring::Distinct,
+            &names,
+        ); // 括弧内 → は が "string"
         assert_eq!(
             inside.len(),
             2,
-            "猫は inside bracket (cross-line) should produce 2 tokens"
+            "猫は inside bracket (cross-line) should produce 2 tokens: {:?}",
+            inside
         );
         assert_eq!(
             inside[1].token_type,
             SemanticTokenType::String as u32,
             "助詞 should be string when inside bracket across lines"
         );
-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d, &names); // 括弧閉 → depth=0
-        assert_eq!(d, 0);
-        let (outside, _) =
-            h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d, &names); // 括弧外 → は スキップ
+
+        let (_, s) = h.tokenize_with_state(
+            &mut LineData::from_str("」").unwrap(),
+            s,
+            BracketColoring::Distinct,
+            &names,
+        ); // 括弧閉 → Normal
+        assert_eq!(s, TokenStatus::Normal);
+
+        let (outside, _) = h.tokenize_with_state(
+            &mut LineData::from_str("猫は").unwrap(),
+            s,
+            BracketColoring::Distinct,
+            &names,
+        ); // 括弧外 → 無色化されトークンなし
         assert_eq!(
             outside.len(),
             0,
-            "猫は outside bracket should produce 1 token (猫 only)"
+            "猫は outside bracket should produce no tokens: {:?}",
+            outside
         );
     }
 
     #[test]
     fn test_nested_brackets_depth() {
-        // ネストした括弧でdepthが正しく管理される
+        // ネストした括弧([外側「」]の内側にもう一段開く)は現設計(TokenStatusは
+        // 単一レベル)では区別できず、内側の開き括弧は単なる本文(InnerBracket)として
+        // 扱われてしまう。それでも外側の「」自体の開閉は正しく追えるため、
+        // 外側の括弧が閉じるまでは string で塗られ続ける(この点だけを確認する)。
         let h = Highlighter::new();
         let names = no_names();
-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「").unwrap(), 0, &names); // depth=1
-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("「").unwrap(), d, &names); // depth=2
-        assert_eq!(d, 2);
-        let (inner, d) = h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d, &names); // depth=2 → は=string
-        assert_eq!(inner.len(), 2, "should be in bracket mode at depth 2");
-        assert_eq!(inner[1].token_type, SemanticTokenType::String as u32);
-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d, &names); // depth=1
-        let (still_inside, d) =
-            h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d, &names); // depth=1 → は=string
-        assert_eq!(
-            still_inside.len(),
-            2,
-            "should still be in bracket mode at depth 1"
+        let (_, s) = h.tokenize_with_state(
+            &mut LineData::from_str("「").unwrap(),
+            TokenStatus::Normal,
+            BracketColoring::Distinct,
+            &names,
         );
-        assert_eq!(still_inside[1].token_type, SemanticTokenType::String as u32);
-        let (_, d) = h.tokenize_with_depth(&mut LineData::from_str("」").unwrap(), d, &names); // depth=0
-        assert_eq!(d, 0);
-        let (outside, _) =
-            h.tokenize_with_depth(&mut LineData::from_str("猫は").unwrap(), d, &names); // depth=0 → は スキップ
-        assert_eq!(
-            outside.len(),
-            0,
-            "should be outside bracket mode at depth 0"
+        let (_, s) = h.tokenize_with_state(
+            &mut LineData::from_str("「").unwrap(),
+            s,
+            BracketColoring::Distinct,
+            &names,
         );
+        let (inner, _) = h.tokenize_with_state(
+            &mut LineData::from_str("猫は").unwrap(),
+            s,
+            BracketColoring::Distinct,
+            &names,
+        );
+        assert_eq!(inner.len(), 2, "should be in bracket mode at nested depth");
     }
 
     #[test]
-    fn test_ensure_bracket_depth_fast_path_and_fold() {
-        // 全行フォールド後は O(1) 高速パス(キャッシュ値がそのまま返る)。
+    fn test_ensure_line_state_folds_from_line0() {
         let h = Highlighter::new();
         let mut lines: Vec<LineData> = ["「セリフ１」", "「セリフ２"]
             .iter()
             .map(|s| LineData::from_str(s).unwrap())
             .collect();
 
-        // 行1(2行目)まで畳み込み: 行0 は閉じて depth=0、行1 は開きっぱなしで depth=1
-        assert_eq!(h.ensure_bracket_depth(&mut lines, 1), 1);
-        assert_eq!(lines[0].bracket_depth_after, Some(0));
-        assert_eq!(lines[1].bracket_depth_after, Some(1));
+        h.ensure_line_state(&mut lines, 1);
 
-        // キャッシュ済みなので再要求してもそのまま返る(高速パス)
-        assert_eq!(h.ensure_bracket_depth(&mut lines, 0), 0);
-        assert_eq!(h.ensure_bracket_depth(&mut lines, 1), 1);
+        // 行0は閉じて Normal、行1は開きっぱなしで InBracket('「', _) のまま終わる。
+        assert_eq!(lines[0].state_after, TokenStatus::Normal);
+        assert!(
+            matches!(&lines[1].state_after, TokenStatus::InBracket(brkt, _) if *brkt == '「'),
+            "{:?}",
+            lines[1].state_after
+        );
 
-        // 行0 の「セリフ１」中身は InBracket、行頭の「と行末の」は Normal(括弧外扱い)
-        assert_eq!(lines[0].tokens.first().unwrap().tag, TokenStatus::Normal);
+        // 行0 の「セリフ１」中身は InnerBracket、開き括弧「と閉じ括弧」は Bracket/BracketClose。
+        assert_eq!(
+            lines[0].tokens.first().unwrap().meaning,
+            TokenMeaning::Bracket
+        );
         assert!(
             lines[0]
                 .tokens
                 .iter()
                 .skip(1)
                 .take(lines[0].tokens.len() - 2)
-                .all(|t| t.tag == TokenStatus::InBracket),
+                .all(|t| t.meaning == TokenMeaning::InnerBracket),
             "{:?}",
             lines[0].tokens
         );
-        assert_eq!(lines[0].tokens.last().unwrap().tag, TokenStatus::Normal);
+        assert_eq!(
+            lines[0].tokens.last().unwrap().meaning,
+            TokenMeaning::BracketClose
+        );
     }
 
     #[test]
-    fn test_ensure_bracket_depth_refold_after_invalidation() {
-        // 陳腐化修復: 上方の行が変わって以降のキャッシュが None 化されたとき、
-        // 再フォールドで新しい深さ・タグに更新されること。
+    fn test_ensure_line_state_refold_after_invalidation() {
+        // 陳腐化修復: 上方の行が変わって以降のキャッシュが Undefined 化されたとき、
+        // 再フォールドで新しい meaning に更新されること。
         let h = Highlighter::new();
         let mut lines: Vec<LineData> = ["こんにちは。", "猫は"]
             .iter()
             .map(|s| LineData::from_str(s).unwrap())
             .collect();
-        assert_eq!(h.ensure_bracket_depth(&mut lines, 1), 0);
-        assert!(lines[1].tokens.iter().all(|t| t.tag == TokenStatus::Normal));
-
-        // 行0 を「こんにちは(開きっぱなし)へ編集 → apply_changes 相当の無効化
-        lines[0] = LineData::from_str("「こんにちは。").unwrap();
-        lines[1].bracket_depth_after = None; // 編集行以降の一括 None クリア相当
-
-        // 再フォールドすると行1 は括弧内になる(タグも InBracket に更新される)
-        assert_eq!(h.ensure_bracket_depth(&mut lines, 1), 1);
+        h.ensure_line_state(&mut lines, 1);
         assert!(
             lines[1]
                 .tokens
                 .iter()
-                .all(|t| t.tag == TokenStatus::InBracket),
+                .all(|t| t.meaning == TokenMeaning::Normal)
+        );
+
+        // 行0 を「こんにちは(開きっぱなし)へ編集 → apply_changes 相当の無効化
+        lines[0] = LineData::from_str("「こんにちは。").unwrap();
+        lines[1].state_after = TokenStatus::Undefined; // 編集行以降の一括クリア相当
+
+        // 再フォールドすると行1 は括弧内になる(meaning も InnerBracket に更新される)
+        h.ensure_line_state(&mut lines, 1);
+        assert!(
+            lines[1]
+                .tokens
+                .iter()
+                .all(|t| t.meaning == TokenMeaning::InnerBracket),
             "{:?}",
             lines[1].tokens
+        );
+    }
+
+    #[test]
+    fn test_ensure_line_state_fast_path_skips_refold() {
+        // state_after が解決済みの行は再畳み込みされない(高速パス)。
+        // 意図的に矛盾した状態を仕込み、それが保持されることで「呼ばれていない」ことを観測する。
+        let h = Highlighter::new();
+        let mut lines: Vec<LineData> = ["「セリフ", "猫は"]
+            .iter()
+            .map(|s| LineData::from_str(s).unwrap())
+            .collect();
+        h.ensure_line_state(&mut lines, 1); // 行1は括弧内 → InnerBracket
+
+        // 毒を仕込む: 行0のテキストは括弧を開いたままだが、状態だけ Normal と偽る。
+        lines[0].state_after = TokenStatus::Normal;
+
+        // 行1 は既に解決済みなので高速パスに入り、行0 の偽状態は参照されないはず。
+        h.ensure_line_state(&mut lines, 1);
+        assert!(
+            lines[1]
+                .tokens
+                .iter()
+                .all(|t| t.meaning == TokenMeaning::InnerBracket),
+            "解決済みの行は再畳み込みされないはず: {:?}",
+            lines[1].tokens
+        );
+        assert_eq!(
+            lines[0].state_after,
+            TokenStatus::Normal,
+            "先行行も再計算されないはず"
+        );
+    }
+
+    #[test]
+    fn test_ensure_line_state_resumes_from_previous_state() {
+        // 後方探索で見つかった解決済み行の state_after を起点に畳み込むこと
+        // (旧実装は start > 0 でも常に Normal 起点にフォールバックしていたバグの回帰防止)。
+        let h = Highlighter::new();
+        let mut lines: Vec<LineData> = ["「セリフ", "猫は"]
+            .iter()
+            .map(|s| LineData::from_str(s).unwrap())
+            .collect();
+        h.ensure_line_state(&mut lines, 0); // 行0のみ畳み込み(InBracketで終わる)
+        assert!(matches!(&lines[0].state_after, TokenStatus::InBracket(..)));
+        assert_eq!(lines[1].state_after, TokenStatus::Undefined);
+
+        h.ensure_line_state(&mut lines, 1); // start==1 で行0の状態を継承するはず
+        assert!(
+            lines[1]
+                .tokens
+                .iter()
+                .all(|t| t.meaning == TokenMeaning::InnerBracket),
+            "直前行の状態が引き継がれていない: {:?}",
+            lines[1].tokens
+        );
+        assert!(matches!(&lines[1].state_after, TokenStatus::InBracket(brkt, _) if *brkt == '「'));
+    }
+
+    #[test]
+    fn test_ensure_line_state_handles_empty_and_out_of_range() {
+        let h = Highlighter::new();
+        let mut empty: Vec<LineData> = vec![];
+        h.ensure_line_state(&mut empty, 0); // panicしないこと
+
+        let mut lines: Vec<LineData> = ["「セリフ１」", "「セリフ２"]
+            .iter()
+            .map(|s| LineData::from_str(s).unwrap())
+            .collect();
+        h.ensure_line_state(&mut lines, 999); // 範囲外はクランプされ、最終行まで畳み込まれる
+        assert!(
+            matches!(&lines[1].state_after, TokenStatus::InBracket(brkt, _) if *brkt == '「'),
+            "{:?}",
+            lines[1].state_after
+        );
+    }
+
+    #[test]
+    fn test_ruby_form_a_with_bar_coloring() {
+        // ｜かな《ルビ》: ｜/《/》がcomment、ルビ本体がstring
+        let h = Highlighter::new();
+        let tokens = tokenize(
+            &h,
+            &mut LineData::from_str("｜てー《撃て》").unwrap(),
+            &no_names(),
+        );
+        assert!(!tokens.is_empty(), "{:?}", tokens);
+        assert_eq!(
+            tokens.first().unwrap().token_type,
+            SemanticTokenType::Comment as u32,
+            "｜ should be comment: {:?}",
+            tokens
+        );
+        assert_eq!(
+            tokens.last().unwrap().token_type,
+            SemanticTokenType::Comment as u32,
+            "》 should be comment: {:?}",
+            tokens
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| t.token_type == SemanticTokenType::String as u32),
+            "ルビ本体がstringであるはず: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_ruby_excluded_from_bracket_depth() {
+        // 漢字《ルビ》は括弧(台詞)ではなくルビとして扱われ、Bracket/InnerBracket/BracketClose
+        // には分類されない。
+        let h = Highlighter::new();
+        let mut line = LineData::from_str("漢字《ルビ》").unwrap();
+        let (_, end_state) = h.tokenize_with_state(
+            &mut line,
+            TokenStatus::Normal,
+            BracketColoring::Distinct,
+            &no_names(),
+        );
+        assert_eq!(
+            end_state,
+            TokenStatus::Normal,
+            "ルビは行末で状態を残さないこと"
+        );
+        assert!(
+            line.tokens.iter().all(|t| !matches!(
+                t.meaning,
+                TokenMeaning::Bracket | TokenMeaning::InnerBracket | TokenMeaning::BracketClose
+            )),
+            "{:?}",
+            line.tokens
+        );
+    }
+
+    #[test]
+    fn test_non_ruby_bracket_still_comment_and_affects_depth() {
+        // 《強調》(行頭、親文字なし)は従来どおり普通の括弧として扱われる。
+        let h = Highlighter::new();
+        let mut line = LineData::from_str("《強調》").unwrap();
+        let (tokens, end_state) = h.tokenize_with_state(
+            &mut line,
+            TokenStatus::Normal,
+            BracketColoring::Distinct,
+            &no_names(),
+        );
+        assert_eq!(
+            end_state,
+            TokenStatus::Normal,
+            "開いて閉じるので最終状態はNormal"
+        );
+        assert_eq!(tokens[0].token_type, SemanticTokenType::Comment as u32); // 《
+        assert_eq!(
+            tokens.last().unwrap().token_type,
+            SemanticTokenType::Comment as u32
+        ); // 》
+        assert_eq!(
+            line.tokens[0].meaning,
+            TokenMeaning::Bracket,
+            "非ルビの《》は普通の括弧として扱われること: {:?}",
+            line.tokens
+        );
+    }
+
+    #[test]
+    fn test_ruby_body_stays_string_in_uniform_coloring() {
+        // .md(Uniform)でもルビ本体はstringのまま(括弧内外統一ルールの意図的な例外)。
+        // 親文字(漢字)の先頭トークンは `Ruby` 状態が base の先頭要素を「開き括弧枠」
+        // として扱う実装上、RubyBracket(comment)になる(base が本来のInBracketの
+        // 開き括弧ではなく漢字本文であるケースの既知の粗さ。ここでは現状の挙動を
+        // 固定してテストする)。
+        let h = Highlighter::new();
+        let tokens = tokenize_uniform(
+            &h,
+            &mut LineData::from_str("漢字《かんじ》").unwrap(),
+            &no_names(),
+        );
+        assert_eq!(tokens.len(), 4, "{:?}", tokens);
+        assert_eq!(
+            tokens[2].token_type,
+            SemanticTokenType::String as u32,
+            "ルビ本体はUniformでもstringのまま: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_ruby_inside_dialogue_does_not_increase_depth() {
+        // 「漢字《かんじ》だ」: 台詞の中にルビがあっても」で正しく閉じること。
+        let h = Highlighter::new();
+        let mut line = LineData::from_str("「漢字《かんじ》だ」").unwrap();
+        let (_, end_state) = h.tokenize_with_state(
+            &mut line,
+            TokenStatus::Normal,
+            BracketColoring::Distinct,
+            &no_names(),
+        );
+        assert_eq!(
+            end_state,
+            TokenStatus::Normal,
+            "」で閉じるので最終状態はNormal"
+        );
+    }
+
+    // --- parse_line_token の状態遷移網羅テスト ---
+    //
+    // Lindera の実際の分割結果に依存せず状態機械だけを検証するため、`line.tokens` へ
+    // 手組みのトークンを直接注入する。`parse_line_token` は `line.text`/`byte_start`/
+    // `byte_end` を一切参照しない(位置計算は呼び出し元の `tokenize_with_state` の仕事)
+    // ため、これらは全て 0 で構わない。
+    //
+    // 現状の実装をそのまま固定するテストであり、既知の未修正の粗さ(R1の項参照)も
+    // あえて期待値として書いている(修正はスコープ外、回帰検知のためだけに固定する)。
+
+    /// 品詞・細分類・表層形(=`details[6]`、状態機械が実際に見る値)だけを指定して
+    /// 手組みのトークンを作る。
+    fn mk(types: &str, subtypes: &str, surface: &str) -> CachedLinderaToken {
+        CachedLinderaToken {
+            details: [
+                types.to_string(),
+                subtypes.to_string(),
+                "*".to_string(),
+                "*".to_string(),
+                "*".to_string(),
+                "*".to_string(),
+                surface.to_string(),
+            ],
+            byte_start: 0,
+            byte_end: 0,
+            meaning: TokenMeaning::Normal,
+        }
+    }
+
+    /// `mk` に加えて `meaning` を明示指定する(状態のペイロードとして持たせる
+    /// 「既に分類済みのトークン」を組み立てるため)。
+    fn mk_with_meaning(
+        types: &str,
+        subtypes: &str,
+        surface: &str,
+        meaning: TokenMeaning,
+    ) -> CachedLinderaToken {
+        let mut t = mk(types, subtypes, surface);
+        t.meaning = meaning;
+        t
+    }
+
+    /// `TokenStatus` のバリアント名(+括弧文字+ペイロード件数)だけを文字列化する。
+    /// 中身のトークンの中身までは比較しない(件数だけで十分に遷移を区別できる)。
+    fn state_label(s: &TokenStatus) -> String {
+        match s {
+            TokenStatus::Normal => "Normal".to_string(),
+            TokenStatus::InBracket(c, inner) => format!("InBracket({c:?}, {}個)", inner.len()),
+            TokenStatus::InLine(c, inner) => format!("InLine({c:?}, {}個)", inner.len()),
+            TokenStatus::RubyBaseKanji(base) => format!("RubyBaseKanji({}個)", base.len()),
+            TokenStatus::RubyBaseBracket(base) => format!("RubyBaseBracket({}個)", base.len()),
+            TokenStatus::Ruby(base, ruby) => {
+                format!("Ruby(base={}個, ruby={}個)", base.len(), ruby.len())
+            }
+            TokenStatus::Undefined => "Undefined".to_string(),
+        }
+    }
+
+    /// `parse_line_token` が返す `results` を (表層形, meaning) の列へ変換する。
+    fn emitted(results: &[CachedLinderaToken]) -> Vec<(String, TokenMeaning)> {
+        results
+            .iter()
+            .map(|t| (t.details[6].clone(), t.meaning))
+            .collect()
+    }
+
+    /// 手組みトークン列を1回の `parse_line_token` 呼び出しに通す。
+    fn run(
+        h: &Highlighter,
+        initial: TokenStatus,
+        input: &[(&str, &str, &str)],
+    ) -> (Vec<CachedLinderaToken>, TokenStatus) {
+        let mut line = LineData::from_str("").unwrap();
+        line.tokens = input.iter().map(|(t, s, surf)| mk(t, s, surf)).collect();
+        h.parse_line_token(&mut line, initial)
+    }
+
+    #[test]
+    fn test_parse_line_token_state_transition_table() {
+        let h = Highlighter::new();
+
+        struct Case {
+            name: &'static str,
+            initial: TokenStatus,
+            input: Vec<(&'static str, &'static str, &'static str)>,
+            want_state: &'static str,
+            want_emitted: Vec<(&'static str, TokenMeaning)>,
+        }
+
+        let cases: Vec<Case> = vec![
+            Case {
+                name: "N1: Normal+記号,括弧開 → InBracket(単発呼び出しなので行末flush(E1)も同時に踏む)",
+                initial: TokenStatus::Normal,
+                input: vec![("記号", "括弧開", "「")],
+                want_state: "InBracket('「', 0個)",
+                want_emitted: vec![("「", TokenMeaning::Bracket)],
+            },
+            Case {
+                name: "N2: Normal+記号,一般(｜) → RubyBaseBracket",
+                initial: TokenStatus::Normal,
+                input: vec![("記号", "一般", "｜")],
+                want_state: "RubyBaseBracket(1個)",
+                want_emitted: vec![],
+            },
+            Case {
+                name: "N3: Normal+漢字 → RubyBaseKanji",
+                initial: TokenStatus::Normal,
+                input: vec![("名詞", "一般", "漢")],
+                want_state: "RubyBaseKanji(1個)",
+                want_emitted: vec![],
+            },
+            Case {
+                name: "N4: Normal+その他 → Normal(即出力)",
+                initial: TokenStatus::Normal,
+                input: vec![("助詞", "格助詞", "は")],
+                want_state: "Normal",
+                want_emitted: vec![("は", TokenMeaning::Normal)],
+            },
+            Case {
+                name: "B1: InBracket+対応する括弧閉 → Normal",
+                initial: TokenStatus::InBracket(
+                    '「',
+                    vec![
+                        mk_with_meaning("記号", "括弧開", "「", TokenMeaning::Bracket),
+                        mk_with_meaning("感嘆符", "*", "こんにちは", TokenMeaning::InnerBracket),
+                    ],
+                ),
+                input: vec![("記号", "括弧閉", "」")],
+                want_state: "Normal",
+                want_emitted: vec![
+                    ("「", TokenMeaning::Bracket),
+                    ("こんにちは", TokenMeaning::InnerBracket),
+                    ("」", TokenMeaning::BracketClose),
+                ],
+            },
+            Case {
+                name: "B2: InBracket+その他 → InBracket継続(単発呼び出しなのでE1も同時に踏む)",
+                initial: TokenStatus::InBracket(
+                    '「',
+                    vec![mk_with_meaning(
+                        "記号",
+                        "括弧開",
+                        "「",
+                        TokenMeaning::Bracket,
+                    )],
+                ),
+                input: vec![("名詞", "一般", "猫")],
+                want_state: "InBracket('「', 0個)",
+                want_emitted: vec![
+                    ("「", TokenMeaning::Bracket),
+                    ("猫", TokenMeaning::InnerBracket),
+                ],
+            },
+            Case {
+                name: "K1: RubyBaseKanji+漢字 → RubyBaseKanji継続",
+                initial: TokenStatus::RubyBaseKanji(vec![mk("名詞", "一般", "漢")]),
+                input: vec![("名詞", "一般", "字")],
+                want_state: "RubyBaseKanji(2個)",
+                want_emitted: vec![],
+            },
+            Case {
+                name: "K2: RubyBaseKanji+《 → Ruby",
+                initial: TokenStatus::RubyBaseKanji(vec![mk("名詞", "一般", "漢")]),
+                input: vec![("記号", "括弧開", "《")],
+                want_state: "Ruby(base=1個, ruby=1個)",
+                want_emitted: vec![],
+            },
+            Case {
+                name: "K3: RubyBaseKanji+その他 → Normal(バックトラック未実装、貯めた分をそのまま出力)",
+                initial: TokenStatus::RubyBaseKanji(vec![mk("名詞", "一般", "漢")]),
+                input: vec![("助詞", "格助詞", "は")],
+                want_state: "Normal",
+                want_emitted: vec![("漢", TokenMeaning::Normal), ("は", TokenMeaning::Normal)],
+            },
+            Case {
+                name: "P1: RubyBaseBracket+《 → Ruby",
+                initial: TokenStatus::RubyBaseBracket(vec![mk("記号", "一般", "｜")]),
+                input: vec![("記号", "括弧開", "《")],
+                want_state: "Ruby(base=1個, ruby=1個)",
+                want_emitted: vec![],
+            },
+            Case {
+                name: "P2: RubyBaseBracket+その他 → RubyBaseBracket継続",
+                initial: TokenStatus::RubyBaseBracket(vec![mk("記号", "一般", "｜")]),
+                input: vec![("名詞", "一般", "か")],
+                want_state: "RubyBaseBracket(2個)",
+                want_emitted: vec![],
+            },
+            Case {
+                name: "R1: Ruby+》 → Normal(既知の粗さ: base[0]は無条件でRubyBracket化される。\
+                    ｜形式ならbase[0]は本当に｜なので正しいが、漢字形式だと親文字自身が\
+                    RubyBracket=Comment色になってしまう。今回は修正せず現状の挙動を固定する)",
+                initial: TokenStatus::Ruby(
+                    vec![mk("記号", "一般", "｜")],
+                    vec![mk_with_meaning(
+                        "記号",
+                        "括弧開",
+                        "《",
+                        TokenMeaning::RubyBracket,
+                    )],
+                ),
+                input: vec![("名詞", "一般", "ル"), ("記号", "括弧閉", "》")],
+                want_state: "Normal",
+                want_emitted: vec![
+                    ("｜", TokenMeaning::RubyBracket),
+                    ("《", TokenMeaning::RubyBracket),
+                    ("ル", TokenMeaning::Ruby),
+                    ("》", TokenMeaning::RubyBracket),
+                ],
+            },
+            Case {
+                name: "R2: Ruby+その他 → Ruby継続",
+                initial: TokenStatus::Ruby(
+                    vec![mk("記号", "一般", "｜")],
+                    vec![mk_with_meaning(
+                        "記号",
+                        "括弧開",
+                        "《",
+                        TokenMeaning::RubyBracket,
+                    )],
+                ),
+                input: vec![("名詞", "一般", "ル")],
+                want_state: "Ruby(base=1個, ruby=2個)",
+                want_emitted: vec![],
+            },
+            Case {
+                name: "U1: InLine(未実装の状態)+何か → Undefined(warn!して打ち切り)",
+                initial: TokenStatus::InLine('x', vec![]),
+                input: vec![("名詞", "一般", "あ")],
+                want_state: "Undefined",
+                want_emitted: vec![],
+            },
+        ];
+
+        for c in cases {
+            let (results, state) = run(&h, c.initial, &c.input);
+            assert_eq!(state_label(&state), c.want_state, "{}: 状態", c.name);
+            let want_emitted: Vec<(String, TokenMeaning)> = c
+                .want_emitted
+                .iter()
+                .map(|(s, m)| (s.to_string(), *m))
+                .collect();
+            assert_eq!(emitted(&results), want_emitted, "{}: 出力", c.name);
+        }
+    }
+
+    // E1/E2(行をまたぐ持ち越し状態からの再開)は1回の parse_line_token 呼び出しでは
+    // 表現できない(2回連続で呼んで初めて意味を持つ)ため、テーブルとは別に検証する。
+
+    #[test]
+    fn test_parse_line_token_e1_resumes_persisted_bracket_across_calls() {
+        // 1回目: 「を開いて行末 → InBracket('「', 空)を持ち越す(E1)。
+        let h = Highlighter::new();
+        let (_, carried) = run(&h, TokenStatus::Normal, &[("記号", "括弧開", "「")]);
+        assert_eq!(state_label(&carried), "InBracket('「', 0個)");
+
+        // 2回目: 持ち越した状態から再開。1回目で確定済みの「自身はもう results に出ない
+        // (2回目の呼び出しでは新規トークンの分だけが出力される)ことを確認する。
+        let (results, state) = run(&h, carried, &[("名詞", "一般", "猫")]);
+        assert_eq!(state_label(&state), "InBracket('「', 0個)");
+        assert_eq!(
+            emitted(&results),
+            vec![("猫".to_string(), TokenMeaning::InnerBracket)]
+        );
+    }
+
+    #[test]
+    fn test_parse_line_token_e1b_resumes_persisted_bracket_across_calls() {
+        // 1回目: 「を開いて行末 → InBracket('「', 空)を持ち越す(E1)。
+        let h = Highlighter::new();
+        let (result, carried) = run(
+            &h,
+            TokenStatus::Normal,
+            &[("記号", "括弧開", "「"), ("感動詞", "*", "こんにちは")],
+        );
+        assert_eq!(state_label(&carried), "InBracket('「', 0個)");
+        assert_eq!(
+            emitted(&result),
+            vec![
+                ("「".to_string(), TokenMeaning::Bracket),
+                ("こんにちは".to_string(), TokenMeaning::InnerBracket)
+            ]
+        );
+
+        // 2回目: 持ち越した状態から再開。1回目で確定済みの「自身はもう results に出ない
+        // (2回目の呼び出しでは新規トークンの分だけが出力される)ことを確認する。
+        let (results, state) = run(&h, carried, &[("記号", "括弧閉", "」")]);
+        assert_eq!(state_label(&state), "Normal");
+        assert_eq!(
+            emitted(&results),
+            vec![("」".to_string(), TokenMeaning::BracketClose)]
+        );
+    }
+
+    #[test]
+    fn test_parse_line_token_e2_resumes_persisted_ruby_base_across_calls() {
+        // 1回目: 漢字1文字だけで行末 → RubyBaseKanji を持ち越す(確定しない=無出力)。
+        let h = Highlighter::new();
+        let (results1, carried) = run(&h, TokenStatus::Normal, &[("名詞", "一般", "漢")]);
+        assert_eq!(state_label(&carried), "RubyBaseKanji(1個)");
+        assert!(results1.is_empty(), "確定前は無出力: {:?}", results1);
+
+        // 2回目: 持ち越した親文字が、次の行の《で正しくルビ確定フローへ合流すること。
+        let (results2, state) = run(&h, carried, &[("記号", "括弧開", "《")]);
+        assert_eq!(state_label(&state), "Ruby(base=1個, ruby=1個)");
+        assert!(
+            results2.is_empty(),
+            "まだ》が来ていないので無出力: {:?}",
+            results2
         );
     }
 }

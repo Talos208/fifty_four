@@ -14,7 +14,7 @@ use crate::writing_agent::{AgentError, ClaudeAgent, WritingAgent};
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
     InitializeResponse, LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, SessionCapabilities, SessionId,
+    NewSessionResponse, PromptRequest, PromptResponse, /*SessionCapabilities,*/ SessionId,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, StopReason, UsageUpdate,
 };

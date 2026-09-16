@@ -2,41 +2,83 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use tracing::instrument;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum TokenStatus {
     Normal,
-    InBracket,
+    InBracket(char, Vec<CachedLinderaToken>),
+    #[allow(unused)]
+    InLine(char, Vec<CachedLinderaToken>),
+    RubyBaseKanji(Vec<CachedLinderaToken>),
+    RubyBaseBracket(Vec<CachedLinderaToken>),
+    Ruby(Vec<CachedLinderaToken>, Vec<CachedLinderaToken>),
+
+    Undefined,
 }
 
 impl Debug for TokenStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TokenStatus::Normal => write!(f, "Normal"),
-            TokenStatus::InBracket => write!(f, "InBracket"),
+            TokenStatus::InBracket(brkt, value) => write!(f, "InBracket({brkt}): {:?}", value),
+            TokenStatus::InLine(brkt, value) => write!(f, "InLine({brkt}): {:?}", value),
+            TokenStatus::RubyBaseKanji(base) => write!(f, "RubyBase1: {:?}", base),
+            TokenStatus::RubyBaseBracket(base) => write!(f, "RubyBase2: {:?}", base),
+            TokenStatus::Ruby(base, ruby) => write!(f, "Ruby: {:?}({:?})", base, ruby),
+            TokenStatus::Undefined => write!(f, "Undefined"),
         }
     }
 }
 
+impl TokenStatus {
+    /// 畳み込み済み(この行の終端状態が信頼できる)か
+    pub fn is_resolved(&self) -> bool {
+        !matches!(self, TokenStatus::Undefined)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TokenMeaning {
+    Normal,
+    Bracket,
+    InnerBracket,
+    #[allow(unused)]
+    InnerLine,
+    BracketClose,
+    RubyBracket,
+    RubyBody,
+    Ruby,
+
+    Characters,
+}
+
 /// Linderaトークンの必要情報をOwned形式でキャッシュするための型。
 /// tagはclassify_cached_tokens()によって設定される。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedLinderaToken {
-    /// 品詞情報（details[0]="名詞", details[1]="固有名詞", ...）
-    pub details: Vec<String>,
+    pub details: [String; 7], // 品詞情報（details[0]="品詞", [1]="細分類1", [2]="細分類2", [3]="細分類3", [4]="活用形", [5]="活用型", [6]="原形"）
     pub byte_start: usize,
     pub byte_end: usize,
-    pub tag: TokenStatus,
+    pub meaning: TokenMeaning,
     // TODO line_noも記録したほうがいいかも
+}
+
+impl CachedLinderaToken {
+    pub fn meaning(&self, types: TokenMeaning) -> Self {
+        CachedLinderaToken {
+            meaning: types,
+            details: self.details.clone(),
+            ..*self
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LineData {
     pub text: String,
     pub tokens: Vec<CachedLinderaToken>,
-    /// この行の処理を終えた時点での括弧ネスト深さ。None = 未計算/無効化済み。
-    /// 前方の全行に依存する累積量のため、編集時は編集行以降を一括で None にすること
-    /// (`apply_changes` 参照)。
-    pub bracket_depth_after: Option<u32>,
+    /// この行を処理し終えた時点のトークナイザ状態。
+    /// 前方の全行に依存する累積量のため、編集時は編集行以降を一括で `Undefined` にする
+    pub state_after: TokenStatus,
 }
 
 impl FromStr for LineData {
@@ -47,7 +89,7 @@ impl FromStr for LineData {
         Ok(Self {
             text: text.to_string(),
             tokens: Vec::new(),
-            bracket_depth_after: None,
+            state_after: TokenStatus::Undefined,
         })
     }
 }
@@ -85,6 +127,12 @@ pub fn utf16_to_byte_offset(text: &str, utf16_offset: usize) -> usize {
 /// 算出する際、`&text[..byte_offset]` を渡して使う。
 pub fn utf16_len(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
+}
+
+use unicode_script::{Script, UnicodeScript};
+
+pub fn is_kanji_all(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.script() == Script::Han)
 }
 
 /// カーソル位置によるcompletion プロンプト分類

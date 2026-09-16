@@ -1,4 +1,4 @@
-use crate::types::{CachedLinderaToken, CursorContext, LineData, TokenStatus};
+use crate::types::{CachedLinderaToken, CursorContext, LineData, TokenMeaning};
 use dashmap::DashMap;
 #[allow(unused_imports)]
 use log::{debug, error, trace};
@@ -7,12 +7,20 @@ use std::cmp::min;
 use tower_lsp_server::lsp_types::{Position, Range};
 use tracing::instrument;
 
+/// ルビ記号(`｜`/`《`/`》`)は台詞の括弧・文末とは無関係なので、台詞内外・文境界の
+/// 判定対象から除外する(`highlight::TokenRole` 参照)。
 fn is_bracket_open(token: &CachedLinderaToken) -> bool {
-    token.details[0] == "記号" && token.details.get(1).map(|s| s.as_str()) == Some("括弧開")
+    // token.details[0] == "記号"
+    //     && token.details.get(1).map(|s| s.as_str()) == Some("括弧開")
+    //     && token.meaning != TokenMeaning::RubyBracket
+    token.meaning == TokenMeaning::Bracket
 }
 
 fn is_bracket_close(token: &CachedLinderaToken) -> bool {
-    token.details[0] == "記号" && token.details.get(1).map(|s| s.as_str()) == Some("括弧閉")
+    // token.details[0] == "記号"
+    //     && token.details.get(1).map(|s| s.as_str()) == Some("括弧閉")
+    //     && token.meaning != TokenMeaning::RubyBracket
+    token.meaning == TokenMeaning::BracketClose
 }
 
 fn is_sentence_end(token: &CachedLinderaToken) -> bool {
@@ -57,7 +65,6 @@ fn before_token(
     mut tokenize_line_no: impl FnMut(&mut LineData),
     predicate: impl Fn(CachedLinderaToken) -> bool,
 ) -> (usize, usize, Option<CachedLinderaToken>) {
-    debug!("before_tkn");
     let mut tkn_ix = token_index as i64;
     let mut ln = line_no as i64;
 
@@ -91,7 +98,6 @@ fn next_token(
     mut tokenize_line_no: impl FnMut(&mut LineData),
     predicate: impl Fn(CachedLinderaToken) -> bool,
 ) -> Option<CachedLinderaToken> {
-    debug!("next_token");
     let mut tkn_ix: i64 = token_index as i64;
     let mut ln = line_no;
 
@@ -133,10 +139,9 @@ pub fn classify_complesion_mode(
 
     cursor_tkn.as_ref().inspect(|t| {
         trace!(
-            "current: {:?},{:?},{:?}",
+            "current: {:?},{:?}",
             t.details[6].as_str(),
             t.details[0..=3].to_vec(),
-            t.tag
         )
     });
 
@@ -147,19 +152,16 @@ pub fn classify_complesion_mode(
 
     before_tkn.as_ref().inspect(|t| {
         trace!(
-            "before: {:?},{:?},{:?}",
+            "before: {:?},{:?}",
             t.details[6].as_str(),
             t.details[0..=3].to_vec(),
-            t.tag
         )
     });
 
-    // tag ~~ とdepth ~~ を使って括弧の内外を判定
-    // - tag == InBracket: 通常のトークンが括弧内にある
-    // - is_bracket_open: 開き括弧の直後（自身はNormalだが直後は括弧内）
-    // - depth > 0: ネストした括弧閉の直後でまだ外側の括弧内にいる場合
+    // meaningを使って括弧の内外を判定
+    // `BracketClose` は常に「外へ抜けた」ことを意味するので括弧外
     let in_bracket = if let Some(tkn) = before_tkn.as_ref() {
-        tkn.tag == TokenStatus::InBracket || is_bracket_open(tkn)
+        tkn.meaning == TokenMeaning::InnerBracket || tkn.meaning == TokenMeaning::Bracket
     } else {
         false
     };
@@ -300,8 +302,6 @@ fn cursor_tkn(
     utf16_offset: usize,
     tokenize_line_no: &mut impl FnMut(&mut LineData),
 ) -> (usize, usize, Option<CachedLinderaToken>) {
-    debug!("cursor_tkn");
-
     let find_result =
         token_at(texts, line_no, utf16_offset, tokenize_line_no).map(|(ix, tkn)| (ix, Some(tkn)));
 
@@ -322,6 +322,7 @@ fn cursor_tkn(
 
 fn is_end_of_sentence(tkn: &CachedLinderaToken) -> bool {
     tkn.details[0] == "記号"
+        && tkn.meaning != TokenMeaning::RubyBracket
         && match tkn.details.get(1).map(|s| s.as_str()) {
             Some("句点") | //=> true,
             Some("括弧閉") => true,
@@ -527,7 +528,7 @@ mod tests {
     use crate::cursor_context::classify_complesion_mode;
     use crate::cursor_context::token_at;
     use crate::highlight::Highlighter;
-    use crate::types::{CursorContext, LineData};
+    use crate::types::{CursorContext, LineData, TokenMeaning, TokenStatus};
     use dashmap::DashMap;
     use tower_lsp_server::lsp_types::{Position, Range};
     // use indoc::indoc;
@@ -553,18 +554,24 @@ mod tests {
         }
 
         fn tokenize(&self, line: &mut LineData) {
-            self.hl.tokenize(line, &std::collections::HashSet::new());
+            self.hl.tokenize_with_state(
+                line,
+                TokenStatus::Normal,
+                crate::highlight::BracketColoring::Distinct,
+                &std::collections::HashSet::new(),
+            );
         }
 
         /// 本番(completion)と同じ手順で分類する:
-        /// カーソル行まで括弧深さを畳み込んでから classify_complesion_mode を呼ぶ。
+        /// カーソル行までトークナイザ状態を畳み込んでから classify_complesion_mode を呼ぶ。
         fn classify(
             &self,
             texts: &mut Vec<LineData>,
             line_no: usize,
             offset: usize,
+            // proc: impl FnMut(&mut LineData),
         ) -> CursorContext {
-            self.hl.ensure_bracket_depth(texts.as_mut_slice(), line_no);
+            self.hl.ensure_line_state(texts.as_mut_slice(), line_no);
             classify_complesion_mode(texts, line_no, offset, |line| self.tokenize(line))
         }
     }
@@ -587,6 +594,32 @@ mod tests {
         assert_eq!(
             td.classify(&mut text, 2, 1),
             CursorContext::AfterClosingBracket
+        );
+    }
+
+    #[test]
+    fn ruby_after_kanji_is_not_after_closing_bracket() {
+        // 漢字《かんじ》の直後は、ルビの》が台詞の閉じ括弧と誤認されず AfterClosingBracket にならない。
+        let mut texts = lines("漢字《かんじ》");
+        let td = TestData::new();
+        let offset = texts[0].text.chars().count();
+        assert_ne!(
+            td.classify(&mut texts, 0, offset),
+            CursorContext::AfterClosingBracket,
+            "ルビの》はAfterClosingBracketと誤認されないこと"
+        );
+    }
+
+    #[test]
+    fn ruby_inside_dialogue_keeps_in_bracket_other() {
+        // 台詞中のルビの直後にカーソルがあっても、台詞の中(InBracketOther)のまま。
+        let mut texts = lines("「セリフ漢字《かんじ》");
+        let td = TestData::new();
+        let offset = texts[0].text.chars().count();
+        assert_eq!(
+            td.classify(&mut texts, 0, offset),
+            CursorContext::InBracketOther,
+            "ルビの直後でも台詞の中のままであること"
         );
     }
 
@@ -672,10 +705,23 @@ mod tests {
         let td = TestData::new();
         // カーソルは1行目の末尾
         let offset = "「こんにちは".chars().count();
-        assert_eq!(
-            td.classify(&mut text, 0, offset),
-            CursorContext::BeforeClosingBracket
-        );
+
+        let mut carry = text[0].state_after.clone();
+
+        // classify()が複数行に対応していないので開いて直書き
+        td.hl.ensure_line_state(text.as_mut_slice(), 1);
+        let result = classify_complesion_mode(text.as_mut_slice(), 0, offset, |line| {
+            let (_, next) = td.hl.tokenize_with_state(
+                line,
+                carry.clone(),
+                crate::highlight::BracketColoring::Distinct,
+                &std::collections::HashSet::new(),
+            );
+            // キャプチャしたcarryで状態を次の行に渡す
+            carry = next;
+        });
+
+        assert_eq!(result, CursorContext::BeforeClosingBracket);
     }
 
     #[test]
@@ -714,7 +760,10 @@ mod tests {
 
     #[test]
     fn nested_brackets() {
-        // 「『内側』|外側」 → depth=1なのでInBracketOther
+        // 「『内側』|外側」: TokenStatusは単一レベルでネストを追跡しないため、
+        // 内側の『』は単なる本文(InnerBracket)として扱われる。それでも外側の「」の
+        // 開閉自体は正しく追えるので、カーソル直前が外側の閉じ括弧の手前であることは
+        // 正しく判定できる。
         let mut text = lines("「『内側』外側」");
         let td = TestData::new();
         let offset = "「『内側』外側".chars().count();
@@ -726,8 +775,8 @@ mod tests {
 
     #[test]
     fn after_nested_inner_close() {
-        // 「『内側』|」 → depth=1, lastが括弧閉(内側の)だが外側はまだ開いている
-        // → next_significantが」 → BeforeClosingBracket
+        // 「『内側』|」: 内側の』は単なる本文(InnerBracket)として畳み込まれるため、
+        // 外側の「」の開閉判定には影響しない。
         let mut text = lines("「『内側』」");
         let td = TestData::new();
         assert_eq!(td.classify(&mut text, 0, 0), CursorContext::Other);
@@ -886,16 +935,16 @@ mod tests {
 
     #[test]
     fn test_token_at_utf16_supplementary() {
-        use crate::types::{CachedLinderaToken, TokenStatus};
+        use crate::types::CachedLinderaToken;
         // サロゲートペア文字「𠮷」(U+20BB7, 4バイト/2 UTF-16単位)を含む行で、
         // Position.character(UTF-16コード単位)が正しくバイト位置へ変換されること。
         // Linderaの補助面文字の分割挙動に依存しないよう、トークンは手組みで与える。
         let mut texts = lines("𠮷田中");
         texts[0].tokens = vec![CachedLinderaToken {
-            details: vec!["名詞".to_string()],
+            details: ["名詞", "固有名詞", "人名", "姓", "", "", "田中"].map(|i| i.to_string()),
             byte_start: 4, // "田中" (𠮷=4バイトの直後)
             byte_end: 10,
-            tag: TokenStatus::Normal,
+            meaning: TokenMeaning::Normal,
         }];
         let mut noop = |_line: &mut LineData| {};
 
@@ -1158,6 +1207,17 @@ mod tests {
         let td = TestData::new();
         let r = sentence_range(&td, &mut text, 0, 0);
         let end = "これは文章。".chars().count() as u32;
+        assert_eq!(r, Range::new(Position::new(0, 0), Position::new(0, end)));
+    }
+
+    #[test]
+    fn test_sentence_range_not_split_by_ruby() {
+        // ルビの》は文末記号として扱われないため、ルビを挟んだ一文全体が範囲になる。
+        let mut text = lines("漢字《かんじ》を読んだ。次の文。");
+        let td = TestData::new();
+        let offset = "漢字《かんじ》を".chars().count();
+        let r = sentence_range(&td, &mut text, 0, offset);
+        let end = "漢字《かんじ》を読んだ。".chars().count() as u32;
         assert_eq!(r, Range::new(Position::new(0, 0), Position::new(0, end)));
     }
 }

@@ -111,12 +111,12 @@ pub(crate) fn apply_changes<T: AsRef<str>>(lines: &mut Vec<LineData>, text: T, r
     let end = end_line.min(lines.len() - 1);
     lines.splice(start_line..=end, new_lines);
 
-    // 括弧深さは前方の全行に依存する累積量。編集行以降のキャッシュを無効化する。
-    // (新規行は from_str の時点で None。既存の後続行に残る陳腐化した Some をここで落とす。
-    //  Option への None 代入だけなので、行数が多くてもコストは無視できる)
+    // トークナイザ状態は前方の全行に依存する累積量。編集行以降のキャッシュを無効化する。
+    // (新規行は from_str の時点で Undefined。既存の後続行に残る陳腐化した状態をここで落とす
+    //  meaning は再畳み込み時に parse_line_token が上書きする)
     let clear_from = start_line.min(lines.len());
     for l in lines[clear_from..].iter_mut() {
-        l.bracket_depth_after = None;
+        l.state_after = crate::types::TokenStatus::Undefined;
     }
 }
 
@@ -124,6 +124,7 @@ pub(crate) fn apply_changes<T: AsRef<str>>(lines: &mut Vec<LineData>, text: T, r
 mod tests {
     use super::*;
     use crate::highlight::Highlighter;
+    use crate::types::TokenStatus;
     use indoc::indoc;
     use tower_lsp_server::lsp_types::Position;
 
@@ -324,7 +325,12 @@ mod tests {
         let hl = Highlighter::new();
         // 各行とも括弧は行内で閉じるので、深さ0起点の行単位 tokenize で足りる
         ls.iter_mut().for_each(|l| {
-            hl.tokenize(l, &std::collections::HashSet::new());
+            hl.tokenize_with_state(
+                l,
+                TokenStatus::Normal,
+                crate::highlight::BracketColoring::Distinct,
+                &std::collections::HashSet::new(),
+            );
         });
 
         assert_eq!(ls.len(), 2);

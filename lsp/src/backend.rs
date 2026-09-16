@@ -253,8 +253,8 @@ fn build_semantic_tokens(
     is_md: bool,
     allowed: &HashSet<String>,
 ) -> Option<Vec<SemanticToken>> {
-    // 共有ストアの行を直接更新する(get_mut)。深さを 0 から畳み込みながら全行を
-    // 処理することで、各行の tag / bracket_depth_after キャッシュが書き戻され、
+    // 共有ストアの行を直接更新する(get_mut)。行0の Normal から畳み込みながら全行を
+    // 処理することで、各行の tokens[].meaning / state_after が書き戻され、
     // 以降の completion がそのまま再利用できる(陳腐化キャッシュもここで修復される)。
     let mut lines = text.get_mut(uri)?;
 
@@ -274,14 +274,24 @@ fn build_semantic_tokens(
         std::collections::HashMap::new()
     };
 
-    let mut depth = 0u32;
+    // `.md`(設定・メモ)は括弧を台詞ではなく注釈として使うため、括弧内外を区別せず
+    // 常に括弧外基準(classify_normal)で塗る。`.txt`(原稿本文)は従来どおり括弧内を
+    // 台詞として別配色にする。
+    let coloring = if is_md {
+        crate::highlight::BracketColoring::Uniform
+    } else {
+        crate::highlight::BracketColoring::Distinct
+    };
+
+    let mut state = crate::types::TokenStatus::Normal;
     let mut per_line = Vec::with_capacity(lines.len());
     for (line_no, line) in lines.iter_mut().enumerate() {
-        // 深さの畳み込み(tag/bracket_depth_after キャッシュの書き戻し)は見出し行でも
+        // 状態の畳み込み(tokens[].meaning / state_after の書き戻し)は見出し行でも
         // 必ず行う。返す通常トークン列だけを見出し行では捨てて装飾用の1トークンに
         // 差し替える。
-        let (toks, d) = highlighter.tokenize_with_depth(line, depth, allowed);
-        depth = d;
+        let (toks, s) = highlighter.tokenize_with_state(line, state, coloring, allowed);
+        line.state_after = s.clone();
+        state = s;
 
         match heading_levels.get(&line_no) {
             Some(&level) => {
@@ -330,8 +340,6 @@ impl LanguageServer for Backend {
     ) -> tower_lsp_server::jsonrpc::Result<InitializeResult> {
         // サーバの機能（capabilities）を構成します。
         // ここでは最小限として semanticTokens の提供（空実装）を宣言します。
-        debug!("initialize");
-
         if let Some(ws) = _param.workspace_folders {
             debug!("Workspace: {:?}", ws);
             self.init_workspace(ws).await;
@@ -1489,11 +1497,11 @@ impl LanguageServer for Backend {
                 TryResult::Present(t) => t,
             };
 
-            // カーソル行までの括弧深さを畳み込み、0..=line_no のトークン tag を確定させる。
-            // これにより classify_complesion_mode の in_bracket 判定(tag == InBracket)が
-            // 行をまたぐ台詞でも正しく機能する。
+            // カーソル行までトークナイザ状態を畳み込み、0..=line_no の meaning を確定させる。
+            // これにより classify_complesion_mode の括弧内判定が行をまたぐ台詞でも
+            // 正しく機能する。
             self.highlighter
-                .ensure_bracket_depth(tmp.as_mut_slice(), line_no);
+                .ensure_line_state(tmp.as_mut_slice(), line_no);
 
             let highlighter = &self.highlighter;
             let context = crate::cursor_context::classify_complesion_mode(
@@ -3022,5 +3030,34 @@ mod tests {
             tokens[0].token_type,
             crate::highlight::SemanticTokenType::Type as u32
         );
+    }
+
+    #[test]
+    fn test_build_semantic_tokens_uniform_coloring_for_md_only() {
+        // .md(is_md=true)は括弧内外を区別せず塗るため、未登録名の台詞行はほぼ無彩色化
+        // (括弧記号2つの comment のみ)される。.txt(is_md=false)は従来どおり括弧内を
+        // 台詞として塗るため、より多くのトークンが出る。
+        let highlighter = Highlighter::new();
+        let allowed = HashSet::new();
+
+        let md_text: DashMap<String, Vec<LineData>> = DashMap::new();
+        md_text.insert("file:///memo.md".to_string(), vec![line("「猫は」")]);
+        let md_tokens =
+            build_semantic_tokens(&md_text, &highlighter, "file:///memo.md", true, &allowed)
+                .expect("did_open 済み");
+
+        let txt_text: DashMap<String, Vec<LineData>> = DashMap::new();
+        txt_text.insert("file:///honbun.txt".to_string(), vec![line("「猫は」")]);
+        let txt_tokens = build_semantic_tokens(
+            &txt_text,
+            &highlighter,
+            "file:///honbun.txt",
+            false,
+            &allowed,
+        )
+        .expect("did_open 済み");
+
+        assert_eq!(md_tokens.len(), 2, "{:?}", md_tokens);
+        assert_eq!(txt_tokens.len(), 4, "{:?}", txt_tokens);
     }
 }

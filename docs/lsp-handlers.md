@@ -623,6 +623,43 @@ DashMap<uri, (JobKey, RunningJob)>`、判定は `code_action::decide_job`):
   状態)は見出し行でも通常通り計算してから、返すトークン列だけを差し替える。見出し行に
   括弧が紛れ込んでいてもキャッシュが壊れないようにするため。
 
+## 括弧内外の色分け方針(semantic_tokens_full)
+
+`highlight.rs::tokenize_with_depth` は括弧の内外で品詞→色種別の写像を分けており
+(`classify_normal`/`classify_bracket`)、`.txt`(原稿本文)では括弧内を台詞として
+別配色にする。一方 `.md`(`characters.md`/`plot.md` 等の設定・メモ)では括弧は台詞
+ではなく単なる注釈のため、`build_semantic_tokens`(`backend.rs`)は `is_md` に応じて
+`BracketColoring::Uniform`(常に `classify_normal` 基準、括弧内外を区別しない)/
+`BracketColoring::Distinct`(従来どおり括弧内は `classify_bracket`)を切り替えて渡す。
+括弧深さの**タグ付け**(`tag_line_depth`)自体はどちらのモードでも変わらず、補完
+モード判定(`cursor_context::classify_complesion_mode`)への影響は無い。
+
+## ルビ記法のハイライト(semantic_tokens_full)
+
+青空文庫形式のルビ記法 `｜単語《ルビ》`(形式A)・`漢字単語《ルビ》`(形式B、直前が
+漢字の連なりなら `｜` を省略できる)を検出し、ルビ記号(`｜`・`《`・`》`)を
+`operator`、ルビ本体を `string` として色分けする。判定は `ruby::scan_ruby`
+(行テキストの字句スキャンのみ、形態素解析には依存しない)が行い、青空文庫の慣習に
+従って**直前が漢字または対応する `｜` がある場合のみ**ルビと判定する。それ以外の
+`《…》`(行頭の `《強調》`、句読点直後、ひらがな直後など)は従来どおり普通の括弧として
+扱う(`extension/languages/fiftyfour/config.toml` で `《》` は括弧ペアとして登録済みで、
+引用・強調用途と共存させる必要があるため)。
+
+- `Highlighter::text_to_lindera_token` がトークン化のたびに `scan_ruby` を呼び、各
+  トークンの範囲がルビのどの部分に当たるかを `CachedLinderaToken::role`
+  (`types::TokenRole`)に確定させる。`tag`(`TokenStatus`、括弧ネスト深さ由来)とは
+  別軸のフィールドであることに注意。
+- ルビと判定された `《》` は `tag_line_depth` の括弧ネスト深さのカウントから**除外**する。
+  ルビは台詞の開始/終了ではないため、除外しないと台詞中のルビでネスト深さが余分に
+  +1/-1 されてしまう。
+- `cursor_context.rs` の `is_bracket_open`/`is_bracket_close`/`is_end_of_sentence` は
+  `role == RubyMarker` のトークンを判定対象から除外している。これが無いとルビの `》` が
+  「台詞の閉じ括弧」「文の終わり」と誤認され、補完モード判定(`classify_complesion_mode`)や
+  `sentence_range_at` の文範囲がルビで分断されてしまう。
+- ルビの色分けは `BracketColoring`(前節)や括弧内外の `tag` より**常に優先**される。
+  `.md` の `BracketColoring::Uniform` でもルビ本体は `string` のまま —
+  括弧内テキストではなくルビという独立した構文要素だから、という意図的な例外。
+
 ## 内部処理（LSP ハンドラ外）
 
 | 関数 | 呼び出し元 | 役割 |
