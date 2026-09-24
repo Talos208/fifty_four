@@ -3,7 +3,6 @@ use http::uri;
 use std::env;
 #[cfg(feature = "otel")]
 use std::{eprintln, time::Duration};
-use tracing::instrument;
 
 #[cfg(feature = "otel")]
 use opentelemetry_sdk::{
@@ -24,7 +23,6 @@ pub struct Logger {
 impl Logger {
     /// `acp` は ACP モード(`--acp`)かどうか。otel 有効時、`service.name` を
     /// LSP/ACP で分けるのに使う(otel 無効時は無視する)。
-    #[instrument]
     pub fn new(acp: bool) -> Self {
         #[cfg(feature = "otel")]
         {
@@ -274,11 +272,43 @@ fn prepare_network_tracing(acp: bool) -> Logger {
         .with(otel_trace_layer)
         .init();
 
+    // panicをotel_log_layer経由でOtelへも送る
+    // subscriberの init 後でないと届かないので、この位置に
+    install_otel_panic_hook(logger_provider.clone());
+
     Logger {
         tracer_provider,
         logger_provider,
         meter_provider,
     }
+}
+
+/// panic発生時、その内容(メッセージ・発生位置)を `tracing::error!` として発行し、Otelへ送る。
+///
+/// panic直後にプロセスが異常終了するとバッチエクスポータの周期フラッシュを待てないため、
+/// ログ発行後に明示的に `force_flush` する。
+#[cfg(feature = "otel")]
+fn install_otel_panic_hook(logger_provider: Option<SdkLoggerProvider>) {
+    // 既存のhookも処理する
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+
+        let location = info.location();
+        let file = location.map(|l| l.file()).unwrap_or("unknown");
+        let line = location.map(|l| l.line()).unwrap_or(0);
+
+        // ファイル名、行番号の名前はOtelに合わせる
+        tracing::error!(
+            target: "panic",
+            { log.file = file, log.line = line },
+            "{}", info.payload_as_str().unwrap_or_default()
+        );
+
+        if let Some(provider) = &logger_provider {
+            let _ = provider.force_flush();
+        }
+    }));
 }
 
 /// 秒精度(UTC)の時刻フォーマッタ。背景は `docs/observability.md` 参照
