@@ -69,6 +69,22 @@ stderr にも OTel にも一切出なくなる（実際にこの不具合が起�
 `agent_servers` の `env` に設定していれば、それは尊重されて上書きされない
 （`docs/acp-agent.md` の該当セクション参照）。
 
+## レベルフィルタ（OTel 送出）
+
+`otel_filter()` は **`RUST_LOG` の値を一切見ず、常に TRACE まで送出する**
+（ノイズ抑制の対象を除く。下記参照）。
+
+以前は `EnvFilter::builder().with_default_directive(LevelFilter::INFO.into()).from_env_lossy()`
+で `RUST_LOG` 任せにしていたが、`RUST_LOG=fifty_four_lsp=trace` を指定しても
+TRACE が出ないことがあった。原因は `log::` マクロ側にある: `tracing-subscriber` の
+`init()` は `tracing-log` feature 経由で `tracing_log::LogTracer` を自動初期化し、
+その際 `log::set_max_level()` を「グローバル subscriber 全体の
+`EnvFilter::max_level_hint()`」に合わせて設定する。この合成された実効レベルが
+低いと、`log::trace!`（このリポジトリの `trace!` はほぼ全て `log` クレート由来、
+`tracing::trace!` ではない）系のマクロ呼び出しがそもそも `log` の時点で
+弾かれ、`tracing` 側にすら伝わらない。`RUST_LOG` の内容や複数レイヤの合成に
+左右されず確実に出すため、`EnvFilter::new("trace")` で固定している。
+
 ## ノイズ抑制
 
 `suppress_transport_noise()` が以下を常に抑制する（stderr・OTel 向けレイヤ共通）:
@@ -136,10 +152,55 @@ tokio::spawn(fut);
 新しく spawn するコードを書く際は、spawn 先の関数が `#[instrument]` されているなら
 同様の対応が必要かどうか確認すること。
 
+## panic の Otel 送出
+
+panic は stdio（JSON-RPC チャネル）にも Zed のログにも残らないため、`prepare_network_tracing()`
+が `install_otel_panic_hook()` で panic hook を設置し、`tracing::error!(target: "panic", ...)`
+として `otel_log_layer` 経由で Otel へ送る（デフォルトの panic 出力はそのまま残す）。
+`tracing_subscriber::registry()...init()` の**後**に設置しないとイベントが届かないため、
+その順序に依存する。
+
+panic 直後にプロセスが異常終了するとバッチエクスポータの周期フラッシュを待てないため、
+ログ発行後に `logger_provider.force_flush()` を明示的に呼ぶ。
+
+**発生位置は `log.file`/`log.line` という独自フィールドで送る。**
+`tracing` のマクロは `file!()`/`line!()` をコンパイル時に静的展開するため、
+`meta.file()/line()`(`opentelemetry-appender-tracing` が `code.filepath`/`code.lineno` へ
+マッピングする値)は常にこのフック自身の呼び出し箇所を指してしまい、実際のpanic発生位置には
+ならない。そのため `PanicHookInfo::location()` から実際の発生位置を取り出し、別名の
+フィールドとして明示的に付与している。ドット付きフィールド名を並べたままメッセージ文字列
+(`"{}", info`)を続けると `tracing::error!` のマクロパーサが "local ambiguity" で構文解析に
+失敗するため、`{ log.file = file, log.line = line }` のように `{ .. }` でフィールドを
+明示的にブロック化している(`error!` マクロが `target: .., { フィールド… }, メッセージ`
+という中括弧区切りの構文を別途サポートしているため)。
+
+ACP モード (debug ビルド) には別途 `main.rs` の `install_acp_panic_hook()` があり
+（`logs/acp_panic.log` へファイル追記）、こちらは `Logger::new()` の後に設置されるため、
+両方の panic hook が(`take_hook`/`set_hook` のチェーンで)両方とも効く。
+
+## Otelへ送出されず終了する経路(既知の制約)
+
+panic 以外にも「Otel へ何も送出せずプロセスが終了する経路」がないか調査した結果を記録する。
+
+1. **シグナル/強制終了**(SIGINT/SIGTERM、Windows の Ctrl+Close イベント等):
+   コードベースにハンドラが一切無く、受信時は OS のデフォルト処理で即終了する
+   (`Logger::drop()` の shutdown も panic hook も実行されない)。
+   → **意図的に対応しない**。クライアントアプリでのシグナル/強制終了はユーザー起因で
+   発生源が分かっており、ログが無いと原因不明になるケースではないため。
+2. **`std::process::exit` の直接呼び出し**: 本稿執筆時点で `main.rs` に 2 箇所あるが、
+   いずれも `Logger` 生成前、または明示的に `drop(_log)` してから呼んでおり問題ない。
+   ただし `process::exit` は Drop を一切実行しないため、将来同様の呼び出しを追加する際は
+   `Logger` の生存期間と shutdown 順序を必ず確認すること。
+3. **OOM・二重 panic**: Rust の既定挙動で abort するため対処が現実的でない
+   (OOM ハンドラのカスタマイズは nightly 限定、二重 panic は極めて稀)。
+4. メインタスクの通常 panic は `panic = "abort"` の設定が無い(既定の unwind)ため、
+   `async_main` 内での unwind により `_log: Logger` の Drop が正しく呼ばれ、既に安全。
+   `tokio::spawn` された別タスクの panic は上記のグローバルな panic hook で既にカバー済み。
+
 ## 関連ファイル
 
 - `lsp/src/logging.rs` — 本ドキュメントが説明する実装本体
-- `lsp/src/main.rs` — `default_acp_log_level()`（ACP 用 `RUST_LOG` 既定値）
+- `lsp/src/main.rs` — `default_acp_log_level()`（ACP 用 `RUST_LOG` 既定値）、`install_acp_panic_hook()`
 - `docs/acp-agent.md` — ACP エージェント固有のログ確認手順
 
 

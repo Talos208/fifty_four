@@ -26,6 +26,7 @@ mod outline;
 mod plot;
 mod plot_sync;
 mod progress;
+mod quality;
 mod references;
 #[cfg(debug_assertions)]
 mod session_log;
@@ -214,10 +215,7 @@ fn append_to_acp_panic_log(line: &str) {
 #[tokio::main]
 #[instrument]
 async fn async_main(acp: bool) {
-    // ロガー/トレーサの設置はここに一本化する。以前は ACP 分岐の手前で
-    // env_logger を無条件初期化していたため、Logger::new() 内の
-    // tracing_subscriber 初期化(内部で LogTracer::init() を呼ぶ)がグローバル
-    // ロガーの二重設定で失敗し、OTel パイプラインが一度も設置されていなかった。
+    // ロガー/トレーサの設置はここに一本化。
     // ACP 経路も計装対象にするため、分岐より前に置く。
     let _log = Logger::new(acp);
 
@@ -226,12 +224,10 @@ async fn async_main(acp: bool) {
         {
             install_acp_panic_hook();
             if let Err(e) = acp::run().await {
-                // 設定不備などはここで落ちる。Zed のログに理由が残るよう stderr にも出す。
-                error!("{}", e);
+                // 設定不備などZed のログに理由が残るよう stderr にも出す
                 eprintln!("fifty_four_lsp --acp: {}", e);
-                // std::process::exit はデストラクタを実行しない。ここで明示的に
-                // Logger を drop してバッチ済みのログ/スパンを送出させてから終了する
-                // (でないと、一番見たいはずの落ちた瞬間の記録が丸ごと消える)。
+                error!("{}", e);
+                // 明示的にLogger を drop してバッチ済みのログ/スパンを送出させる
                 drop(_log);
                 std::process::exit(1);
             }
@@ -245,11 +241,9 @@ async fn async_main(acp: bool) {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    // LspService を構築し、`Backend` をクライアントハンドルで初期化する
     info!("initialize lsp service");
     let (service, socket) = tower_lsp_server::LspService::build(Backend::new).finish();
 
-    // サーバを起動してクライアントとのメッセージループを開始する
     info!("start server");
 
     tower_lsp_server::Server::new(stdin, stdout, socket)

@@ -34,6 +34,11 @@ use tracing::instrument;
 /// `documentSelector` はこれと一致していないとどのバッファにもマッチしない。
 pub(crate) const LANGUAGE_ID: &str = "fiftyfour";
 
+/// `did_change` を検知してから `quality` 診断を実行するまでの既定の待ち時間。
+/// `plot_sync::DEFAULT_PLOT_SYNC_IDLE_MS`(1500ms、破壊的なファイルリネームを伴うため長め)
+/// より短くし、タイピング追従と再解析コストのバランスを取る。
+const DEFAULT_QUALITY_IDLE_MS: u64 = 800;
+
 /// `Backend` はサーバの状態を保持する構造体です。
 ///
 /// 現在は `Client` を保持しており、サーバからクライアントへログや通知を送信する際に使用します。
@@ -77,6 +82,16 @@ pub(crate) struct Backend {
     // クライアントが WorkspaceEdit.document_changes 経由の ResourceOp::Rename をサポートするか
     // (initialize で判定。false ならリネームは tokio::fs::rename にフォールバックする)
     client_supports_rename_resource_op: std::sync::atomic::AtomicBool,
+    // URI ごとの文章品質診断(`quality`)の debounce世代カウンタ。詳細は `note_quality_change` 参照。
+    quality_generations: DashMap<String, Arc<parking_lot::Mutex<u64>>>,
+    quality_enabled: std::sync::atomic::AtomicBool,
+    quality_idle_ms: std::sync::atomic::AtomicU64,
+    // true なら `.md` も診断対象にする(既定は `.txt` 原稿本文のみ)
+    quality_include_md: std::sync::atomic::AtomicBool,
+    // サーバー自身が `apply_edit` で書き換えた直後の URI 集合。クライアントからのエコーである
+    // 次の `did_change` を通常の debounce ではなく即時実行に切り替えるための目印。
+    // 詳細は `execute_command`/`note_quality_change` 参照。
+    quality_fast_track: DashMap<String, ()>,
 }
 
 /// サーバの capabilities を組み立てる。`Backend`(`Client` を保持する)から独立した
@@ -326,6 +341,93 @@ fn build_semantic_tokens(
     )
 }
 
+/// `quality` モジュールの解析本体。`note_quality_change`/`run_quality_now` の両方から呼ぶ
+/// 自由関数(`refresh_highlight_names_with` と同じ理由で `&Backend` を持ち込めない
+/// detached task から呼べるようにするため)。
+///
+/// `Highlighter::ensure_line_state` でトークン状態を畳み込んでから `quality::analyze_document`
+/// に渡す(`quality` モジュール冒頭のドキュメント参照)。
+#[instrument(skip(text, highlighter, client))]
+async fn run_quality_analysis(
+    text: &DashMap<String, Vec<LineData>>,
+    highlighter: &Highlighter,
+    client: &Client,
+    uri: &Uri,
+) {
+    let Some(mut lines) = text.get_mut(uri.as_str()) else {
+        debug!("quality[{}]: 未オープンの URI", uri.as_str());
+        return;
+    };
+    if lines.is_empty() {
+        return;
+    }
+    let last = lines.len() - 1;
+    highlighter.ensure_line_state(&mut lines, last);
+
+    let config = crate::quality::QualityConfig::default();
+    let report = crate::quality::analyze_document(&lines, &config);
+    // 範囲に紐づかない文体統計(名詞率/MVR/文長分散等)は診断化せず、デバッグログにのみ残す
+    // (将来レポート表示を足すまでの暫定。`quality::stats::DocStats` 参照)。
+    debug!("quality[{}]: stats={:?}", uri.as_str(), report.stats);
+    let diagnostics = findings_to_diagnostics(&report.findings, &lines);
+    drop(lines);
+
+    client.publish_diagnostics(uri.clone(), diagnostics, None).await;
+}
+
+/// `quality::Finding` を LSP の `Diagnostic` へ変換する。
+/// バイトオフセット→UTF-16 コード単位の変換は `crate::types::utf16_len` に委ねる。
+fn findings_to_diagnostics(
+    findings: &[crate::quality::Finding],
+    lines: &[LineData],
+) -> Vec<Diagnostic> {
+    findings
+        .iter()
+        .map(|f| Diagnostic {
+            range: finding_range_to_lsp(f.range, lines),
+            severity: Some(match f.severity {
+                crate::quality::Severity::Warning => DiagnosticSeverity::WARNING,
+                crate::quality::Severity::Information => DiagnosticSeverity::INFORMATION,
+                crate::quality::Severity::Hint => DiagnosticSeverity::HINT,
+            }),
+            code: Some(NumberOrString::String(f.rule.code().to_string())),
+            code_description: None,
+            source: Some("fifty-four quality".to_string()),
+            message: f.message.clone(),
+            related_information: None,
+            tags: None,
+            data: None,
+        })
+        .collect()
+}
+
+/// `quality::FindingRange`(行番号+バイトオフセット)を LSP の `Range`(UTF-16)へ変換する。
+///
+/// ルールが不正なバイトオフセット(範囲外・文字境界の途中)を返してもスライスで panic しないよう、
+/// 長さと文字境界の両方へクランプする。
+fn finding_range_to_lsp(r: crate::quality::FindingRange, lines: &[LineData]) -> Range {
+    let start_text = lines.get(r.start_line).map(|l| l.text.as_str()).unwrap_or("");
+    let end_text = lines.get(r.end_line).map(|l| l.text.as_str()).unwrap_or("");
+    let clamp = |text: &str, byte: usize| {
+        let mut b = byte.min(text.len());
+        while !text.is_char_boundary(b) {
+            b -= 1;
+        }
+        b
+    };
+    Range {
+        start: Position {
+            line: r.start_line as u32,
+            character: crate::types::utf16_len(&start_text[..clamp(start_text, r.start_byte)])
+                as u32,
+        },
+        end: Position {
+            line: r.end_line as u32,
+            character: crate::types::utf16_len(&end_text[..clamp(end_text, r.end_byte)]) as u32,
+        },
+    }
+}
+
 /// `LanguageServer` トレイトの実装。
 ///
 /// ここでは最小限のメソッドのみ実装しており、将来的にホバーや補完などを追加できます。
@@ -461,6 +563,33 @@ impl LanguageServer for Backend {
                     .load(std::sync::atomic::Ordering::Relaxed),
             );
 
+            if let Some(q) = opt.get("quality") {
+                debug!("quality config found: {:?}", q);
+                if q.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+                    self.quality_enabled
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(v) = q.get("idle_ms").and_then(|v| v.as_u64()) {
+                    self.quality_idle_ms
+                        .store(v, std::sync::atomic::Ordering::Relaxed);
+                }
+                if q.get("include_md").and_then(|v| v.as_bool()) == Some(true) {
+                    self.quality_include_md
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else {
+                debug!("no quality config; using defaults");
+            }
+            debug!(
+                "quality effective: enabled={} idle_ms={} include_md={}",
+                self.quality_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.quality_idle_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.quality_include_md
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+
             if let Some(llm_root) = opt.get("llm") {
                 // 旧形式互換: llm:{provider,...} → ondemand として扱う。
                 // 新形式は llm:{ondemand:{...}, deferred:{...}}。
@@ -591,6 +720,9 @@ impl LanguageServer for Backend {
             .collect();
         self.update_all(params.text_document.uri.as_str(), 0, texts);
 
+        // quality: 開いた直後に一度、debounce を待たず診断する。
+        self.run_quality_now(&params.text_document.uri).await;
+
         // plot_sync: baseline(ディスク上の .txt 群と一致していると信じる章名の並び)を開いた時点の内容で種付けする。
         if self
             .plot_md_workspace(&params.text_document.uri)
@@ -635,6 +767,9 @@ impl LanguageServer for Backend {
         if uri.ends_with(".txt") {
             let _ = self.client.inlay_hint_refresh().await;
         }
+
+        // quality: 保存は「編集の確定」の明確なシグナルなので、debounce を待たず即座に診断し直す。
+        self.run_quality_now(&params.text_document.uri).await;
 
         // plot_sync: 保存は「編集の確定」の明確なシグナルなので、debounce を待たず即座に章名変更を判定・実行する。
         if let Some(ws) = self.plot_md_workspace(&params.text_document.uri).await {
@@ -851,6 +986,7 @@ impl LanguageServer for Backend {
                     .collect(),
             );
             self.note_plot_change(&param.text_document.uri).await;
+            self.note_quality_change(&param.text_document.uri).await;
             return;
         }
 
@@ -876,6 +1012,7 @@ impl LanguageServer for Backend {
             .await;
 
         self.note_plot_change(&param.text_document.uri).await;
+        self.note_quality_change(&param.text_document.uri).await;
 
         let _ = self.client.semantic_tokens_refresh().await;
     }
@@ -883,6 +1020,15 @@ impl LanguageServer for Backend {
     #[instrument(ret, skip(self))]
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         debug!("file closed!");
+
+        // quality: 閉じたタブに古い波線を残さない。
+        self.quality_generations
+            .remove(params.text_document.uri.as_str());
+        self.quality_fast_track
+            .remove(params.text_document.uri.as_str());
+        self.client
+            .publish_diagnostics(params.text_document.uri.clone(), Vec::new(), None)
+            .await;
 
         self.text.remove(params.text_document.uri.as_str());
         self.update_states.remove(params.text_document.uri.as_str());
@@ -1982,8 +2128,14 @@ impl LanguageServer for Backend {
             )])),
             ..Default::default()
         };
+        // quality: このあと来るはずの(クライアントからのエコー)`did_change` を、
+        // 通常の debounce ではなく即時実行に切り替える目印を立てておく。
+        // このAI書き直しは「指示に従って」内容を確定させた編集であり、そこに残る古い
+        // 指摘がそのまま数百msも表示され続けるのは不自然なため。
+        self.quality_fast_track.insert(uri.to_string(), ());
         if let Err(err) = self.client.apply_edit(edit).await {
             error!("execute_command: apply_edit failed: {:?}", err);
+            self.quality_fast_track.remove(uri);
         }
 
         Ok(None)
@@ -2079,6 +2231,11 @@ impl Backend {
                 crate::plot_sync::DEFAULT_PLOT_SYNC_IDLE_MS,
             ),
             client_supports_rename_resource_op: std::sync::atomic::AtomicBool::new(false),
+            quality_generations: DashMap::new(),
+            quality_enabled: std::sync::atomic::AtomicBool::new(true),
+            quality_idle_ms: std::sync::atomic::AtomicU64::new(DEFAULT_QUALITY_IDLE_MS),
+            quality_include_md: std::sync::atomic::AtomicBool::new(false),
+            quality_fast_track: DashMap::new(),
         }
     }
 
@@ -2517,6 +2674,91 @@ impl Backend {
         .await;
     }
 
+    /// `quality` 診断の対象拡張子かどうか。既定は `.txt`(原稿本文)のみ。
+    /// `.md`(設定・メモ)は `quality_include_md` を立てない限り対象外
+    /// (文章作法ルールが無意味に鳴ってしまうため)。
+    #[instrument(skip(self))]
+    fn is_quality_target(&self, uri: &Uri) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(path) = uri.to_file_path() else {
+            return false;
+        };
+        match path.extension().and_then(|e| e.to_str()) {
+            Some(ext) if ext.eq_ignore_ascii_case("txt") => true,
+            Some(ext) if ext.eq_ignore_ascii_case("md") => self.quality_include_md.load(Relaxed),
+            _ => false,
+        }
+    }
+
+    /// `uri` の `quality` debounce世代カウンタを取得する。無ければ0で新規作成する。
+    fn quality_generation(&self, uri: &Uri) -> Arc<parking_lot::Mutex<u64>> {
+        self.quality_generations
+            .entry(uri.as_str().to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(0)))
+            .clone()
+    }
+
+    /// `did_change` から呼ぶ。世代を進めて detached task を spawn するだけで、
+    /// 実際の解析・publishDiagnostics はタイマー満了後に行う(`plot_sync::note_plot_change` と同じ方針)。
+    ///
+    /// ただし `quality_fast_track` に印が付いている URI(直前に `execute_command` 等で
+    /// サーバー自身が `apply_edit` した直後のエコー)は debounce を待たず即時実行する。
+    /// AIによる書き直しの直後、古い指摘がそのまま800ms残って見えるのは不自然なため
+    /// (`execute_command` 参照)。
+    #[instrument(skip(self))]
+    async fn note_quality_change(&self, uri: &Uri) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // 対象外 URI でも印を残さないよう、早期 return より先に消費する
+        let fast_track = self.quality_fast_track.remove(uri.as_str()).is_some();
+        if !self.quality_enabled.load(Relaxed) || !self.is_quality_target(uri) {
+            return;
+        }
+        let gen_cell = self.quality_generation(uri);
+        let generation = {
+            let mut g = gen_cell.lock();
+            *g += 1;
+            *g
+        };
+        let idle = if fast_track {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_millis(self.quality_idle_ms.load(Relaxed))
+        };
+        let text = self.text.clone();
+        let highlighter = self.highlighter.clone();
+        let client = self.client.clone();
+        let uri = uri.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(idle).await;
+            if *gen_cell.lock() != generation {
+                debug!(
+                    "quality: superseded by a later change, skip (uri={})",
+                    uri.as_str()
+                );
+                return;
+            }
+            run_quality_analysis(&text, &highlighter, &client, &uri).await;
+        });
+    }
+
+    /// `did_open`/`did_save` から呼ぶ。debounce を待たず即座に診断する。
+    #[instrument(skip(self))]
+    async fn run_quality_now(&self, uri: &Uri) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.quality_enabled.load(Relaxed) || !self.is_quality_target(uri) {
+            return;
+        }
+        // 直後に来るかもしれない debounce 済みタスクが、この即時実行より古い結果で
+        // 上書きしないよう世代を進めておく。
+        {
+            let gen_cell = self.quality_generation(uri);
+            let mut g = gen_cell.lock();
+            *g += 1;
+        }
+        run_quality_analysis(&self.text, &self.highlighter, &self.client, uri).await;
+    }
+
     /// plot_sync の逆方向本体。plot.md 内の `old_name` 見出しを1件だけ特定し、章名部分だけを
     /// `new_name` に書き換える(装飾・行末コメントを保つため行全体は作り直さない)。
     /// plot.md が開いていれば `apply_edit`、開いていなければサーバーが直接読み書きする。
@@ -2928,6 +3170,29 @@ mod tests {
 
     fn line(text: &str) -> LineData {
         text.parse().unwrap()
+    }
+
+    /// 回帰: 末尾が「で終わる文書(閉じ括弧なし)で bracket_mismatch の範囲が
+    /// マルチバイト文字の途中を指し、finding_range_to_lsp のスライスで panic していた。
+    #[test]
+    fn test_unclosed_bracket_finding_does_not_panic() {
+        let h = Highlighter::new();
+        let mut lines = vec![line("「閉じられない台詞")];
+        let mut state = crate::types::TokenStatus::Normal;
+        for l in &mut lines {
+            let (_t, s) = h.tokenize_with_state(
+                l,
+                state,
+                crate::highlight::BracketColoring::Distinct,
+                &HashSet::new(),
+            );
+            state = s;
+        }
+        let findings = crate::quality::bracket_mismatch(&lines);
+        assert_eq!(findings.len(), 1);
+        let diags = findings_to_diagnostics(&findings, &lines);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].range.start.character < 9, "{:?}", diags[0].range);
     }
 
     #[test]

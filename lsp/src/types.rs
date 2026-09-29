@@ -55,7 +55,11 @@ pub enum TokenMeaning {
 /// tagはclassify_cached_tokens()によって設定される。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedLinderaToken {
-    pub details: [String; 7], // 品詞情報（details[0]="品詞", [1]="細分類1", [2]="細分類2", [3]="細分類3", [4]="活用形", [5]="活用型", [6]="原形"）
+    // 品詞情報（details[0]="品詞", [1]="細分類1", [2]="細分類2", [3]="細分類3", [4]="活用型", [5]="活用形", [6]="原形"）。
+    // 実測(lindera 2.3.2 + embed-ipadic)では [4] に「五段・ラ行」等の活用型、[5] に「未然形」等の
+    // 活用形が入る(quality::sentence::STok::conj_form 参照)。よく見る「活用形→活用型」の順の
+    // 資料もあるが、この実装が実際に受け取る並びはこちら。
+    pub details: [String; 7],
     pub byte_start: usize,
     pub byte_end: usize,
     pub meaning: TokenMeaning,
@@ -133,6 +137,16 @@ use unicode_script::{Script, UnicodeScript};
 
 pub fn is_kanji_all(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.script() == Script::Han)
+}
+
+/// 1文字が漢字(Han)かどうか。`quality` モジュールの文字種ラン検出で使う。
+pub fn is_han_char(c: char) -> bool {
+    c.script() == Script::Han
+}
+
+/// 1文字がひらがなかどうか。`quality` モジュールの文字種ラン検出で使う。
+pub fn is_hiragana_char(c: char) -> bool {
+    c.script() == Script::Hiragana
 }
 
 /// カーソル位置によるcompletion プロンプト分類

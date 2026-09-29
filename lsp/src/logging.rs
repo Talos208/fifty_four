@@ -106,18 +106,14 @@ fn suppress_transport_noise(filter: EnvFilter) -> EnvFilter {
         .add_directive("opentelemetry_sdk=warn".parse().unwrap())
 }
 
-/// OTel エクスポータ用レイヤ限定のフィルタ。上記に加え `reqwest`/`opentelemetry` も外すのは、
-/// 「エクスポート → そのログもエクスポート」というフィードバックループを断つため
-/// (stderr はどこにも再送されないのでこの心配は無い)。
+/// OTel エクスポータ用レイヤ限定のフィルタ。`RUST_LOG` の値に関わらず常に TRACE まで通す
+///  `reqwest`/`opentelemetry` を外すのは、「エクスポート → そのログもエクスポート」
+/// というフィードバックループを断つため(stderr はどこにも再送されないのでこの心配は無い)。
 #[cfg(feature = "otel")]
 fn otel_filter() -> EnvFilter {
-    suppress_transport_noise(
-        EnvFilter::builder()
-            .with_default_directive(LevelFilter::INFO.into())
-            .from_env_lossy(),
-    )
-    .add_directive("reqwest=off".parse().unwrap())
-    .add_directive("opentelemetry=off".parse().unwrap())
+    suppress_transport_noise(EnvFilter::new("trace"))
+        .add_directive("reqwest=off".parse().unwrap())
+        .add_directive("opentelemetry=off".parse().unwrap())
 }
 
 /// `RUST_LOG=off`(または `fifty_four_lsp=off` 等)でログ出力が明示的に無効化されて
