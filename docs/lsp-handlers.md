@@ -438,6 +438,54 @@ WARN を出している処理)が壊している。
 
 LM Studio 側の不具合が直れば、コード変更なしにこのオプトアウトを外すだけで有効化できる。
 
+##### LLM-JP 系の対応状況(2026-10 時点、LM Studio 実機で確認)
+
+| モデル(LM Studio の id / GGUF 配布元) | 応答 | 複数 system | 構造化出力 | ツール呼び出し |
+|---|---|---|---|---|
+| `llm-jp-4.1-8b-thinking`(llm-jp 公式) | ✗ 全リクエスト 500(下記) | — | — | — |
+| `llm-jp-4-8b-thinking`(llm-jp 公式) | ✗ 同上 | — | — | — |
+| `llm-jp-4-8b-instruct`(mmnga-o) | ○ | 2つ目以降が捨てられる → 連結で解決 | ○ | ✗ LM Studio は `tool_use` を報告するが、実際はツールを呼ばず本文に JSON を書く → 自動で外す |
+| `llm-jp-3-3.7b-instruct`(alfredplpl) | ○ | 2つ目以降が捨てられる → 連結で解決 | ✗ 400(下記)→ 自動で外す | ✗ ツールを呼ばず本文で断る → 自動で外す |
+| `llm-jp-3.1-1.8b-function-calling`(aipib) | ○ | 同上 | ✗ 同上 | ✗ 同上(function-calling 微調整版でも呼ばない) |
+
+「自動で外す」は `apply_lmstudio_known_quirks` による補正で、LMStudio の capability 自動推定時のみ
+適用する(明示 `capabilities` は上書きしない)。`tool_calling` の無いモデルには tools 宣言自体を
+送らない。ツールが必須のプロンプトは frontmatter に `tools: required` と書くと、非対応モデルでは
+送信前にエラーで止まる(`docs/data-layer.md` 参照)。
+
+**LLM-JP-3 / 3.1 系**: HF 上の公式 chat_template は system の中身を描画せず固定文
+「以下は、タスクを説明する指示です。…」に置き換える。テンプレートから検出できれば
+(`template_drops_system_content`)、または LMStudio でモデル名に `llm-jp-3` を含めば
+`NO_SYSTEM_ROLE` を立て、system(システムプロンプト+キャッシュ文脈)を最初の user
+メッセージへ入れて送る。明示 `capabilities` でも `no_system_role` を指定できる。
+また `json_schema` を付けると LM Studio が
+`Failed to initialize samplers: Unexpected empty grammar stack after accepting piece` の 400 を返す
+(配布元の異なる 3 と 3.1 で同じトークンで失敗するのでトークナイザ由来)。この本文は
+自己修復リトライの検出対象外のため、自動推定時は `structured_output` を外して
+プロンプト埋め込みへ倒す(明示指定は上書きしない)。
+
+**LLM-JP-4 / 4.1 系**の chat_template は gpt-oss 系の Harmony 形式
+(`chat_format=llm-jp-harmony-v1`)で、Qwen3 系とは次の点が異なる。
+
+- **思考量は `enable_thinking` ではなく文字列の `reasoning_effort`(low/medium/high、既定 medium)**で
+  制御し、思考を無効化できない。`reasoning_level()` は `chat_template_kwargs` に
+  `enable_thinking` と `reasoning_effort` を両方積む(Jinja は未参照の kwargs を無視するため、
+  どちらの方式のテンプレートでも効く)。`0.0` は Harmony 側では最小の `low` になる。
+- **system は `messages[0]` しか描画されない**(2つ目以降の system は黙って捨てられる)。
+  このため `LlmClient` はシステムプロンプトとキャッシュ文脈(characters.md 等)を常に
+  1本の system に連結して送る。
+- LM Studio の `publisher/id` から HuggingFace を引くと GGUF ではなく元の safetensors リポジトリ
+  (`llm-jp/llm-jp-4.1-8b-thinking`)に当たり、`gguf.chat_template` が無い。HF プローブは
+  `config.chat_template_jinja` / `config.tokenizer_config.chat_template` にもフォールバックする。
+
+**既知の不具合(llama.cpp 側の修正待ち)**: 現行の LM Studio では thinking 版
+(`llm-jp-4-8b-thinking` / `llm-jp-4.1-8b-thinking`、公式 GGUF, Q4_K_M)がストリーム有無に関わらず全リクエストで
+`The model produced output that does not match the expected peg-native format` の 500 になり、
+そもそも応答を得られない(LLM-JP のトークナイザが openai-harmony の前提と異なり、LM Studio の
+Harmony パーサが出力を拒否する。[lmstudio-bug-tracker#2182](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/2182) と同じエラー)。
+このサーバ側では回避できないため、LM Studio 側の修正待ち。上記の対応はその修正後(または
+llama.cpp の `llama-server` を直接使う場合)に効く。
+
 ##### xAI (Grok) の `reasoning_effort` 対応(2026-08 時点)
 
 xAI はモデルによって `reasoning_effort` の対応が大きく割れており、非対応モデルに送ると
@@ -450,7 +498,8 @@ xAI はモデルによって `reasoning_effort` の対応が大きく割れて�
 |---|---|---|
 | `grok-4.20-0309-reasoning` / `-non-reasoning` | 非対応(送ると 400) | reasoning 深度がスナップショットに固定 |
 | `grok-4.20-multi-agent-*` | 対応(low/medium/high/xhigh) | 値の意味は「エージェント数(4 or 16)」であり reasoning 深度ではない |
-| `grok-4.3` / `grok-4.5` | 対応(low/medium/high) | `grok-4.5` は無効化(`none`)不可 |
+| `grok-4.3` / `grok-4.5` | 対応(low/medium/high) | `grok-4.5` は `xhigh` 非対応(送るとxAI側で `high` に丸められる) |
+| `grok-4.6` / `grok-4.7` | 対応(low/medium/high/xhigh) | `xhigh` は grok-4.6 以降で利用可能(出典: docs.x.ai) |
 | 上記以外(未知のモデル) | 非対応扱い(安全側) | 400 が出ても自己修復リトライで吸収される |
 
 ##### Google (Gemini) の `reasoning_effort` 段数
@@ -460,11 +509,16 @@ Gemini 3 系は `thinkingLevel` の対応段数がモデルで異なり、対応
 (xAI の 400 とは文言が異なるため、xAI 用の自己修復リトライでは救えない点に注意)。
 このサーバは `Provider::map_reasoning` で `gemini-3-pro-preview`(`.1` 無しの旧世代)のみ
 2段ラダー(`[low, high]`)に倒し、`medium` を送らないようにしている。
+Flash系はモデルによって段数・最下段が異なり(出典: ai.google.dev/gemini-api/docs/generate-content/thinking、
+2026-10 時点)、`gemini-3.1-flash`(無印)のみ `low` が無く、flash-lite 系と `gemini-3.5`/`3.6-flash` は
+逆に `minimal` が追加された4段になる。
 
 | モデル | `reasoning_effort` 段数 |
 |---|---|
 | `gemini-3-pro-preview`(`.1` 無し) | low / high の2段のみ(medium 非対応) |
-| `gemini-3.1-pro-preview` 等(`.1` 系)・旧 gemini-2.5系 | low / medium / high |
+| `gemini-3.1-pro` 等(`.1` 系)・旧 gemini-2.5系・`gemini-3.7`/`3.8-flash` | low / medium / high |
+| `gemini-3.1-flash`(無印、lite/image suffix無し) | medium / high の2段のみ(low 非対応) |
+| `*flash-lite*` / `gemini-3.5-flash` / `gemini-3.6-flash` | minimal / low / medium / high の4段 |
 
 なお `gemini-3.1-pro-preview` / `gemini-2.5-pro` 等は thinking 自体を無効化できない仕様だが、
 `reasoning_effort: 0.0` を送ってもエラーにはならず、genai アダプタが `thinkingConfig` を単に
@@ -524,8 +578,8 @@ Gemini 3 系は `thinkingLevel` の対応段数がモデルで異なり、対応
 ```json
 {
   "llm": {
-    "ondemand": { "provider": "anthropic", "model": "claude-4.6-sonnet" },
-    "deferred": { "provider": "anthropic", "model": "claude-4.6-sonnet" }
+    "ondemand": { "provider": "anthropic", "model": "claude-sonnet-5-5" },
+    "deferred": { "provider": "anthropic", "model": "claude-sonnet-5-5" }
   }
 }
 ```

@@ -76,4 +76,9 @@ code_action_candidates (id, code_action_id, rank, candidate, selected)
 2. `gray_matter` で YAML frontmatter を分離
 3. 本文 + frontmatter オプション（`max_tokens`, `temperature`, `schema` 等）を返却
 
-frontmatter のオプションは `use_llm_with_option` が LLM 呼び出し前に適用する。同様のロジックは `build_llm_client` のシステムプロンプト読み込み(`system.md`)にも使われる。
+frontmatter のオプションは `use_llm_with_option` が LLM 呼び出し前に適用する。
+
+`tools: required` を書いたプロンプトは、モデルに `tool_calling` capability が無いと LLM を呼ばずに
+`error!` を出して `LlmError::ToolCallingUnsupported` で止まる(ツール結果を前提にした出力を
+捏造させないため)。書かない場合(既定)はツールは任意扱いで、非対応モデルには tools 宣言を
+送らずに普通に呼ぶ。同様のロジックは `build_llm_client` のシステムプロンプト読み込み(`system.md`)にも使われる。
