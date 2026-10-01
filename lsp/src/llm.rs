@@ -26,6 +26,11 @@ bitflags! {
         /// stop シーケンスを送ってよい
         /// (一部プロバイダの reasoning モデルは `stop` パラメータ自体が非対応)
         const STOP_SEQUENCES    = 1 << 3;
+        /// 他と逆向きの「癖」フラグ: chat_template が system の中身を描画しない
+        /// (LLM-JP-3/3.1 は system を固定文に置き換える)。立っていれば system を
+        /// 最初の user メッセージへ入れて送る。肯定形にしないのは、明示指定の
+        /// capabilities が自動判定を置き換えたときに既存設定が system を失わないため。
+        const NO_SYSTEM_ROLE    = 1 << 4;
     }
 }
 #[allow(unused_imports)]
@@ -52,10 +57,10 @@ impl Provider {
     #[instrument(ret)]
     pub fn from_str(s: &str) -> Result<Self, String> {
         match s.to_lowercase().as_str() {
-            "google" => Ok(Provider::Google("gemini-3.1-pro-preview".to_string())),
+            "google" => Ok(Provider::Google("gemini-3.1-pro".to_string())),
             "openai" => Ok(Provider::OpenAI("gpt-5.3".to_string())),
-            "anthropic" => Ok(Provider::Anthropic("claude-4.6-sonnet".to_string())),
-            "xai" => Ok(Provider::XAi("grok-4.5".to_string())),
+            "anthropic" => Ok(Provider::Anthropic("claude-sonnet-5-5".to_string())),
+            "xai" => Ok(Provider::XAi("grok-4.7".to_string())),
             "lmstudio" => Ok(Provider::LMStudio(
                 "qwen3.5-2b".to_string(),
                 Some("http://localhost:1234/v1/".to_string()),
@@ -137,12 +142,28 @@ impl Provider {
     /// Cloudflare Workers AI のモデル一覧は function calling 対応がモデル依存のため、
     /// モデル名に含まれるファミリー名から簡易判定する。
     /// 対応が確実でないモデルは安全側(空)に倒す。
+    ///
+    /// キーワードは developers.cloudflare.com/workers-ai/models/ の "Capabilities" フィルタで
+    /// "Function calling" を選んだ実際の絞り込み結果(2026-08-12更新時点、18モデル)の
+    /// ファミリー名を元にしている(ブラウザで実レンダリングして確認済み。静的HTML取得では
+    /// JS描画のため一覧を機械的に拾えない)。該当18モデル: glm-5.3-flash, qwen3.8-27b,
+    /// glm-5.3, deepseek-v4-pro-0813, deepseek-v4-flash-0731, glm-5.2, kimi-k2.7-code,
+    /// kimi-k2.6, gemma-4-26b-a4b-it, nemotron-3-120b-a12b, glm-4.7-flash,
+    /// granite-4.0-h-micro, gpt-oss-20b, gpt-oss-120b, qwen3-30b-a3b-fp8,
+    /// llama-4-scout-17b-16e-instruct, mistral-small-3.1-24b-instruct,
+    /// llama-3.3-70b-instruct-fp8-fast。
+    /// 既存の"instruct"/"mistral"等と同じく粒度の粗いファミリー名一致であり、同名の
+    /// 非対応バリアントを誤検出する可能性は残る(安全側に倒す設計のため、誤検出時の実害は
+    /// 「tools宣言を送ったが無視される」程度に留まる想定)。
     #[instrument(ret)]
     fn cloudflare_capabilities(model: &str) -> ModelCapability {
         let m = model.to_lowercase();
-        let supports_tool_calling = ["instruct", "hermes", "qwen", "mistral"]
-            .iter()
-            .any(|kw| m.contains(kw));
+        let supports_tool_calling = [
+            "instruct", "hermes", "qwen", "mistral", "glm", "kimi", "gemma", "deepseek",
+            "nemotron", "granite", "gpt-oss",
+        ]
+        .iter()
+        .any(|kw| m.contains(kw));
         if supports_tool_calling {
             ModelCapability::TOOL_CALLING
         } else {
@@ -153,6 +174,7 @@ impl Provider {
     /// xAI (Grok) のモデル別 `reasoning_effort` 対応表。詳細・出典は `docs/lsp-handlers.md`
     /// の「xAI (Grok) の reasoning_effort 対応」参照。未知のモデル名は安全側に倒し非対応扱い。
     /// 判定順序注意: "grok-4.20-multi-agent" は "grok-4.20" のプレフィックスにもマッチするため先に判定する。
+    /// `grok-4.6`/`grok-4.7` は `grok-4.3`/`grok-4.5` と同じく対応(出典: docs.x.ai)。
     #[instrument(ret)]
     fn xai_capabilities(model: &str) -> ModelCapability {
         let base = ModelCapability::STRUCTURED_OUTPUT | ModelCapability::TOOL_CALLING;
@@ -161,7 +183,11 @@ impl Provider {
             base | ModelCapability::REASONING_EFFORT
         } else if m.contains("grok-4.20") {
             base
-        } else if m.contains("grok-4.3") || m.contains("grok-4.5") {
+        } else if m.contains("grok-4.3")
+            || m.contains("grok-4.5")
+            || m.contains("grok-4.6")
+            || m.contains("grok-4.7")
+        {
             base | ModelCapability::REASONING_EFFORT
         } else {
             base
@@ -184,6 +210,15 @@ impl Provider {
             // low/medium/high に対応しているため、プレフィックス一致で bare な
             // "gemini-3-pro-preview" のみ2段のラダーに倒す。
             Provider::Google(_) if m.starts_with("gemini-3-pro-preview") => &[Low, High],
+            // flash-lite 系・gemini-3.5/3.6-flash は thinkingLevel に `minimal` を含む4段。
+            // `gemini-3.1-flash`(無印、lite/image suffix無し)のみ `low` が無く2段(medium/high)。
+            // 出典: ai.google.dev/gemini-api/docs/generate-content/thinking (2026-10 時点)。
+            Provider::Google(_)
+                if m.contains("flash-lite") || m.contains("3.5-flash") || m.contains("3.6-flash") =>
+            {
+                &[Minimal, Low, Medium, High]
+            }
+            Provider::Google(_) if m == "gemini-3.1-flash" => &[Medium, High],
             Provider::Google(_) => &[Low, Medium, High],
             Provider::XAi(_) if m.contains("grok-4.20-multi-agent") => {
                 // multi-agent モデルでは reasoning 深度ではなく
@@ -191,6 +226,11 @@ impl Provider {
                 &[Low, Medium, High, XHigh]
             }
             Provider::XAi(_) if m.contains("grok-4.20") => &[],
+            // grok-4.6/4.7 は xhigh にも対応(grok-4.5 は xhigh非対応で "high" に丸められる)。
+            // 出典: docs.x.ai/developers/model-capabilities/text/reasoning
+            Provider::XAi(_) if m.contains("grok-4.6") || m.contains("grok-4.7") => {
+                &[Low, Medium, High, XHigh]
+            }
             Provider::XAi(_) if m.contains("grok-4.3") || m.contains("grok-4.5") => {
                 &[Low, Medium, High]
             }
@@ -336,8 +376,28 @@ async fn probe_lmstudio_capabilities(base_url: &str, model: &str) -> Option<Mode
         );
     }
 
+    let caps = apply_lmstudio_known_quirks(model, caps);
     LMSTUDIO_CAP_CACHE.insert(cache_key, caps);
     Some(caps)
+}
+
+/// LM Studio 実機で「申告と実際が食い違う」ことを確認したモデルの capability を補正する。
+/// 自動推定の経路でのみ使い、明示 capabilities 指定は上書きしない。
+/// 確認内容は `docs/lsp-handlers.md` の「LLM-JP 系の対応状況」参照。
+fn apply_lmstudio_known_quirks(model: &str, mut caps: ModelCapability) -> ModelCapability {
+    let m = model.to_lowercase();
+    if m.contains("llm-jp-3") {
+        // json_schema を付けると "Failed to initialize samplers: Unexpected empty grammar
+        // stack" の 400(トークナイザ由来、自己修復リトライの検出対象外)。
+        caps.remove(ModelCapability::STRUCTURED_OUTPUT);
+        // function-calling 微調整版を含め、ツールを渡しても呼ばずに本文で断る。
+        caps.remove(ModelCapability::TOOL_CALLING);
+    }
+    if m.contains("llm-jp-4") && m.contains("instruct") {
+        // LM Studio は tool_use を報告するが、ツールを呼ばず本文に JSON をでっち上げる。
+        caps.remove(ModelCapability::TOOL_CALLING);
+    }
+    caps
 }
 
 /// HuggingFace の GGUF リポジトリメタデータから `chat_template` を取得し、
@@ -372,8 +432,36 @@ async fn probe_huggingface_capabilities(publisher: &str, id: &str) -> Option<Mod
         .await
         .inspect_err(|e| debug!("huggingface probe: failed to parse {} response: {}", url, e))
         .ok()?;
-    let template = body.get("gguf")?.get("chat_template")?.as_str()?;
+    let template = chat_template_from_hf_model_info(&body)?;
     Some(capabilities_from_chat_template(template))
+}
+
+/// HuggingFace の `/api/models/{repo}` 応答から chat_template を取り出す。
+///
+/// LM Studio の `publisher/id` から組み立てた repo 名は GGUF リポジトリ(`*-gguf`)ではなく
+/// 元の safetensors リポジトリに当たることがあり(実例: `llm-jp/llm-jp-4.1-8b-thinking`)、
+/// その場合 `gguf` キーは無くテンプレートは `config.chat_template_jinja` 側にある。
+/// 旧来の repo は `config.tokenizer_config.chat_template` に文字列、または
+/// `[{name, template}]` の配列(名前付き複数テンプレート)で持つ。
+fn chat_template_from_hf_model_info(body: &Value) -> Option<&str> {
+    let config = body.get("config");
+    let tokenizer_tmpl = config
+        .and_then(|c| c.get("tokenizer_config"))
+        .and_then(|t| t.get("chat_template"));
+    body.get("gguf")
+        .and_then(|g| g.get("chat_template"))
+        .and_then(Value::as_str)
+        .or_else(|| config?.get("chat_template_jinja")?.as_str())
+        .or_else(|| tokenizer_tmpl?.as_str())
+        .or_else(|| {
+            let named = tokenizer_tmpl?.as_array()?;
+            named
+                .iter()
+                .find(|t| t.get("name").and_then(Value::as_str) == Some("default"))
+                .or_else(|| named.first())?
+                .get("template")?
+                .as_str()
+        })
 }
 
 /// Jinja chat_template の文字列だけから capability を推定する純粋関数。
@@ -398,7 +486,30 @@ fn capabilities_from_chat_template(tmpl: &str) -> ModelCapability {
     if has_thinking_toggle {
         caps |= ModelCapability::REASONING_EFFORT;
     }
+    if template_drops_system_content(tmpl) {
+        caps |= ModelCapability::NO_SYSTEM_ROLE;
+    }
     caps
+}
+
+/// `role == 'system'` の分岐がどれも system の中身(`content`)を参照していなければ true。
+///
+/// LLM-JP-3/3.1 は `{% elif message['role'] == 'system' %}{{ '以下は、…' }}{% elif …` と
+/// 固定文に置き換える。ChatML のように role を比較せず汎用に描画するテンプレートは
+/// 比較自体が無いので false(= system は届く)。
+fn template_drops_system_content(tmpl: &str) -> bool {
+    static ROLE_IS_SYSTEM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"role['"]?\]?\s*==\s*['"]system['"]"#).unwrap()
+    });
+    static BRANCH_END: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\{%-?\s*(elif|else|endif)\b").unwrap());
+    let mut branches = ROLE_IS_SYSTEM.find_iter(tmpl).peekable();
+    branches.peek().is_some()
+        && branches.all(|m| {
+            let rest = &tmpl[m.end()..];
+            let body = BRANCH_END.find(rest).map_or(rest, |e| &rest[..e.start()]);
+            !body.contains("content")
+        })
 }
 
 /// xAI 等が返す 400 のエラー本文から「対応していないパラメータ名」を抽出する。
@@ -504,6 +615,8 @@ pub enum LlmError {
     GenericError { message: String },
     #[display("JSON parse error: {}", message)]
     JsonParseError { message: String },
+    #[display("Model {} does not support tool calling, but this prompt requires it", model)]
+    ToolCallingUnsupported { model: String },
     #[display("Not implemented")]
     #[allow(unused)]
     NotImplemented,
@@ -637,6 +750,7 @@ impl LlmClientBuilder {
                         "tool_calling" => acc | ModelCapability::TOOL_CALLING,
                         "reasoning_effort" => acc | ModelCapability::REASONING_EFFORT,
                         "stop_sequences" => acc | ModelCapability::STOP_SEQUENCES,
+                        "no_system_role" => acc | ModelCapability::NO_SYSTEM_ROLE,
                         _ => acc,
                     }
                 })
@@ -801,15 +915,23 @@ impl LlmClientBuilder {
             .with_service_target_resolver(proc)
             .build();
 
-        let capabilities = self
+        let mut capabilities = self
             .capabilities
             .unwrap_or_else(|| self.provider.default_capabilities(mdl_name));
+        // LLM-JP-3/3.1 の GGUF はコミュニティ配布(mmnga 等)が主で、LM Studio の
+        // publisher/id から HF のテンプレートを引けないことが多い。名前で補う。
+        // 明示 capabilities 指定時も適用する(癖であって機能の選択ではないため)。
+        if matches!(self.provider, Provider::LMStudio(..))
+            && mdl_name.to_lowercase().contains("llm-jp-3")
+        {
+            capabilities |= ModelCapability::NO_SYSTEM_ROLE;
+        }
 
         Box::new(LlmClient {
             provider: self.provider.clone(),
             inner_client,
             model: mdl_name.clone(),
-            cache: HashMap::new(),
+            cache: Vec::new(),
             prompts: vec![],
             options: ChatOptions::default(),
             tools: HashMap::from_iter(self.tools.into_iter().map(|t| {
@@ -845,7 +967,9 @@ pub struct LlmClient {
     /// 使用するLLMのモデル名
     model: String,
     /// プロンプトを永続的に保持するためのキャッシュ
-    cache: HashMap<String, Content>,
+    /// 登録順を保つため Vec で持つ(数件程度なので線形探索で足りる)。HashMap だと
+    /// system 連結時の順序が毎回変わり、プロバイダ側のプロンプトキャッシュも当たらない。
+    cache: Vec<(String, Content)>,
     /// 現在のチャットセッションでのみ使用される一時的なプロンプト
     prompts: Vec<Content>,
     /// 利用可能なツール
@@ -854,6 +978,48 @@ pub struct LlmClient {
     sys_prompt: String,
     /// モデルが対応している機能
     capabilities: ModelCapability,
+}
+
+impl LlmClient {
+    /// システムプロンプトとキャッシュ済みコンテキストを1つの system テキストへ連結する。
+    ///
+    /// 別々の system メッセージで送ると、Harmony 形式(LLM-JP-4 / gpt-oss 系)の
+    /// chat_template は `messages[0]` しか developer 指示として描画せず、2つ目以降の
+    /// system を黙って捨てる(characters.md 等のキャッシュ文脈が消える)。
+    /// クラウド各社のアダプタも複数 system を結局1つに束ねるので、常に連結して送る。
+    fn system_text(&self) -> String {
+        std::iter::once(self.sys_prompt.as_str())
+            .chain(self.cache.iter().map(|(_, c)| match c {
+                Content::Text(s) => s.as_str(),
+                Content::CacheEntry(h) => self.fetch(h).map_or("", |c| c.as_ref().as_str()),
+            }))
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// system とユーザープロンプトから(tools 抜きの)リクエストを組む。
+    /// `NO_SYSTEM_ROLE` のモデルでは system を最初の user メッセージの先頭へ入れる。
+    fn base_request(&self, prompts: &[Content]) -> ChatRequest {
+        let system = self.system_text();
+        let mut users: Vec<String> = prompts
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text(s) => Some(s.clone()),
+                Content::CacheEntry(h) => self.fetch(h).map(|c| c.to_string()),
+            })
+            .collect();
+
+        if !self.capabilities.contains(ModelCapability::NO_SYSTEM_ROLE) || system.is_empty() {
+            return ChatRequest::from_system(system)
+                .append_messages(users.into_iter().map(ChatMessage::user));
+        }
+        match users.first_mut() {
+            Some(first) => *first = format!("{system}\n\n{first}"),
+            None => users.push(system),
+        }
+        ChatRequest::from_messages(users.into_iter().map(ChatMessage::user).collect())
+    }
 }
 
 #[async_trait]
@@ -885,25 +1051,22 @@ impl LlmInterface for LlmClient {
 
         // chat_req はツール呼び出しの往復をまたいで会話履歴として保持・追記する。
         // (LLM API はステートレスなので、毎リクエストに全履歴を送る必要がある)
-        let mut chat_req = ChatRequest::from_system(&self.sys_prompt)
-            .append_messages(self.fetch_all().iter().filter_map(|c| {
-                Some(ChatMessage::system(match c {
-                    Content::Text(s) => s,
-                    Content::CacheEntry(h) => self.fetch(h)?.as_ref(),
-                }))
-            }))
-            .append_messages(prompts.iter().filter_map(|c| {
-                Some(ChatMessage::user(match c {
-                    Content::Text(s) => s,
-                    Content::CacheEntry(h) => self.fetch(h)?.as_ref(),
-                }))
-            }))
-            // Tool call 準備
-            .with_tools(self.tools.values().map(|t| {
+        let mut chat_req = self.base_request(&prompts);
+        // 非対応モデルに tools を渡すと、呼ばずに本文で JSON をでっち上げる等の誤動作になる。
+        // ツール必須の用途は use_llm_with_option が事前に止めるので、ここは任意扱いで外すだけ。
+        if self.capabilities.contains(ModelCapability::TOOL_CALLING) {
+            chat_req = chat_req.with_tools(self.tools.values().map(|t| {
                 Tool::new(t.name())
                     .with_description(t.description())
                     .with_schema(t.schema())
             }));
+        } else if !self.tools.is_empty() {
+            debug!(
+                "model {} does not support tool calling; sending without tools {:?}",
+                self.model,
+                self.tools.keys().collect::<Vec<_>>()
+            );
+        }
 
         // 静的な capability 表が古くなっていた場合の保険。400 の本文に
         // "does not support parameter <name>" があれば、そのパラメータを
@@ -1085,12 +1248,15 @@ impl LlmInterface for LlmClient {
         match prompt {
             Content::Text(s) => {
                 let key = format!("{:016x}", farmhash::hash64(s.as_bytes()));
-                self.cache.insert(key.clone(), Content::Text(s));
+                // 同一内容の再登録は位置を動かさない(順序 = 初回登録順)
+                if self.fetch(&key).is_none() {
+                    self.cache.push((key.clone(), Content::Text(s)));
+                }
                 Ok(key)
             }
             Content::CacheEntry(key) => {
-                if self.cache.contains_key(&key) {
-                    Ok(key.clone())
+                if self.fetch(&key).is_some() {
+                    Ok(key)
                 } else {
                     Err(LlmError::CacheNotFound { key })
                 }
@@ -1100,12 +1266,12 @@ impl LlmInterface for LlmClient {
 
     #[instrument(skip(self), ret)]
     fn fetch(&self, hash: &str) -> Option<&Content> {
-        self.cache.get(hash)
+        self.cache.iter().find(|(k, _)| k == hash).map(|(_, c)| c)
     }
 
     #[instrument(skip(self), ret)]
     fn fetch_all(&self) -> Vec<Content> {
-        self.cache.values().cloned().collect()
+        self.cache.iter().map(|(_, c)| c.clone()).collect()
     }
 
     fn clear(&mut self) {
@@ -1113,7 +1279,7 @@ impl LlmInterface for LlmClient {
     }
 
     fn remove(&mut self, hash: String) {
-        self.cache.remove(&hash);
+        self.cache.retain(|(k, _)| *k != hash);
     }
 
     #[instrument(skip(self), ret)]
@@ -1191,9 +1357,21 @@ impl LlmInterface for LlmClient {
             // (vLLM/SGLang deployment doc、LM Studio issue #1990 で語彙が一致することから確認)。
             // この capability は capabilities_from_chat_template() が chat_template 中の
             // enable_thinking トグル変数の有無を根拠に付与しているので、ここで意味が食い違わない。
+            //
+            // Harmony 形式(LLM-JP-4 / gpt-oss 系)のテンプレートは enable_thinking を参照せず、
+            // 文字列の `reasoning_effort`(low/medium/high、既定 medium、無効化不可)で制御する。
+            // どちらの方式のテンプレートかはここでは分からないが、Jinja は未参照の kwargs を
+            // 無視するので両方積んでおけばよい。Harmony は思考を切れないため 0.0 は "low"。
             let enable_thinking = level > 0.0;
-            let extra =
-                serde_json::json!({"chat_template_kwargs": {"enable_thinking": enable_thinking}});
+            let effort = match level {
+                l if l <= 1.0 / 3.0 => "low",
+                l if l <= 2.0 / 3.0 => "medium",
+                _ => "high",
+            };
+            let extra = serde_json::json!({"chat_template_kwargs": {
+                "enable_thinking": enable_thinking,
+                "reasoning_effort": effort,
+            }});
             self.options = std::mem::take(&mut self.options).with_extra_body(extra);
             return;
         }
@@ -1294,6 +1472,19 @@ where
     let Some(llm) = ref_llm.as_mut() else {
         return Err(LlmError::NotInitialized);
     };
+
+    // frontmatter で `tools: required` と宣言したプロンプトは、ツールを呼べないモデルでは
+    // 送っても無意味(ツール結果を前提にした出力が捏造される)なので送信前に止める。
+    if option.get("tools").map(|v| v.trim()) == Some("required")
+        && !llm.capabilities().contains(ModelCapability::TOOL_CALLING)
+    {
+        let model = llm.get_model().to_string();
+        error!(
+            "model {} does not support tool calling, but the prompt declares `tools: required`; aborting",
+            model
+        );
+        return Err(LlmError::ToolCallingUnsupported { model });
+    }
 
     // 前回リクエストの max_tokens/temperature/reasoning_level 等が
     // 失敗・キャンセル時に持ち越されないよう、適用前に既定値へ戻す。
@@ -1543,6 +1734,24 @@ mod tests_reasoning {
     }
 
     #[test]
+    fn test_xai_grok_4_6_and_4_7_support_xhigh() {
+        // grok-4.6/4.7 は grok-4.3/4.5 と違い xhigh まで対応する(出典: docs.x.ai)。
+        assert!(matches!(
+            xai().map_reasoning("grok-4.6", 1.0),
+            ReasoningEffort::XHigh
+        ));
+        assert!(matches!(
+            xai().map_reasoning("grok-4.7", 1.0),
+            ReasoningEffort::XHigh
+        ));
+        // grok-4.5 は4段ラダーに入っておらず、1.0でも最上位は High止まり。
+        assert!(matches!(
+            xai().map_reasoning("grok-4.5", 1.0),
+            ReasoningEffort::High
+        ));
+    }
+
+    #[test]
     fn test_xai_grok_4_20_multi_agent_is_not_mistaken_for_grok_4_20() {
         // "grok-4.20-multi-agent" は "grok-4.20" のプレフィックスにもマッチしうるため、
         // multi-agent の判定を先に行う必要がある。ここでは reasoning_effort が
@@ -1591,6 +1800,38 @@ mod tests_reasoning {
             ReasoningEffort::Medium
         ));
     }
+
+    #[test]
+    fn test_google_gemini_3_1_flash_has_no_low() {
+        // gemini-3.1-flash(無印)は medium/high の2段のみで low が無い
+        // (出典: ai.google.dev/gemini-api/docs/generate-content/thinking)。
+        // 2段ラダーでは 0.5 は idx=0(ceil(1.0)-1) -> Medium、0.0超〜0.5 は常に Medium。
+        assert!(matches!(
+            google().map_reasoning("gemini-3.1-flash", 0.1),
+            ReasoningEffort::Medium
+        ));
+        assert!(matches!(
+            google().map_reasoning("gemini-3.1-flash", 1.0),
+            ReasoningEffort::High
+        ));
+    }
+
+    #[test]
+    fn test_google_gemini_flash_lite_has_minimal() {
+        // flash-lite 系・3.5/3.6-flash は minimal/low/medium/high の4段ラダー。
+        assert!(matches!(
+            google().map_reasoning("gemini-3.5-flash-lite", 0.1),
+            ReasoningEffort::Minimal
+        ));
+        assert!(matches!(
+            google().map_reasoning("gemini-3.1-flash-lite-image", 0.1),
+            ReasoningEffort::Minimal
+        ));
+        assert!(matches!(
+            google().map_reasoning("gemini-3.6-flash", 1.0),
+            ReasoningEffort::High
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -1627,6 +1868,8 @@ mod tests_capabilities {
             | ModelCapability::REASONING_EFFORT;
         assert_eq!(xai.default_capabilities("grok-4.5"), with_reasoning);
         assert_eq!(xai.default_capabilities("grok-4.3"), with_reasoning);
+        assert_eq!(xai.default_capabilities("grok-4.6"), with_reasoning);
+        assert_eq!(xai.default_capabilities("grok-4.7"), with_reasoning);
         assert_eq!(
             xai.default_capabilities("grok-4.20-multi-agent-0309"),
             with_reasoning
@@ -1679,6 +1922,41 @@ mod tests_capabilities {
             cf.default_capabilities("@cf/meta/llama-3.1-8b-instruct"),
             ModelCapability::TOOL_CALLING
         );
+    }
+
+    #[test]
+    fn test_cloudflare_function_calling_catalog_2026_08() {
+        // developers.cloudflare.com/workers-ai/models/?capabilities=Function+calling を
+        // ブラウザで実レンダリングして確認した18モデル全件(2026-08-12更新時点)。
+        // モデルIDは `@cf/<author>/<name>` 形式だが、判定はモデル名部分の
+        // ファミリー名一致のみなので接頭辞無しの素のIDでも検証できる。
+        for model in [
+            "glm-5.3-flash",
+            "qwen3.8-27b",
+            "glm-5.3",
+            "deepseek-v4-pro-0813",
+            "deepseek-v4-flash-0731",
+            "glm-5.2",
+            "kimi-k2.7-code",
+            "kimi-k2.6",
+            "gemma-4-26b-a4b-it",
+            "nemotron-3-120b-a12b",
+            "glm-4.7-flash",
+            "granite-4.0-h-micro",
+            "gpt-oss-20b",
+            "gpt-oss-120b",
+            "qwen3-30b-a3b-fp8",
+            "llama-4-scout-17b-16e-instruct",
+            "mistral-small-3.1-24b-instruct",
+            "llama-3.3-70b-instruct-fp8-fast",
+        ] {
+            let cf = Provider::Cloudflare(model.to_string());
+            assert_eq!(
+                cf.default_capabilities(model),
+                ModelCapability::TOOL_CALLING,
+                "expected tool_calling for {model}"
+            );
+        }
     }
 
     #[test]
@@ -1839,6 +2117,16 @@ mod tests_lmstudio_probe {
         assert_eq!(unknown, ModelCapability::STRUCTURED_OUTPUT);
     }
 
+    /// LLM-JP-3 系を入れた LM Studio での結合確認(`--ignored` で手動実行)。
+    #[tokio::test]
+    #[ignore = "requires LM Studio on localhost:1234 with llm-jp-3-3.7b-instruct installed"]
+    async fn test_probe_llm_jp_3_drops_structured_output() {
+        let caps = probe_lmstudio_capabilities("http://localhost:1234/v1/", "llm-jp-3-3.7b-instruct")
+            .await
+            .expect("LM Studio should be reachable");
+        assert!(!caps.contains(ModelCapability::STRUCTURED_OUTPUT));
+    }
+
     /// テスト用に最小構成の LMStudio 向け LlmClient を組み立てる。
     /// `genai::Client` は `Default` を実装しているので実際の HTTP 設定は不要。
     fn lmstudio_test_client(capabilities: ModelCapability) -> LlmClient {
@@ -1847,7 +2135,7 @@ mod tests_lmstudio_probe {
             inner_client: genai::Client::default(),
             options: ChatOptions::default(),
             model: "model".to_string(),
-            cache: HashMap::new(),
+            cache: Vec::new(),
             prompts: vec![],
             tools: HashMap::new(),
             sys_prompt: String::new(),
@@ -1862,19 +2150,213 @@ mod tests_lmstudio_probe {
         // chat_template_kwargs.enable_thinking を extra_body に積む。
         let mut cl = lmstudio_test_client(ModelCapability::REASONING_EFFORT);
 
+        // Harmony 系テンプレート向けの reasoning_effort も同じ kwargs に同居させる。
         cl.reasoning_level(0.8);
         assert_eq!(
             cl.options.extra_body,
-            Some(serde_json::json!({"chat_template_kwargs": {"enable_thinking": true}}))
+            Some(serde_json::json!({"chat_template_kwargs": {
+                "enable_thinking": true, "reasoning_effort": "high"
+            }}))
         );
-        // reasoning_effort 自体は(LMStudio では使わないので)設定されない。
+        // genai の汎用 reasoning_effort(トップレベル)は LMStudio では使わない。
         assert!(cl.options.reasoning_effort.is_none());
 
+        cl.reasoning_level(0.5);
+        assert_eq!(
+            cl.options.extra_body.as_ref().unwrap()["chat_template_kwargs"]["reasoning_effort"],
+            "medium"
+        );
+
+        // Harmony は思考を切れないので 0.0 は最小の "low" に倒す。
         cl.reasoning_level(0.0);
         assert_eq!(
             cl.options.extra_body,
-            Some(serde_json::json!({"chat_template_kwargs": {"enable_thinking": false}}))
+            Some(serde_json::json!({"chat_template_kwargs": {
+                "enable_thinking": false, "reasoning_effort": "low"
+            }}))
         );
+    }
+
+    /// LLM-JP-4.1 公式 GGUF の chat_template(Harmony 形式、`llm-jp-harmony-v1`)の要所を抜粋。
+    const HARMONY_TEMPLATE: &str = r#"
+        {#- chat_format=llm-jp-harmony-v1 -#}
+        {%- if reasoning_effort is not defined %}
+            {%- set reasoning_effort = "medium" %}
+        {%- endif %}
+        {{- "Reasoning: " + reasoning_effort + "\n\n" }}
+        {%- if tools -%}
+            {{- render_tool_namespace("functions", tools) }}
+        {%- endif -%}
+    "#;
+
+    #[test]
+    fn test_harmony_template_grants_tool_calling_and_reasoning_effort() {
+        assert_eq!(
+            capabilities_from_chat_template(HARMONY_TEMPLATE),
+            ModelCapability::TOOL_CALLING | ModelCapability::REASONING_EFFORT
+        );
+    }
+
+    /// LLM-JP-3 / 3.1 instruct 系の chat_template(HF の tokenizer_config そのまま)。
+    const LLM_JP_3_TEMPLATE: &str = r#"{{bos_token}}{% for message in messages %}{% if message['role'] == 'user' %}{{ '\n\n### 指示:\n' + message['content'] }}{% elif message['role'] == 'system' %}{{ '以下は、タスクを説明する指示です。要求を適切に満たす応答を書きなさい。' }}{% elif message['role'] == 'assistant' %}{{ '\n\n### 応答:\n' + message['content'] + eos_token }}{% endif %}{% if loop.last and add_generation_prompt %}{{ '\n\n### 応答:\n' }}{% endif %}{% endfor %}"#;
+
+    #[test]
+    fn test_template_drops_system_content_detection() {
+        assert!(template_drops_system_content(LLM_JP_3_TEMPLATE));
+        assert_eq!(
+            capabilities_from_chat_template(LLM_JP_3_TEMPLATE),
+            ModelCapability::NO_SYSTEM_ROLE
+        );
+        // Harmony: messages[0] の system を developer 指示として使う
+        let harmony = r#"{%- if messages[0].role == "developer" or messages[0].role == "system" %}
+            {%- set developer_message = messages[0].content %}
+        {%- else %}{%- set developer_message = "" %}{%- endif %}"#;
+        assert!(!template_drops_system_content(harmony));
+        // Qwen3 系: 先頭 system の中身を描画する
+        let qwen = r#"{%- if messages[0].role == 'system' %}{{- messages[0].content + '\n\n' }}{%- endif %}"#;
+        assert!(!template_drops_system_content(qwen));
+        // ChatML 汎用: role を比較しない = system も普通に描画される
+        let chatml = r#"{% for m in messages %}{{'<|im_start|>' + m['role'] + '\n' + m['content']}}{% endfor %}"#;
+        assert!(!template_drops_system_content(chatml));
+    }
+
+    #[test]
+    fn test_llm_jp_3_name_fallback_even_with_explicit_capabilities() {
+        let cfg = serde_json::json!({
+            "provider": "lmstudio", "model": "llm-jp-3.1-13b-instruct4",
+            "capabilities": ["structured_output"]
+        });
+        let llm = LlmClientBuilder::from_value(&cfg).build();
+        assert!(llm.capabilities().contains(ModelCapability::NO_SYSTEM_ROLE));
+
+        // LLM-JP-4 は Harmony で system が効くので対象外
+        let cfg4 = serde_json::json!({"provider": "lmstudio", "model": "llm-jp-4-8b-thinking"});
+        let llm4 = LlmClientBuilder::from_value(&cfg4).build();
+        assert!(!llm4.capabilities().contains(ModelCapability::NO_SYSTEM_ROLE));
+    }
+
+    #[test]
+    fn test_lmstudio_known_quirks_drop_unworking_tool_calling() {
+        let full = ModelCapability::STRUCTURED_OUTPUT | ModelCapability::TOOL_CALLING;
+        // 3/3.1 系: 構造化出力もツールも実機で動かない
+        assert_eq!(
+            apply_lmstudio_known_quirks("llm-jp-3.1-1.8b-function-calling", full),
+            ModelCapability::empty()
+        );
+        // 4 instruct: ツールだけ動かない(構造化出力は実機で OK)
+        assert_eq!(
+            apply_lmstudio_known_quirks("llm-jp-4-8b-instruct", full),
+            ModelCapability::STRUCTURED_OUTPUT
+        );
+        // thinking 版は未検証(LM Studio で応答自体が返らない)なので触らない
+        assert_eq!(apply_lmstudio_known_quirks("llm-jp-4.1-8b-thinking", full), full);
+        assert_eq!(apply_lmstudio_known_quirks("qwen/qwen3-4b-2507", full), full);
+    }
+
+    #[tokio::test]
+    async fn test_tools_required_aborts_without_tool_calling() {
+        let slot: tokio::sync::Mutex<Option<Box<dyn LlmInterface>>> =
+            tokio::sync::Mutex::new(Some(Box::new(lmstudio_test_client(
+                ModelCapability::STRUCTURED_OUTPUT,
+            ))));
+        let option = HashMap::from([("tools".to_string(), "required".to_string())]);
+        let mut called = false;
+        let res = use_llm_with_option(&slot, option, async |_l| {
+            called = true;
+            Ok("unreachable".to_string())
+        })
+        .await;
+        assert!(matches!(res, Err(LlmError::ToolCallingUnsupported { .. })));
+        assert!(!called, "LLM must not be invoked when required tools are unavailable");
+    }
+
+    #[tokio::test]
+    async fn test_tools_required_passes_with_tool_calling_and_optional_never_blocks() {
+        let slot: tokio::sync::Mutex<Option<Box<dyn LlmInterface>>> =
+            tokio::sync::Mutex::new(Some(Box::new(lmstudio_test_client(
+                ModelCapability::TOOL_CALLING,
+            ))));
+        let required = HashMap::from([("tools".to_string(), "required".to_string())]);
+        let res = use_llm_with_option(&slot, required, async |_l| Ok("ok".to_string())).await;
+        assert_eq!(res.unwrap(), "ok");
+
+        // 宣言が無ければ(既定 = 任意)非対応モデルでも止めない
+        let slot_no_tc: tokio::sync::Mutex<Option<Box<dyn LlmInterface>>> =
+            tokio::sync::Mutex::new(Some(Box::new(lmstudio_test_client(ModelCapability::empty()))));
+        let res = use_llm_with_option(&slot_no_tc, HashMap::new(), async |_l| Ok("ok".to_string())).await;
+        assert_eq!(res.unwrap(), "ok");
+    }
+
+    #[test]
+    fn test_base_request_folds_system_into_first_user_when_no_system_role() {
+        let mut cl = lmstudio_test_client(ModelCapability::NO_SYSTEM_ROLE);
+        cl.sys_prompt = "SYS".to_string();
+        let req = cl.base_request(&[Content::Text("Q1".into()), Content::Text("Q2".into())]);
+        assert!(req.system.is_none());
+        let texts: Vec<_> = req.messages.iter().map(|m| m.content.joined_texts().unwrap()).collect();
+        assert_eq!(texts, ["SYS\n\nQ1", "Q2"]);
+
+        // user が無ければ system 単独の user を作る
+        let req = cl.base_request(&[]);
+        assert_eq!(req.messages[0].content.joined_texts().as_deref(), Some("SYS"));
+
+        // フラグが無ければ従来通り system で送る
+        let mut normal = lmstudio_test_client(ModelCapability::empty());
+        normal.sys_prompt = "SYS".to_string();
+        let req = normal.base_request(&[Content::Text("Q1".into())]);
+        assert_eq!(req.system.as_deref(), Some("SYS"));
+        assert_eq!(req.messages.len(), 1);
+    }
+
+    #[test]
+    fn test_chat_template_from_hf_model_info_variants() {
+        // GGUF リポジトリ
+        let gguf = serde_json::json!({"gguf": {"chat_template": "A"}});
+        assert_eq!(chat_template_from_hf_model_info(&gguf), Some("A"));
+        // safetensors リポジトリ(LM Studio の publisher/id から解決される LLM-JP の実例)
+        let jinja = serde_json::json!({"config": {"chat_template_jinja": "B", "tokenizer_config": {}}});
+        assert_eq!(chat_template_from_hf_model_info(&jinja), Some("B"));
+        // 旧来の tokenizer_config 文字列
+        let tok = serde_json::json!({"config": {"tokenizer_config": {"chat_template": "C"}}});
+        assert_eq!(chat_template_from_hf_model_info(&tok), Some("C"));
+        // 名前付き複数テンプレートは default を優先
+        let named = serde_json::json!({"config": {"tokenizer_config": {"chat_template": [
+            {"name": "tool_use", "template": "T"}, {"name": "default", "template": "D"}
+        ]}}});
+        assert_eq!(chat_template_from_hf_model_info(&named), Some("D"));
+        assert_eq!(chat_template_from_hf_model_info(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn test_system_text_merges_sys_prompt_and_cache_into_one() {
+        // Harmony テンプレートは messages[0] 以外の system を捨てるため、
+        // キャッシュ文脈もシステムプロンプトと同じ1本に入っていなければならない。
+        let mut cl = lmstudio_test_client(ModelCapability::empty());
+        cl.sys_prompt = "SYS".to_string();
+        cl.cache(Content::Text("CTX".to_string())).unwrap();
+        assert_eq!(cl.system_text(), "SYS\n\nCTX");
+
+        // システムプロンプトが空でも先頭に空行を作らない。
+        cl.sys_prompt.clear();
+        assert_eq!(cl.system_text(), "CTX");
+    }
+
+    #[test]
+    fn test_cache_keeps_registration_order() {
+        let mut cl = lmstudio_test_client(ModelCapability::empty());
+        // ハッシュ値の大小とは無関係に、登録順で連結されること
+        for s in ["C", "A", "B", "Z", "M"] {
+            cl.cache(Content::Text(s.to_string())).unwrap();
+        }
+        assert_eq!(cl.system_text(), "C\n\nA\n\nB\n\nZ\n\nM");
+
+        // 再登録しても位置は動かず重複もしない
+        let key_a = cl.cache(Content::Text("A".to_string())).unwrap();
+        assert_eq!(cl.system_text(), "C\n\nA\n\nB\n\nZ\n\nM");
+
+        // 削除しても残りの順序は保たれる
+        cl.remove(key_a);
+        assert_eq!(cl.system_text(), "C\n\nB\n\nZ\n\nM");
     }
 
     #[test]

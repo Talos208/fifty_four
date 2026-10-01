@@ -12,7 +12,8 @@ API キーの環境変数(`GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_K
 
 `capabilities`(サンプルの `deferred.capabilities` を参照)は `structured_output` / `tool_calling` /
 `reasoning_effort` / `stop_sequences` の4値を指定でき、指定すると provider ごとの自動導出結果を
-完全に置き換える。xAI (`grok-4.20-0309-reasoning` 等)はモデルによって `reasoning_effort` 非対応で
+完全に置き換える。加えて、chat_template が system を描画しないモデル向けの `no_system_role`
+(system を最初の user メッセージへ入れて送る)も指定できる。LLM-JP-3 系は名前から自動で付く。xAI (`grok-4.20-0309-reasoning` 等)はモデルによって `reasoning_effort` 非対応で
 明示しないと 400 になることがあるので、対応表は [lsp-handlers.md](lsp-handlers.md) の
 「xAI (Grok) の `reasoning_effort` 対応」を参照。
 
