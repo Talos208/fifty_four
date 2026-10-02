@@ -1208,6 +1208,15 @@ impl LlmInterface for LlmClient {
     }
 
     fn response_format(&mut self, fmt: ChatResponseFormat) {
+        // Anthropic の構造化出力は JSON Schema のサブセットしか受け付けず、
+        // 非対応キーワードがあると 400 になる。公式 SDK と同様に送信前に取り除く。
+        let fmt = match (fmt, &self.provider) {
+            (ChatResponseFormat::JsonSpec(mut spec), Provider::Anthropic(_)) => {
+                strip_unsupported_anthropic_schema(&mut spec.schema);
+                ChatResponseFormat::JsonSpec(spec)
+            }
+            (fmt, _) => fmt,
+        };
         self.options = std::mem::take(&mut self.options).with_response_format(fmt);
     }
 
@@ -1217,6 +1226,59 @@ impl LlmInterface for LlmClient {
 
     fn verbosity(&mut self, v: Verbosity) {
         self.options = std::mem::take(&mut self.options).with_verbosity(v);
+    }
+}
+
+/// Anthropic の構造化出力(`output_config.format`)が受け付けない JSON Schema
+/// キーワードを再帰的に取り除く。
+///
+/// 数値制約・文字列長制約・配列の件数制約は非対応(`minItems` は 0/1 のみ可)。
+/// 取り除いた制約は保証されなくなるので、必要なら呼び出し側で検証すること。
+#[instrument(level = "trace")]
+pub(crate) fn strip_unsupported_anthropic_schema(schema: &mut serde_json::Value) {
+    const UNSUPPORTED: &[&str] = &[
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "maxItems",
+        "uniqueItems",
+    ];
+    match schema {
+        serde_json::Value::Object(map) => {
+            for key in UNSUPPORTED {
+                map.remove(*key);
+            }
+            if map
+                .get("minItems")
+                .and_then(|v| v.as_u64())
+                .is_some_and(|n| n > 1)
+            {
+                map.remove("minItems");
+            }
+            for (key, v) in map.iter_mut() {
+                // properties / $defs 直下のキーはプロパティ名・定義名なので、
+                // `maximum` 等と同名でも消さずに値(サブスキーマ)だけを辿る。
+                if matches!(key.as_str(), "properties" | "$defs" | "definitions")
+                    && let serde_json::Value::Object(named) = v
+                {
+                    for sub in named.values_mut() {
+                        strip_unsupported_anthropic_schema(sub);
+                    }
+                } else {
+                    strip_unsupported_anthropic_schema(v);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                strip_unsupported_anthropic_schema(v);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1447,6 +1509,43 @@ mod tests_reasoning {
             lmstudio().map_reasoning("model", 0.0),
             ReasoningEffort::None
         ));
+    }
+
+    #[test]
+    fn test_strip_unsupported_anthropic_schema() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "candidates": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": 100},
+                    "minItems": 1,
+                    "maxItems": 3
+                },
+                "many": {"type": "array", "items": {"type": "string"}, "minItems": 2},
+                "maximum": {"type": "integer", "minimum": 0}
+            },
+            "required": ["candidates"],
+            "additionalProperties": false
+        });
+        strip_unsupported_anthropic_schema(&mut schema);
+        assert_eq!(
+            schema,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "candidates": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1
+                    },
+                    "many": {"type": "array", "items": {"type": "string"}},
+                    "maximum": {"type": "integer"}
+                },
+                "required": ["candidates"],
+                "additionalProperties": false
+            })
+        );
     }
 
     #[test]

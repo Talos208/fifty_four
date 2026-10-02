@@ -23,7 +23,6 @@ schema: >
   }
 schema_name: character_updates
 max_tokens: 4096
-temperature: 0.3
 ---
 以下の小説本文を注意深く読み、描写からキャラクター設定として確定的に読み取れる情報を、登場する全キャラクター（新規キャラクターを含む）について抽出せよ
 
