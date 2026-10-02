@@ -170,7 +170,11 @@ pub(crate) fn decide_mode(texts: &[LineData], range: Range) -> ActionMode {
     }
 }
 
-/// LLM 応答を候補の列へ分解する。
+/// 提示する候補の上限。プロンプトのスキーマ(`maxItems`)でも要求しているが、
+/// Anthropic など `maxItems` 非対応のプロバイダでは送信前に除去されるためここで揃える。
+const MAX_CANDIDATES: usize = 3;
+
+/// LLM 応答を候補の列へ分解する(最大 [`MAX_CANDIDATES`] 件)。
 ///
 /// プロンプトは frontmatter の `schema` で `{"candidates": ["...", "..."]}` を要求する
 /// (`use_llm_with_option` が構造化出力 / プロンプト埋め込みのどちらでも面倒を見る)。
@@ -183,12 +187,14 @@ pub(crate) fn decide_mode(texts: &[LineData], range: Range) -> ActionMode {
 #[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
 #[instrument]
 pub(crate) fn parse_candidates(response: &str) -> Vec<String> {
-    if let Some(list) = parse_candidates_json(response) {
+    if let Some(mut list) = parse_candidates_json(response) {
+        list.truncate(MAX_CANDIDATES);
         return list;
     }
     log::debug!("parse_candidates: not JSON, falling back to line split");
     crate::cursor_context::extract_candidate_lines(response)
         .into_iter()
+        .take(MAX_CANDIDATES)
         .map(|s| s.to_string())
         .collect()
 }
@@ -314,6 +320,12 @@ mod tests {
             parse_candidates(response),
             vec!["一行目です。\n二行目です。", "別案です。"]
         );
+    }
+
+    #[test]
+    fn test_parse_candidates_truncates_to_max() {
+        let response = r#"{"candidates": ["a", "b", "c", "d", "e"]}"#;
+        assert_eq!(parse_candidates(response), vec!["a", "b", "c"]);
     }
 
     #[test]

@@ -250,7 +250,7 @@ provider(既定 Gemini)の API キーは必要**（上記「プロンプト」�
 |---|---|
 | `data/system_chat.md` | 会話用システムプロンプト。Claude Code の既定を**置き換える**ので、役割・原稿ディレクトリの約束事（plot.md / キャラ設定 / memo/）・本文 `.txt` を勝手に編集しない旨まで全てここに書く |
 | `data/system_chat_digest.md` | 要約用システムプロンプト |
-| `data/prompt_chat_digest.md` | 要約の指示。`{{HISTORY}}`。frontmatter の `max_tokens`/`temperature` も適用される |
+| `data/prompt_chat_digest.md` | 要約の指示。`{{HISTORY}}`。frontmatter の `max_tokens` も適用される |
 
 **要約(`acp.rs::update_digest`)は `crate::llm::use_llm_with_option` 経由で動く。**
 LSP ハンドラ(`Backend::use_llm_with_option`)と同じ自由関数を使っており、`claude` CLI

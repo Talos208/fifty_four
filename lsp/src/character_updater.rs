@@ -1191,7 +1191,6 @@ async fn run_batch_merge(
     // reset_options() から設定し直す(前回サイクル/前回試行の残留を防ぐ)
     let set_llm_options = |llm_client: &mut dyn LlmInterface| {
         llm_client.reset_options();
-        llm_client.temperature(0.2);
         llm_client.max_tokens(max_tokens);
         llm_client.reasoning_level(0.0);
         if structured {
