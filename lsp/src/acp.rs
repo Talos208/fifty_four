@@ -12,11 +12,12 @@
 use crate::acp_config::{self, SessionConfig};
 use crate::writing_agent::{AgentError, ClaudeAgent, WritingAgent};
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, /*SessionCapabilities,*/ SessionId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, UsageUpdate,
+    AgentCapabilities, AuthMethod, AuthMethodAgent, AuthMethodTerminal, AuthenticateRequest,
+    AuthenticateResponse, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse, Meta,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    /*SessionCapabilities,*/ SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, UsageUpdate,
 };
 use agent_client_protocol::{Agent, Stdio};
 #[allow(unused_imports)]
@@ -36,6 +37,9 @@ const MAX_DIGEST_TURNS: usize = 8;
 /// 要約は `session/prompt` の応答を返したあとに走るので、その直後に Zed が切断すると
 /// 書き終える前にランタイムごと落ちる。ここで待つことで取りこぼしを防ぐ。
 const DIGEST_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 「Claude にログイン」の認証方法ID(ACP の `authMethods` に載せる)。
+const LOGIN_METHOD_ID: &str = "claude-login";
 
 /// 会話の話者。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -117,6 +121,66 @@ impl AgentState {
     }
 }
 
+/// `initialize` で返す認証方法。`claude` CLI のログインが切れたとき、Zed の
+/// Agent Panel に「ログイン」ボタンを出させるためのもの(`auth_required` エラーと対)。
+///
+/// どちらの形式でも、Zed は内蔵ターミナルで `fifty_four_lsp --acp --login` を走らせ、
+/// それが `claude auth login` を実行する(`main.rs`/[`crate::writing_agent::run_login`])。
+/// - 現行仕様: クライアントが `auth.terminal` を宣言していれば `type: "terminal"`。
+///   クライアントは設定済みのエージェント起動コマンド(`--acp` 付き)に `args` を足して実行する。
+/// - 旧形式: `_meta["terminal-auth"]` を宣言するクライアント(古めの Zed)向けに、
+///   実行するコマンドを `_meta["terminal-auth"]` で丸ごと渡す。
+///
+/// どちらも宣言していないクライアントには何も返さない(仕様上、端末を開けない
+/// クライアントへ terminal 方式を載せてはいけないため)。
+fn auth_methods(caps: &ClientCapabilities) -> Vec<AuthMethod> {
+    const NAME: &str = "Claude にログイン";
+    const DESCRIPTION: &str =
+        "claude CLI のログインが切れたとき、`claude auth login` でログインし直します";
+
+    if caps.auth.terminal {
+        return vec![AuthMethod::Terminal(
+            AuthMethodTerminal::new(LOGIN_METHOD_ID, NAME)
+                .description(DESCRIPTION.to_string())
+                .args(vec!["--login".to_string()]),
+        )];
+    }
+
+    let legacy = caps
+        .meta
+        .as_ref()
+        .and_then(|m| m.get("terminal-auth"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !legacy {
+        return Vec::new();
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            warn!(
+                "acp: 実行ファイルのパスが取れないためログイン方法を提示しません: {}",
+                e
+            );
+            return Vec::new();
+        }
+    };
+    let mut meta = Meta::new();
+    meta.insert(
+        "terminal-auth".to_string(),
+        serde_json::json!({
+            "label": "claude auth login",
+            "command": exe.to_string_lossy(),
+            "args": ["--acp", "--login"],
+        }),
+    );
+    vec![AuthMethod::Agent(
+        AuthMethodAgent::new(LOGIN_METHOD_ID, NAME)
+            .description(DESCRIPTION.to_string())
+            .meta(meta),
+    )]
+}
+
 /// ACP エージェントとして stdio で待ち受ける。
 #[instrument]
 pub(crate) async fn run() -> Result<(), String> {
@@ -149,12 +213,24 @@ pub(crate) async fn run() -> Result<(), String> {
                     req.protocol_version
                 );
                 responder.respond(
-                    InitializeResponse::new(req.protocol_version).agent_capabilities(
-                        // `claude` CLI の `--session-id`/`--resume` がそのまま使えるため
-                        // `session/load` に対応できる(下のハンドラ参照)。
-                        AgentCapabilities::new().load_session(true),
-                    ),
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(
+                            // `claude` CLI の `--session-id`/`--resume` がそのまま使えるため
+                            // `session/load` に対応できる(下のハンドラ参照)。
+                            AgentCapabilities::new().load_session(true),
+                        )
+                        .auth_methods(auth_methods(&req.client_capabilities)),
                 )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        // `authenticate`: ログイン自体は Zed が端末で `--acp --login` を走らせて済ませる
+        // ([`auth_methods`] 参照)ので、ここでは何もせず成功を返すだけ。
+        // 旧形式(`_meta.terminal-auth`)のクライアントが端末での実行後に呼んでくる場合がある。
+        .on_receive_request(
+            async move |req: AuthenticateRequest, responder, _cx| {
+                debug!("acp authenticate: method_id={:?}", req.method_id);
+                responder.respond(AuthenticateResponse::default())
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -457,7 +533,23 @@ pub(crate) async fn run() -> Result<(), String> {
 
                 let reply = match reply {
                     Ok(r) => r,
-                    Err(AgentError { message }) => {
+                    Err(AgentError {
+                        message,
+                        auth_required: true,
+                    }) => {
+                        // いま動いている `claude` プロセスは古い資格情報を握ったままなので、
+                        // ログインし直しても次のターンで失敗し続ける。設定変更と同じ経路で、
+                        // 次の `session/prompt` の頭でプロセスを起こし直させる
+                        // (ログイン後の資格情報は起動時に読み直される)。
+                        warn!("acp prompt failed (auth required): {}", message);
+                        if let Some(s) = prompt_state.sessions.lock().await.get_mut(&session_id) {
+                            s.pending = Some(s.pending.clone().unwrap_or_else(|| s.config.clone()));
+                        }
+                        let mut err = agent_client_protocol::Error::auth_required();
+                        err.message = message;
+                        return responder.respond_with_error(err);
+                    }
+                    Err(AgentError { message, .. }) => {
                         error!("acp prompt failed: {}", message);
                         return responder
                             .respond_with_internal_error(format!("応答の生成に失敗: {}", message));
@@ -703,6 +795,32 @@ async fn update_digest(
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::TextContent;
+
+    #[test]
+    fn test_auth_methods_uses_terminal_type_when_client_supports_it() {
+        let caps: ClientCapabilities =
+            serde_json::from_value(serde_json::json!({ "auth": { "terminal": true } })).unwrap();
+        let json = serde_json::to_value(auth_methods(&caps)).unwrap();
+        assert_eq!(json[0]["type"], "terminal");
+        assert_eq!(json[0]["id"], LOGIN_METHOD_ID);
+        assert_eq!(json[0]["args"], serde_json::json!(["--login"]));
+    }
+
+    #[test]
+    fn test_auth_methods_falls_back_to_legacy_terminal_auth_meta() {
+        let caps: ClientCapabilities =
+            serde_json::from_value(serde_json::json!({ "_meta": { "terminal-auth": true } }))
+                .unwrap();
+        let json = serde_json::to_value(auth_methods(&caps)).unwrap();
+        let meta = &json[0]["_meta"]["terminal-auth"];
+        assert_eq!(meta["args"], serde_json::json!(["--acp", "--login"]));
+        assert!(meta["command"].as_str().is_some_and(|c| !c.is_empty()));
+    }
+
+    #[test]
+    fn test_auth_methods_is_empty_without_terminal_support() {
+        assert!(auth_methods(&ClientCapabilities::default()).is_empty());
+    }
 
     /// `FIFTY_FOUR_ACP_LLM` はプロセス全体の環境変数なので、テストが並行に
     /// 走ると互いの `set_var`/`remove_var` が競合する

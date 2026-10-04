@@ -147,6 +147,15 @@ fn main() {
         // scrub が必ずそれを取り除いてから claude CLI を起動する)。
         load_dev_env();
         scrub_anthropic_credentials();
+
+        // `--acp --login`: Zed の「ログイン」ボタン(ACP の terminal auth)から
+        // 起動されたとき。ACP サーバは立てず、`claude auth login` だけ実行して終わる
+        // (`crate::acp::auth_methods` 参照)。資格情報の scrub は済ませてから呼ぶ —
+        // 残っていると CLI が API キーを優先してしまうため。
+        if std::env::args().skip(1).any(|a| a == "--login") {
+            std::process::exit(writing_agent::run_login());
+        }
+
         default_acp_log_level();
     } else {
         load_dev_env();
