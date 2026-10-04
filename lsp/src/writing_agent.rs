@@ -45,9 +45,42 @@ const ALLOWED_TOOLS: &[&str] = &[
 #[display("agent failed: {}", message)]
 pub(crate) struct AgentError {
     pub(crate) message: String,
+    /// `claude` CLI の認証切れ(OAuth の期限切れ・未ログイン)による失敗か。
+    /// `crate::acp` はこれを見て ACP の `auth_required` エラーで返し、
+    /// Zed にログインボタンを出させる(`docs/acp-agent.md` の「認証切れ」参照)。
+    pub(crate) auth_required: bool,
+}
+
+impl AgentError {
+    /// 認証切れ以外の失敗。
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            auth_required: false,
+        }
+    }
 }
 
 impl std::error::Error for AgentError {}
+
+/// `claude` CLI のエラー文言が認証切れ(要ログイン)を示しているか。
+///
+/// CLI は認証失敗を専用の型ではなく `Message::Result{is_error:true}` の文言でしか
+/// 伝えてこない(例: `Failed to authenticate: OAuth session expired and could not be
+/// refreshed`)ため、文言で判定する。拾い漏らしても従来通りの内部エラーになるだけ。
+pub(crate) fn is_auth_error_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "failed to authenticate",
+        "oauth",
+        "/login",
+        "not logged in",
+        "authentication_error",
+        "invalid api key",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
 
 /// サブスクリプション枠(5時間枠)の状況。`claude` CLI が流す `rate_limit_event` から拾う。
 ///
@@ -193,15 +226,53 @@ impl ClaudeAgent {
             "acp: claude reported an error result (resumed={}): {}",
             self.resumed, detail
         );
+        // 認証切れは `--resume` の有無に関係なく起きるので、再開失敗の判定より先に見る
+        // (でないと「新しい会話を開始してください」と誤誘導してしまう)。
+        if is_auth_error_text(&detail) {
+            return AgentError {
+                message: format!(
+                    "claude CLI のログインが切れています。ログインし直してから、\
+                     もう一度送信してください ({})",
+                    detail
+                ),
+                auth_required: true,
+            };
+        }
         if self.resumed {
-            AgentError {
-                message: "セッションの再開に失敗しました。新しい会話を開始してください。"
-                    .to_string(),
-            }
+            AgentError::new("セッションの再開に失敗しました。新しい会話を開始してください。")
         } else {
-            AgentError {
-                message: format!("claude reported an error result ({})", detail),
+            AgentError::new(format!("claude reported an error result ({})", detail))
+        }
+    }
+}
+
+/// `fifty_four_lsp --acp --login` の本体。`claude auth login` を端末に繋いだまま実行し、
+/// その終了コードを返す。
+///
+/// Zed の Agent Panel の「ログイン」ボタン(ACP の terminal auth)から、Zed 内蔵の
+/// ターミナル上で起動される想定。`claude /login` ではなく `claude auth login` を使うのは、
+/// ログインが済むとそのまま終了し、終了コード 0 がそのまま「成功」として Zed に伝わるから
+/// (`/login` だと対話画面に入ったまま、自分で `/exit` するまで終わらない)。
+pub(crate) fn run_login() -> i32 {
+    let cli = resolve_cli_path().unwrap_or_else(|| PathBuf::from("claude"));
+    eprintln!("claude CLI にログインします: {} auth login", cli.display());
+    match std::process::Command::new(&cli)
+        .args(["auth", "login"])
+        .status()
+    {
+        Ok(status) => {
+            if status.success() {
+                eprintln!("ログインしました。このウィンドウは閉じてかまいません。");
             }
+            status.code().unwrap_or(1)
+        }
+        Err(e) => {
+            eprintln!(
+                "claude CLI を起動できませんでした({}): {}",
+                cli.display(),
+                e
+            );
+            1
         }
     }
 }
@@ -259,15 +330,13 @@ fn unsupported_cli_reason(path: &Path) -> Option<AgentError> {
         "acp: claude CLIがバッチラッパー形式で見つかりました(起動不可): {:?}",
         path
     );
-    Some(AgentError {
-        message: format!(
-            "claude CLI が npm 経由のラッパースクリプト({})として見つかりましたが、\
+    Some(AgentError::new(format!(
+        "claude CLI が npm 経由のラッパースクリプト({})として見つかりましたが、\
              この形式は ACP 連携から起動できません(Windows の引数エスケープの制限のため)。\
              `npm uninstall -g @anthropic-ai/claude-code` のうえ、\
              Anthropic のネイティブインストーラで入れ直してください。",
-            path.display()
-        ),
-    })
+        path.display()
+    )))
 }
 
 #[cfg(not(windows))]
@@ -294,11 +363,9 @@ fn cli_error(e: anthropic_agent_sdk::ClaudeError) -> AgentError {
         let message = "claude CLI が見つかりません。`npm install -g @anthropic-ai/claude-code` \
             でインストールしてください。"
             .to_string();
-        return AgentError { message };
+        return AgentError::new(message);
     }
-    AgentError {
-        message: format!("failed to start claude: {}", e),
-    }
+    AgentError::new(format!("failed to start claude: {}", e))
 }
 
 /// 1行分のパース結果。
@@ -378,14 +445,9 @@ fn friendly_agent_error(e: anthropic_agent_sdk::ClaudeError) -> AgentError {
     match e {
         anthropic_agent_sdk::ClaudeError::Transport(detail) => {
             warn!("acp: transport error (session不整合の可能性): {}", detail);
-            AgentError {
-                message: "セッションの再開に失敗しました。新しい会話を開始してください。"
-                    .to_string(),
-            }
+            AgentError::new("セッションの再開に失敗しました。新しい会話を開始してください。")
         }
-        other => AgentError {
-            message: other.to_string(),
-        },
+        other => AgentError::new(other.to_string()),
     }
 }
 
@@ -480,9 +542,7 @@ impl WritingAgent for ClaudeAgent {
             .await
             .interrupt()
             .await
-            .map_err(|e| AgentError {
-                message: e.to_string(),
-            })
+            .map_err(|e| AgentError::new(e.to_string()))
     }
 }
 
@@ -537,6 +597,16 @@ mod tests {
         }
 
         assert_eq!(found, None);
+    }
+
+    #[test]
+    fn test_is_auth_error_text_detects_expired_oauth() {
+        assert!(is_auth_error_text(
+            "success (Failed to authenticate: OAuth session expired and could not be refreshed)"
+        ));
+        assert!(is_auth_error_text("Invalid API key · Please run /login"));
+        assert!(!is_auth_error_text("error_max_turns"));
+        assert!(!is_auth_error_text("No conversation found with session ID"));
     }
 
     #[test]

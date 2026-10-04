@@ -104,6 +104,31 @@ Anthropic Agent SDK の注意書き)は会話本体にのみ関わる。
 > 選択肢は採らず、**release ビルドでは `--acp` 自体が起動しない**ようにしてこの問題を
 > 構造的に回避している。
 
+### 認証切れ — Zed からログインし直す
+
+`claude` CLI のログイン（OAuth）が切れると、CLI は
+`Failed to authenticate: OAuth session expired and could not be refreshed` のような文言で
+ターンを失敗させる。claude.ai をブラウザでログインし直しても、CLI が保存している
+資格情報は更新されない。そこで Zed の Agent Panel から直接ログインし直せるようにしてある:
+
+1. **`authMethods` を提示する**（`acp.rs::auth_methods`）。`initialize` でクライアントが
+   `auth.terminal` を宣言していれば `type: "terminal"`（`args: ["--login"]`）、
+   旧形式の `_meta["terminal-auth"]` だけを宣言していれば `_meta["terminal-auth"]` に
+   `fifty_four_lsp --acp --login` を丸ごと載せる。どちらも宣言していないクライアントには
+   何も返さない。
+2. **認証切れを `auth_required`（-32000）で返す。** `writing_agent.rs::is_auth_error_text`
+   が CLI の文言から判定し、`session/prompt` は内部エラーではなく `auth_required` を返す。
+   これを受けた Zed がログインボタンを出し、押すと内蔵ターミナルで
+   `fifty_four_lsp --acp --login` → `claude auth login` が走る（`main.rs`）。
+   `claude /login` でなく `claude auth login` なのは、ログインが済むと終了コード 0 で
+   終わり、それがそのまま成功として Zed に伝わるため。
+3. **次のターンで `claude` プロセスを起こし直す。** 動いている CLI プロセスは古い
+   資格情報を握ったままなので、認証切れを返したセッションには `pending` を積み、
+   次の `session/prompt` の頭で再起動させる（「モデル・思考レベルの変更」と同じ経路）。
+
+一度も応答していないセッションで認証切れになった場合、再起動は `--session-id`（新規扱い）
+で行う。それでも失敗するようなら、新しいスレッドを始めれば確実に直る。
+
 ## グローバル設定は読ませない、ワークスペース側は読む
 
 コーディング向けの CLAUDE.md が執筆用エージェントに混ざると邪魔になるので、
