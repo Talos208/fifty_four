@@ -30,6 +30,19 @@ pub(crate) struct PendingCandidate {
     candidate: String,
 }
 
+/// `quality_findings` へ書く1件分。決定的ルール(`source = "rule"`)も LLM 診断(`"llm"`)も同じ形。
+/// release ビルドでも呼び出し側が同じコードで組み立てられるよう、cfg の外に置いている。
+#[derive(Debug, Clone)]
+pub(crate) struct QualityFindingRecord {
+    pub source: &'static str,
+    pub rule_code: String,
+    pub severity: &'static str,
+    pub line: usize,
+    pub excerpt: String,
+    pub message: String,
+    pub review_id: Option<i64>,
+}
+
 /// デバッグビルド専用のDB操作をカプセル化する構造体
 #[cfg(debug_assertions)]
 #[derive(Debug)]
@@ -302,6 +315,147 @@ impl FlightRecorder {
             debug!("complete_character_update failed: {}", e);
         }
     }
+
+    /// INSERT INTO quality_reviews ... RETURNING id。失敗時は -1 を返す。
+    /// detached task から呼ばれ補完の記録と並走しうるため `try_lock_for` で待つ。
+    pub(crate) fn record_quality_review(&self, uri: &str, model: &str, prompt: &str) -> i64 {
+        if let Some(db) = self.conn.try_lock_for(std::time::Duration::from_secs(1)) {
+            db.query_row(
+                indoc!(
+                    "INSERT INTO quality_reviews (document_uri, model_name, prompt)
+                    VALUES (?,?,?) RETURNING id;"
+                ),
+                rusqlite::params![uri, model, prompt],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1)
+        } else {
+            -1
+        }
+    }
+
+    /// quality_reviews.response へ LLM の生応答(パース前)を書き込む。
+    pub(crate) fn record_quality_review_response(&self, review_id: i64, response: &str) {
+        if let Some(db) = self.conn.try_lock_for(std::time::Duration::from_secs(1)) {
+            if let Err(e) = db.execute(
+                "UPDATE quality_reviews SET response = ? WHERE id = ?;",
+                rusqlite::params![response, review_id],
+            ) {
+                debug!("record_quality_review_response failed: {}", e);
+            }
+        }
+    }
+
+    /// INSERT INTO quality_findings。1トランザクションにまとめる。
+    pub(crate) fn record_quality_findings(&self, uri: &str, records: &[QualityFindingRecord]) {
+        if records.is_empty() {
+            return;
+        }
+        let Some(mut db) = self.conn.try_lock_for(std::time::Duration::from_secs(1)) else {
+            return;
+        };
+        let result = (|| -> rusqlite::Result<()> {
+            let tx = db.transaction()?;
+            {
+                let mut stmt = tx.prepare(indoc!(
+                    "INSERT INTO quality_findings
+                    (document_uri, source, rule_code, severity, line, excerpt, message, review_id)
+                    VALUES (?,?,?,?,?,?,?,?);"
+                ))?;
+                for r in records {
+                    stmt.execute(rusqlite::params![
+                        uri,
+                        r.source,
+                        r.rule_code,
+                        r.severity,
+                        r.line as i64,
+                        r.excerpt,
+                        r.message,
+                        r.review_id,
+                    ])?;
+                }
+            }
+            tx.commit()
+        })();
+        if let Err(e) = result {
+            debug!("record_quality_findings failed: {}", e);
+        }
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+
+    fn temp_db(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fifty_four_fr_test_{}_{}",
+            tag,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.db");
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn rec(source: &'static str, code: &str) -> QualityFindingRecord {
+        QualityFindingRecord {
+            source,
+            rule_code: code.to_string(),
+            severity: "information",
+            line: 3,
+            excerpt: "抜粋".to_string(),
+            message: "msg".to_string(),
+            review_id: None,
+        }
+    }
+
+    #[test]
+    fn test_quality_migration_and_findings_roundtrip() {
+        let fr = FlightRecorder::new(&temp_db("roundtrip"));
+        let review_id = fr.record_quality_review("file:///a.txt", "model-x", "prompt");
+        assert!(review_id > 0);
+        fr.record_quality_review_response(review_id, "{\"findings\":[]}");
+
+        let mut llm = rec("llm", "llm-review");
+        llm.review_id = Some(review_id);
+        fr.record_quality_findings("file:///a.txt", &[rec("rule", "no-chain"), llm]);
+
+        let db = fr.conn.lock();
+        let n: i64 = db
+            .query_row("SELECT count(*) FROM quality_findings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+        let linked: i64 = db
+            .query_row(
+                "SELECT count(*) FROM quality_findings WHERE review_id = ?",
+                [review_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked, 1);
+        let resp: String = db
+            .query_row(
+                "SELECT response FROM quality_reviews WHERE id = ?",
+                [review_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(resp.contains("findings"));
+    }
+
+    #[test]
+    fn test_record_quality_findings_empty_is_noop() {
+        let fr = FlightRecorder::new(&temp_db("empty"));
+        fr.record_quality_findings("file:///a.txt", &[]);
+        let n: i64 = fr
+            .conn
+            .lock()
+            .query_row("SELECT count(*) FROM quality_findings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
 }
 
 #[cfg(not(debug_assertions))]
@@ -379,4 +533,10 @@ impl FlightRecorder {
     ) {
     }
     pub(crate) fn complete_character_update(&self, _update_id: i64) {}
+
+    pub(crate) fn record_quality_review(&self, _uri: &str, _model: &str, _prompt: &str) -> i64 {
+        -1
+    }
+    pub(crate) fn record_quality_review_response(&self, _review_id: i64, _response: &str) {}
+    pub(crate) fn record_quality_findings(&self, _uri: &str, _records: &[QualityFindingRecord]) {}
 }

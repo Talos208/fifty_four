@@ -7,6 +7,8 @@
 
 use std::ops::Range;
 
+use tracing::instrument;
+
 use crate::types::{LineData, TokenMeaning};
 
 /// `CachedLinderaToken` を文書全体でフラットに並べ、行番号とバイト範囲を持たせた形に
@@ -59,6 +61,7 @@ impl STok {
 
 /// `lines` から文書順にフラットな `STok` 列を組み立てる。
 #[allow(clippy::ptr_arg)]
+#[instrument(skip(lines), ret)]
 pub(crate) fn build_tokens(lines: &[LineData]) -> Vec<STok> {
     let mut out = Vec::new();
     for (line_no, line) in lines.iter().enumerate() {
@@ -94,13 +97,15 @@ pub(crate) struct SentenceSpan {
 /// IPADIC は "。" を 記号,句点 として登録しているが、"！"/"？" は 記号,一般 になるため
 /// 表層形での判定を併用する。
 fn is_terminal_punct(t: &STok) -> bool {
-    (t.pos() == "記号" && t.sub1() == "句点") || matches!(t.surface.as_str(), "!" | "?" | "！" | "？")
+    (t.pos() == "記号" && t.sub1() == "句点")
+        || matches!(t.surface.as_str(), "!" | "?" | "！" | "？")
 }
 
 /// フラットなトークン列を文単位に分割する。
 ///
 /// 境界は「句点相当のトークン」または「括弧閉じ(`TokenMeaning::BracketClose`)」。
 /// 台詞は句点を伴わずに終わることが多いため、括弧閉じ単独でも文を区切る。
+#[instrument(ret)]
 pub(crate) fn split_sentences(tokens: &[STok]) -> Vec<SentenceSpan> {
     let mut spans = Vec::new();
     let mut start = 0usize;

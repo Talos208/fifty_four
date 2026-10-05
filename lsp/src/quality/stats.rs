@@ -6,6 +6,7 @@
 use super::sentence::{STok, SentenceSpan};
 use super::{Finding, FindingRange, QualityConfig, RuleId, Severity, char_class_runs};
 use crate::types::LineData;
+use tracing::instrument;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Style {
@@ -17,10 +18,17 @@ enum Style {
 /// 助動詞「です/ます/ございます」→敬体、「だ/である/た」→常体、動詞・形容詞の基本形終止→常体。
 /// いずれにも当てはまらない場合は判定不能として `None`(集計対象外)。
 fn sentence_ending_style(tokens: &[STok], span: &SentenceSpan) -> Option<Style> {
-    let t = tokens[span.range.clone()].iter().rev().find(|t| t.pos() != "記号")?;
+    let t = tokens[span.range.clone()]
+        .iter()
+        .rev()
+        .find(|t| t.pos() != "記号")?;
     match (t.pos(), t.base()) {
-        ("助動詞", "です") | ("助動詞", "ます") | ("助動詞", "ございます") => Some(Style::Polite),
-        ("助動詞", "だ") | ("助動詞", "である") | ("助動詞", "た") => Some(Style::Plain),
+        ("助動詞", "です") | ("助動詞", "ます") | ("助動詞", "ございます") => {
+            Some(Style::Polite)
+        }
+        ("助動詞", "だ") | ("助動詞", "である") | ("助動詞", "た") => {
+            Some(Style::Plain)
+        }
         ("動詞", _) if t.conj_form() == "基本形" => Some(Style::Plain),
         ("形容詞", _) if t.conj_form() == "基本形" => Some(Style::Plain),
         _ => None,
@@ -48,6 +56,7 @@ pub(crate) struct DocStats {
     pub polite_sentence_count: usize,
 }
 
+#[instrument(skip(tokens), ret)]
 pub(crate) fn compute_stats(tokens: &[STok], sentences: &[SentenceSpan]) -> DocStats {
     if tokens.is_empty() {
         return DocStats::default();
@@ -104,14 +113,17 @@ pub(crate) fn compute_stats(tokens: &[STok], sentences: &[SentenceSpan]) -> DocS
         (mean, var)
     };
 
-    let (plain, polite) = sentences.iter().filter(|s| !s.in_dialogue).fold(
-        (0usize, 0usize),
-        |(p, q), s| match sentence_ending_style(tokens, s) {
-            Some(Style::Plain) => (p + 1, q),
-            Some(Style::Polite) => (p, q + 1),
-            None => (p, q),
-        },
-    );
+    let (plain, polite) =
+        sentences
+            .iter()
+            .filter(|s| !s.in_dialogue)
+            .fold((0usize, 0usize), |(p, q), s| {
+                match sentence_ending_style(tokens, s) {
+                    Some(Style::Plain) => (p + 1, q),
+                    Some(Style::Polite) => (p, q + 1),
+                    None => (p, q),
+                }
+            });
 
     DocStats {
         noun_ratio: noun / total,
@@ -141,6 +153,7 @@ pub(crate) fn compute_stats(tokens: &[STok], sentences: &[SentenceSpan]) -> DocS
 /// 常体/敬体混在。文書全体が一方に大きく偏っている(少数派比率 < `style_mixed_min_ratio`)
 /// 場合だけ、少数派の文を個別に指摘する。台詞・判定不能文は対象外。
 /// サンプルが少なすぎる(4文未満)場合は判定しない。
+#[instrument(skip(tokens), ret)]
 pub(crate) fn style_mixed(
     tokens: &[STok],
     sentences: &[SentenceSpan],
@@ -190,6 +203,7 @@ pub(crate) fn style_mixed(
 }
 
 /// 1文の文字数が閾値を超えていないか。
+#[instrument(skip(tokens), ret)]
 pub(crate) fn sentence_too_long(
     tokens: &[STok],
     sentences: &[SentenceSpan],
@@ -225,6 +239,7 @@ pub(crate) fn sentence_too_long(
 }
 
 /// ひらがなの連続(「かな地獄」)。
+#[instrument(ret)]
 pub(crate) fn kana_run(lines: &[LineData], config: &QualityConfig) -> Vec<Finding> {
     let mut findings = Vec::new();
     for (line_no, line) in lines.iter().enumerate() {
@@ -249,6 +264,7 @@ pub(crate) fn kana_run(lines: &[LineData], config: &QualityConfig) -> Vec<Findin
 
 /// 漢字の連続。閾値は `config.kanji_run_max` を下限としつつ、文書全体の平均+2σがそれを
 /// 上回る場合はそちらを使う(漢字を多用する硬めの文体の作者を毎回誤検知させないため)。
+#[instrument(ret)]
 pub(crate) fn kanji_run(lines: &[LineData], config: &QualityConfig) -> Vec<Finding> {
     let runs: Vec<(usize, usize, usize, usize)> = lines
         .iter()
@@ -338,14 +354,24 @@ mod tests {
             "彼は歩いた。彼は走った。彼は笑った。彼は泣いた。彼は叫んだ。\
              彼は座った。彼は立った。彼は眠った。彼は起きた。彼は黙った。彼は喜びます。",
         );
-        let findings = style_mixed(&tokens, &sentences, &compute_stats(&tokens, &sentences), &QualityConfig::default());
+        let findings = style_mixed(
+            &tokens,
+            &sentences,
+            &compute_stats(&tokens, &sentences),
+            &QualityConfig::default(),
+        );
         assert_eq!(findings.len(), 1, "{:?}", findings);
     }
 
     #[test]
     fn test_style_mixed_ok_when_uniform() {
         let (tokens, sentences) = build("彼は歩いた。彼は走った。彼は笑った。彼は泣いた。");
-        let findings = style_mixed(&tokens, &sentences, &compute_stats(&tokens, &sentences), &QualityConfig::default());
+        let findings = style_mixed(
+            &tokens,
+            &sentences,
+            &compute_stats(&tokens, &sentences),
+            &QualityConfig::default(),
+        );
         assert!(findings.is_empty(), "{:?}", findings);
     }
 

@@ -53,6 +53,19 @@ pub enum Provider {
 }
 
 impl Provider {
+    /// メトリクス属性用のプロバイダ名(モデル名を含まない有界な値)
+    pub fn label(&self) -> &'static str {
+        match self {
+            Provider::Google(_) => "google",
+            Provider::OpenAI(_) => "openai",
+            Provider::Anthropic(_) => "anthropic",
+            Provider::XAi(_) => "xai",
+            Provider::LMStudio(..) => "lmstudio",
+            Provider::Cloudflare(_) => "cloudflare",
+            Provider::Undefined => "undefined",
+        }
+    }
+
     /// 文字列からProviderを生成する
     #[instrument(ret)]
     pub fn from_str(s: &str) -> Result<Self, String> {
@@ -214,7 +227,9 @@ impl Provider {
             // `gemini-3.1-flash`(無印、lite/image suffix無し)のみ `low` が無く2段(medium/high)。
             // 出典: ai.google.dev/gemini-api/docs/generate-content/thinking (2026-10 時点)。
             Provider::Google(_)
-                if m.contains("flash-lite") || m.contains("3.5-flash") || m.contains("3.6-flash") =>
+                if m.contains("flash-lite")
+                    || m.contains("3.5-flash")
+                    || m.contains("3.6-flash") =>
             {
                 &[Minimal, Low, Medium, High]
             }
@@ -275,6 +290,45 @@ impl Provider {
             Provider::LMStudio(s, _) => Provider::LMStudio(s.clone(), None),
             Provider::Cloudflare(s) => Provider::Cloudflare(s.clone()),
             _ => Provider::Undefined,
+        }
+    }
+}
+
+/// `exec_chat` の待機中に future が drop された(= キャンセルされた)ことを検出するガード。
+/// `finish()` まで到達せず drop されたら `llm.requests{outcome="cancelled"}` を記録する。
+struct InFlightRequest {
+    provider: &'static str,
+    model: String,
+    started: std::time::Instant,
+    finished: bool,
+}
+
+impl InFlightRequest {
+    fn start(provider: &'static str, model: &str) -> Self {
+        Self {
+            provider,
+            model: model.to_string(),
+            started: std::time::Instant::now(),
+            finished: false,
+        }
+    }
+
+    /// 応答(成功・失敗とも)が返ったことを記録して経過秒を返す。
+    fn finish(mut self) -> f64 {
+        self.finished = true;
+        self.started.elapsed().as_secs_f64()
+    }
+}
+
+impl Drop for InFlightRequest {
+    fn drop(&mut self) {
+        if !self.finished {
+            crate::metrics::llm_request(
+                self.provider,
+                &self.model,
+                "cancelled",
+                self.started.elapsed().as_secs_f64(),
+            );
         }
     }
 }
@@ -615,7 +669,10 @@ pub enum LlmError {
     GenericError { message: String },
     #[display("JSON parse error: {}", message)]
     JsonParseError { message: String },
-    #[display("Model {} does not support tool calling, but this prompt requires it", model)]
+    #[display(
+        "Model {} does not support tool calling, but this prompt requires it",
+        model
+    )]
     ToolCallingUnsupported { model: String },
     #[display("Not implemented")]
     #[allow(unused)]
@@ -1075,14 +1132,20 @@ impl LlmInterface for LlmClient {
         let mut stripped_params: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
+        let provider_label = self.provider.label();
         let content = loop {
+            // 補完の連打などでこの future が待機中に drop されたら、ガードが "cancelled" を記録する。
+            let in_flight = InFlightRequest::start(provider_label, &self.model);
             let res = self
                 .inner_client
                 .exec_chat(model, chat_req.clone(), Some(&self.options))
                 .await;
+            let elapsed = in_flight.finish();
 
             let Ok(response) = res else {
                 let err = res.unwrap_err();
+                // 下の分岐で上書きしなかったものは汎用の "error" として記録する。
+                let mut outcome = "error";
                 match err {
                     genai::Error::WebModelCall {
                         model_iden: _,
@@ -1094,6 +1157,12 @@ impl LlmInterface for LlmClient {
                             headers,
                         } if *status == http::StatusCode::SERVICE_UNAVAILABLE => {
                             error!("Web error{:?} {:?}", status, headers);
+                            crate::metrics::llm_request(
+                                provider_label,
+                                &self.model,
+                                "busy",
+                                elapsed,
+                            );
                             let after = headers
                                 .get("Retry-After")
                                 .map(|v| v.to_str().unwrap_or("0").parse::<u32>().unwrap())
@@ -1110,9 +1179,16 @@ impl LlmInterface for LlmClient {
                                     self.model, status, param, body
                                 );
                                 stripped_params.insert(param);
+                                crate::metrics::llm_request(
+                                    provider_label,
+                                    &self.model,
+                                    "param_stripped",
+                                    elapsed,
+                                );
                                 continue;
                             }
                             error!("Web error{:?} body={}", status, body);
+                            outcome = "http_error";
                         }
                         _ => {
                             error!("{:?}", e)
@@ -1126,16 +1202,48 @@ impl LlmInterface for LlmClient {
                     } => {
                         let msg = format!("{:?}", c.clone());
                         error!("{}", msg);
+                        crate::metrics::llm_request(
+                            provider_label,
+                            &self.model,
+                            "gen_error",
+                            elapsed,
+                        );
                         return Err(LlmError::GenericError { message: msg });
                     }
                     _ => {
                         error!("{:?}", err)
                     }
                 };
+                crate::metrics::llm_request(provider_label, &self.model, outcome, elapsed);
                 return Err(LlmError::GenericError {
                     message: err.to_string(),
                 });
             };
+
+            crate::metrics::llm_request(provider_label, &self.model, "ok", elapsed);
+            let usage = &response.usage;
+            crate::metrics::llm_tokens(
+                provider_label,
+                &self.model,
+                "input",
+                usage.prompt_tokens.unwrap_or(0),
+            );
+            crate::metrics::llm_tokens(
+                provider_label,
+                &self.model,
+                "output",
+                usage.completion_tokens.unwrap_or(0),
+            );
+            crate::metrics::llm_tokens(
+                provider_label,
+                &self.model,
+                "reasoning",
+                usage
+                    .completion_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.reasoning_tokens)
+                    .unwrap_or(0),
+            );
 
             // prompts は with_model 冒頭で既に take 済み。キャッシュ(fetch_all側)は保存されたまま。
 
@@ -1193,6 +1301,7 @@ impl LlmInterface for LlmClient {
                 .cloned()
                 .unwrap_or(Map::default());
             info!("tool call {}({:?})", t.name(), arg);
+            crate::metrics::llm_tool_call(t.name());
             match t.invoke(&arg).await {
                 // ツールコールの結果を返す
                 Ok(ret) => {
@@ -1342,6 +1451,8 @@ impl LlmInterface for LlmClient {
         if !self
             .capabilities
             .contains(ModelCapability::REASONING_EFFORT)
+            && level > 0.0
+        // reasoning_effort がサポートされていないモデルを level == 0.0 で呼んでも legal
         {
             warn!(
                 "model {} does not support reasoning_effort; skipping (level={})",
@@ -1350,18 +1461,11 @@ impl LlmInterface for LlmClient {
             return;
         }
         if matches!(self.provider, Provider::LMStudio(..)) {
-            // Qwen3 系の thinking on/off は genai の汎用 reasoning_effort
-            // (OpenAI o-series 由来の "low"/"medium"/"high" 文字列、insert_openai_reasoning_effort
-            // 経由で "reasoning_effort" キーとして送られる)では制御できず、Qwen公式ドキュメント
-            // 準拠の `chat_template_kwargs.enable_thinking`(真偽値)でのみ制御できる
-            // (vLLM/SGLang deployment doc、LM Studio issue #1990 で語彙が一致することから確認)。
-            // この capability は capabilities_from_chat_template() が chat_template 中の
-            // enable_thinking トグル変数の有無を根拠に付与しているので、ここで意味が食い違わない。
-            //
-            // Harmony 形式(LLM-JP-4 / gpt-oss 系)のテンプレートは enable_thinking を参照せず、
-            // 文字列の `reasoning_effort`(low/medium/high、既定 medium、無効化不可)で制御する。
-            // どちらの方式のテンプレートかはここでは分からないが、Jinja は未参照の kwargs を
-            // 無視するので両方積んでおけばよい。Harmony は思考を切れないため 0.0 は "low"。
+            // Qwen3 系の thinking on/off は汎用の reasoning_effort ではなく
+            // `chat_template_kwargs.enable_thinking`(真偽値)でのみ制御できる。
+            // Harmony 形式(LLM-JP-4 / gpt-oss 系)は enable_thinking を見ず、文字列の
+            // `reasoning_effort`(無効化不可、0.0 は "low")で制御する。
+            // どちらのテンプレートかは分からないが、Jinja は未参照の kwargs を無視するので両方送る。
             let enable_thinking = level > 0.0;
             let effort = match level {
                 l if l <= 1.0 / 3.0 => "low",
@@ -1377,8 +1481,10 @@ impl LlmInterface for LlmClient {
         }
         // モデル名は builder 側で上書き済みの self.model を見る(self.provider が
         // 内部に保持する既定モデル名ではなく、実際に送信するモデル名で判定する)。
-        let effort = self.provider.map_reasoning(&self.model, level);
-        self.options = std::mem::take(&mut self.options).with_reasoning_effort(effort);
+        if level > 0.0 {
+            let effort = self.provider.map_reasoning(&self.model, level);
+            self.options = std::mem::take(&mut self.options).with_reasoning_effort(effort);
+        }
     }
 
     fn reset_options(&mut self) {
@@ -2121,9 +2227,10 @@ mod tests_lmstudio_probe {
     #[tokio::test]
     #[ignore = "requires LM Studio on localhost:1234 with llm-jp-3-3.7b-instruct installed"]
     async fn test_probe_llm_jp_3_drops_structured_output() {
-        let caps = probe_lmstudio_capabilities("http://localhost:1234/v1/", "llm-jp-3-3.7b-instruct")
-            .await
-            .expect("LM Studio should be reachable");
+        let caps =
+            probe_lmstudio_capabilities("http://localhost:1234/v1/", "llm-jp-3-3.7b-instruct")
+                .await
+                .expect("LM Studio should be reachable");
         assert!(!caps.contains(ModelCapability::STRUCTURED_OUTPUT));
     }
 
@@ -2232,7 +2339,11 @@ mod tests_lmstudio_probe {
         // LLM-JP-4 は Harmony で system が効くので対象外
         let cfg4 = serde_json::json!({"provider": "lmstudio", "model": "llm-jp-4-8b-thinking"});
         let llm4 = LlmClientBuilder::from_value(&cfg4).build();
-        assert!(!llm4.capabilities().contains(ModelCapability::NO_SYSTEM_ROLE));
+        assert!(
+            !llm4
+                .capabilities()
+                .contains(ModelCapability::NO_SYSTEM_ROLE)
+        );
     }
 
     #[test]
@@ -2249,8 +2360,14 @@ mod tests_lmstudio_probe {
             ModelCapability::STRUCTURED_OUTPUT
         );
         // thinking 版は未検証(LM Studio で応答自体が返らない)なので触らない
-        assert_eq!(apply_lmstudio_known_quirks("llm-jp-4.1-8b-thinking", full), full);
-        assert_eq!(apply_lmstudio_known_quirks("qwen/qwen3-4b-2507", full), full);
+        assert_eq!(
+            apply_lmstudio_known_quirks("llm-jp-4.1-8b-thinking", full),
+            full
+        );
+        assert_eq!(
+            apply_lmstudio_known_quirks("qwen/qwen3-4b-2507", full),
+            full
+        );
     }
 
     #[tokio::test]
@@ -2267,7 +2384,10 @@ mod tests_lmstudio_probe {
         })
         .await;
         assert!(matches!(res, Err(LlmError::ToolCallingUnsupported { .. })));
-        assert!(!called, "LLM must not be invoked when required tools are unavailable");
+        assert!(
+            !called,
+            "LLM must not be invoked when required tools are unavailable"
+        );
     }
 
     #[tokio::test]
@@ -2281,9 +2401,11 @@ mod tests_lmstudio_probe {
         assert_eq!(res.unwrap(), "ok");
 
         // 宣言が無ければ(既定 = 任意)非対応モデルでも止めない
-        let slot_no_tc: tokio::sync::Mutex<Option<Box<dyn LlmInterface>>> =
-            tokio::sync::Mutex::new(Some(Box::new(lmstudio_test_client(ModelCapability::empty()))));
-        let res = use_llm_with_option(&slot_no_tc, HashMap::new(), async |_l| Ok("ok".to_string())).await;
+        let slot_no_tc: tokio::sync::Mutex<Option<Box<dyn LlmInterface>>> = tokio::sync::Mutex::new(
+            Some(Box::new(lmstudio_test_client(ModelCapability::empty()))),
+        );
+        let res =
+            use_llm_with_option(&slot_no_tc, HashMap::new(), async |_l| Ok("ok".to_string())).await;
         assert_eq!(res.unwrap(), "ok");
     }
 
@@ -2293,12 +2415,19 @@ mod tests_lmstudio_probe {
         cl.sys_prompt = "SYS".to_string();
         let req = cl.base_request(&[Content::Text("Q1".into()), Content::Text("Q2".into())]);
         assert!(req.system.is_none());
-        let texts: Vec<_> = req.messages.iter().map(|m| m.content.joined_texts().unwrap()).collect();
+        let texts: Vec<_> = req
+            .messages
+            .iter()
+            .map(|m| m.content.joined_texts().unwrap())
+            .collect();
         assert_eq!(texts, ["SYS\n\nQ1", "Q2"]);
 
         // user が無ければ system 単独の user を作る
         let req = cl.base_request(&[]);
-        assert_eq!(req.messages[0].content.joined_texts().as_deref(), Some("SYS"));
+        assert_eq!(
+            req.messages[0].content.joined_texts().as_deref(),
+            Some("SYS")
+        );
 
         // フラグが無ければ従来通り system で送る
         let mut normal = lmstudio_test_client(ModelCapability::empty());
@@ -2314,7 +2443,8 @@ mod tests_lmstudio_probe {
         let gguf = serde_json::json!({"gguf": {"chat_template": "A"}});
         assert_eq!(chat_template_from_hf_model_info(&gguf), Some("A"));
         // safetensors リポジトリ(LM Studio の publisher/id から解決される LLM-JP の実例)
-        let jinja = serde_json::json!({"config": {"chat_template_jinja": "B", "tokenizer_config": {}}});
+        let jinja =
+            serde_json::json!({"config": {"chat_template_jinja": "B", "tokenizer_config": {}}});
         assert_eq!(chat_template_from_hf_model_info(&jinja), Some("B"));
         // 旧来の tokenizer_config 文字列
         let tok = serde_json::json!({"config": {"tokenizer_config": {"chat_template": "C"}}});
@@ -2324,7 +2454,10 @@ mod tests_lmstudio_probe {
             {"name": "tool_use", "template": "T"}, {"name": "default", "template": "D"}
         ]}}});
         assert_eq!(chat_template_from_hf_model_info(&named), Some("D"));
-        assert_eq!(chat_template_from_hf_model_info(&serde_json::json!({})), None);
+        assert_eq!(
+            chat_template_from_hf_model_info(&serde_json::json!({})),
+            None
+        );
     }
 
     #[test]

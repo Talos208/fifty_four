@@ -77,3 +77,57 @@ FiftyFour 言語専用のルールとして適用され、他の言語・LSP サ
 `global_lsp_settings.semantic_token_rules` に同じ形で書いても良い(ただし全言語に効く。
 `"foreground_color": "#rrggbb"` のような色指定も可能)。両方が定義されている場合の優先順位は
 未確認なので、基本的にはどちらか一方だけを使うこと。
+
+## 文章品質診断(quality)
+
+`lsp.fifty-four.initialization_options.quality` の下に書く。すべて省略可能で、省略した項目は既定値になる。
+診断は `.txt` 原稿が対象(`.md` も対象にするなら `include_md`)。台詞(`「」`内)は、記号の誤用
+(`punct-char`)を除いて対象外。
+
+```json
+{
+  "lsp": {
+    "fifty-four": {
+      "initialization_options": {
+        "quality": {
+          "enabled": true,
+          "idle_ms": 800,
+          "include_md": false,
+
+          "llm_review": false,
+          "llm_review_idle_ms": 5000,
+          "llm_review_max_chars": 3000,
+
+          "rules": {
+            "disabled": ["fragment-run", "grandiose-word"],
+            "fragment_max_chars": 10,
+            "fragment_run": 3,
+            "grandiose_threshold": 3,
+            "vocab_extra": { "grandiose_words": ["比類なき"] },
+            "stock_phrases": ["重要なのは", "と言えるだろう"]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+- **`llm_review`**(既定 `false`): 決定的ルールでは拾えない「AI が書いたような不自然さ」(場面の壮大化・
+  無生物の擬人化・直訳の比喩・段落の閉じ方の均一化など)を LLM に診断させる。`llm.deferred`
+  (無ければ `llm.ondemand`)の LLM を使うので、課金・負荷を意識して明示的に有効にすること。
+  最後の編集から `llm_review_idle_ms` 経つ、またはファイルを開く・保存すると起動する。未診断の段落
+  (本文ハッシュが未登録のもの)だけを送るので、2回目以降は差分しか送らない。LLM の応答待ちの間に入った
+  編集は無視され、その段落は次のアイドル時か保存で再診断される。
+- **`rules.disabled`**: 無効にするルールコード。コードは診断の `code` と同じ(例 `no-chain`)。未知のコードは無視。
+- **`rules.*`(閾値)**: `QualityConfig`(`lsp/src/quality/mod.rs`)のフィールド名がそのままキーになる。
+  型が合わない値があると、`rules` 全体が既定値に戻る(警告がログに出る)。
+- **`rules.*`(語彙リスト)**: `grandiose_words` / `pseudo_concrete_words` / `stock_phrases` /
+  `translationese_phrases` / `abstract_have_nouns` / `inanimate_subjects` / `inanimate_verbs` /
+  `intensifiers` / `hedges` は**置き換え**。既定に足すだけなら `vocab_extra`(キーはリスト名)を使う。
+  ファンタジーなどで「運命」「残酷」が正当に頻出する作風は、`grandiose_words` を絞るか、
+  `grandiose-word` を `disabled` に入れる。
+
+デバッグビルドでは、指摘が `db/fifty_four.db` の `quality_findings`(決定的ルール・LLM とも)、
+LLM の要求と生応答が `quality_reviews` に記録される。決定的ルールは前回の診断に無かった指摘だけを記録する。
+LLM の抜粋が本文中に見つからなかった指摘は、`message` の末尾が「(位置特定失敗)」になる。
