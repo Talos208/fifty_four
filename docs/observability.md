@@ -197,9 +197,37 @@ panic 以外にも「Otel へ何も送出せずプロセスが終了する経路
    `async_main` 内での unwind により `_log: Logger` の Drop が正しく呼ばれ、既に安全。
    `tokio::spawn` された別タスクの panic は上記のグローバルな panic hook で既にカバー済み。
 
+## メトリクス
+
+定義と記録用ヘルパは `lsp/src/metrics.rs`。`otel` feature 無効時は同名の空関数になるため、
+呼び出し側に cfg は要らない。インスタンスは初回利用時に `global::meter("fifty_four")` から
+生成される(`Logger::new` が `set_meter_provider` した後)。
+
+| 名前 | 種類 | 属性 | 計測点 |
+|---|---|---|---|
+| `fifty_four.llm.requests` | Counter | `provider`, `model`, `outcome` | `llm.rs` `with_model` の `exec_chat` ごと |
+| `fifty_four.llm.request.duration` | Histogram(s) | `provider`, `model` | 同上(1往復単位。境界は 0.5〜80s) |
+| `fifty_four.llm.tokens` | Counter | `provider`, `model`, `type`(input/output/reasoning) | 同上。API が返した `usage` |
+| `fifty_four.llm.tool_calls` | Counter | `tool` | `respond_tool` |
+| `fifty_four.lsp.request.duration` | Histogram(s) | `method` | 現状 `semanticTokens/full` のみ |
+| `fifty_four.quality.analysis.duration` | Histogram(s) | なし | `run_quality_analysis` の `analyze_document` |
+| `fifty_four.quality.findings` | Counter | `rule_code`, `source`(rule/llm) | 新規に記録した指摘のみ(debounce ごとの再発行は数えない) |
+| `fifty_four.quality.llm_review.paragraphs` | Counter | `result`(cache_hit/sent/failed) | `run_llm_review` |
+| `fifty_four.quality.llm_review.skipped_running` | Counter | なし | 同一 URI で実行中のためスキップした回数 |
+
+`fifty_four.llm.requests` の `outcome`: `ok` / `busy`(503) / `http_error` / `gen_error` / `error` /
+`param_stripped`(400 で非対応パラメータを外して再送) / `cancelled`。
+
+- **`cancelled`**: 補完の連打などで `exec_chat` の待機中に future が drop された場合。
+  `llm.rs` の `InFlightRequest`(drop ガード)が記録する。補完の取り消し率はこれで見る
+  (`completion` ハンドラ自体は計測していない。応答時間の大半は `fifty_four.llm.request.duration` に出る)。
+- **cardinality**: 属性に URI・ファイル名・本文は入れない。`model` は設定由来、`rule_code` は
+  コード由来でどちらも有界。
+
 ## 関連ファイル
 
 - `lsp/src/logging.rs` — 本ドキュメントが説明する実装本体
+- `lsp/src/metrics.rs` — メトリクスの定義と記録ヘルパ
 - `lsp/src/main.rs` — `default_acp_log_level()`（ACP 用 `RUST_LOG` 既定値）、`install_acp_panic_hook()`
 - `docs/acp-agent.md` — ACP エージェント固有のログ確認手順
 

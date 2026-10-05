@@ -4,12 +4,15 @@
 //! 撒き散らすだけで誤検知の温床になるため、内容語を扱うルールはすべて除外する
 //! (`STok::is_proper_noun`)。
 
+use tracing::instrument;
+
 use super::sentence::{STok, SentenceSpan};
 use super::{Finding, FindingRange, QualityConfig, RuleId, Severity, char_class_runs};
 use crate::types::{LineData, TokenStatus};
 
 /// `tokens[i]..=tokens[j]` を覆う `FindingRange` を作る。
-fn token_range(tokens: &[STok], i: usize, j: usize) -> FindingRange {
+#[instrument(ret)]
+pub(super) fn token_range(tokens: &[STok], i: usize, j: usize) -> FindingRange {
     let a = &tokens[i];
     let b = &tokens[j];
     FindingRange {
@@ -23,7 +26,12 @@ fn token_range(tokens: &[STok], i: usize, j: usize) -> FindingRange {
 /// 昇順の出現位置列 `positions` を、クラスタ先頭からの距離が `window` 以内に収まるクラスタへまとめ、
 /// 要素数が `threshold` 以上のクラスタだけを `(positions のインデックス開始, 終了)` で返す。
 /// `WordRepeat`/`RedundantToIu` の「近接反復」判定で共用する。
-fn cluster_matches(positions: &[usize], window: usize, threshold: usize) -> Vec<(usize, usize)> {
+#[instrument(ret)]
+pub(super) fn cluster_matches(
+    positions: &[usize],
+    window: usize,
+    threshold: usize,
+) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < positions.len() {
@@ -45,6 +53,7 @@ fn cluster_matches(positions: &[usize], window: usize, threshold: usize) -> Vec<
 
 /// ドキュメント末尾で括弧・ルビ記法が閉じ切れていないか。
 /// `ensure_line_state` 畳み込み後の最終行 `state_after` を見るだけで判定できる。
+#[instrument(ret)]
 pub(crate) fn bracket_mismatch(lines: &[LineData]) -> Vec<Finding> {
     let Some(last) = lines.last() else {
         return Vec::new();
@@ -70,10 +79,12 @@ pub(crate) fn bracket_mismatch(lines: &[LineData]) -> Vec<Finding> {
 
 /// 三点リーダ「…」・ダッシュ「―」の連続数。出版慣行ではどちらも2個1組。
 /// lindera はこれらの記号を未知語として一切トークン化しないため、行の生テキストを直接見る。
+#[instrument(ret)]
 pub(crate) fn ellipsis_pair(lines: &[LineData], config: &QualityConfig) -> Vec<Finding> {
     let mut findings = Vec::new();
     for (line_no, line) in lines.iter().enumerate() {
-        for (target, label) in [('…', "三点リーダ「…」"), ('―', "ダッシュ「―」")] {
+        for (target, label) in [('…', "三点リーダ「…」"), ('―', "ダッシュ「―」")]
+        {
             for (start, end, count) in char_class_runs(&line.text, |c| c == target) {
                 let ok = if config.ellipsis_strict {
                     count == 2
@@ -107,21 +118,71 @@ pub(crate) fn ellipsis_pair(lines: &[LineData], config: &QualityConfig) -> Vec<F
 /// 台詞(`in_dialogue`)を挟んだ場合や、空行を挟んだ段落区切りを挟んだ場合は、
 /// その時点で連続をリセットする(台詞や改段落を挟んでも「地の文だけを抜き出せば連続」
 /// という判定は、実際に読んだときの印象と合わないため)。
+
+#[instrument(skip(tokens, lines), ret)]
 pub(crate) fn sentence_end_repeat(
     tokens: &[STok],
     sentences: &[SentenceSpan],
     lines: &[LineData],
     config: &QualityConfig,
 ) -> Vec<Finding> {
-    let threshold = config.sentence_end_repeat_threshold;
+    sentence_streak_findings(
+        tokens,
+        sentences,
+        lines,
+        config.sentence_end_repeat_threshold,
+        RuleId::SentenceEndRepeat,
+        Severity::Information,
+        |tokens, s| sentence_ending_auxiliary(tokens, s).map(str::to_string),
+        |base, n| format!("文末「{base}」が{n}文連続しています"),
+    )
+}
+
+/// 「文ごとの特徴(キー)が同じ文が `threshold` 文以上連続していないか」の共通実装。
+/// 文末(`sentence_end_repeat`)・文頭(`slop::sentence_start_repeat`)・短文(`slop::fragment_run`)が共用する。
+///
+/// `key_of` が `None` を返した文は連続を切る。台詞を含む文と、空行(段落区切り)を挟んだ箇所でも連続を切る。
+#[allow(clippy::too_many_arguments)]
+#[instrument(skip(tokens, lines, key_of, message), ret)]
+pub(super) fn sentence_streak_findings(
+    tokens: &[STok],
+    sentences: &[SentenceSpan],
+    lines: &[LineData],
+    threshold: usize,
+    rule: RuleId,
+    severity: Severity,
+    key_of: impl Fn(&[STok], &SentenceSpan) -> Option<String>,
+    message: impl Fn(&str, usize) -> String,
+) -> Vec<Finding> {
     if threshold < 2 {
         return Vec::new();
     }
 
     let mut findings = Vec::new();
     let mut streak_ixs: Vec<usize> = Vec::new();
-    let mut streak_base: Option<&str> = None;
+    let mut streak_base: Option<String> = None;
     let mut prev_end_line: Option<usize> = None;
+
+    // 貯めた連続が閾値を満たしていれば `Finding` として確定させ、いずれにせよクリアする。
+    let flush = |streak_ixs: &mut Vec<usize>,
+                 streak_base: &mut Option<String>,
+                 findings: &mut Vec<Finding>| {
+        if streak_ixs.len() >= threshold {
+            let base = streak_base
+                .as_deref()
+                .expect("streak_ixs が非空なら streak_base も Some のはず");
+            let first = &sentences[streak_ixs[0]];
+            let last = &sentences[*streak_ixs.last().unwrap()];
+            findings.push(Finding {
+                rule,
+                severity,
+                message: message(base, streak_ixs.len()),
+                range: token_range(tokens, first.range.start, last.range.end - 1),
+            });
+        }
+        streak_ixs.clear();
+        *streak_base = None;
+    };
 
     for (ix, s) in sentences.iter().enumerate() {
         if s.range.is_empty() {
@@ -129,7 +190,7 @@ pub(crate) fn sentence_end_repeat(
         }
         if s.in_dialogue {
             // 台詞を挟んだら連続は途切れる。
-            flush_sentence_end_streak(&mut streak_ixs, &mut streak_base, tokens, sentences, threshold, &mut findings);
+            flush(&mut streak_ixs, &mut streak_base, &mut findings);
             prev_end_line = Some(tokens[s.range.end - 1].line);
             continue;
         }
@@ -137,59 +198,37 @@ pub(crate) fn sentence_end_repeat(
         // 直前の文とのあいだに空行(段落区切り)があれば連続をリセットする。
         if let Some(prev_line) = prev_end_line {
             let cur_line = tokens[s.range.start].line;
-            let paragraph_break = (prev_line + 1..cur_line)
-                .any(|l| lines.get(l).map(|ln| ln.text.trim().is_empty()).unwrap_or(false));
+            let paragraph_break = (prev_line + 1..cur_line).any(|l| {
+                lines
+                    .get(l)
+                    .map(|ln| ln.text.trim().is_empty())
+                    .unwrap_or(false)
+            });
             if paragraph_break {
-                flush_sentence_end_streak(&mut streak_ixs, &mut streak_base, tokens, sentences, threshold, &mut findings);
+                flush(&mut streak_ixs, &mut streak_base, &mut findings);
             }
         }
 
-        let ending = sentence_ending_auxiliary(tokens, s);
-        match (streak_base, ending) {
-            (Some(b), Some(e)) if b == e => {
+        let key = key_of(tokens, s);
+        let same = matches!((&streak_base, &key), (Some(b), Some(k)) if b == k);
+        if same {
+            streak_ixs.push(ix);
+        } else {
+            flush(&mut streak_ixs, &mut streak_base, &mut findings);
+            if let Some(k) = key {
                 streak_ixs.push(ix);
-            }
-            _ => {
-                flush_sentence_end_streak(&mut streak_ixs, &mut streak_base, tokens, sentences, threshold, &mut findings);
-                if let Some(e) = ending {
-                    streak_ixs.push(ix);
-                    streak_base = Some(e);
-                }
+                streak_base = Some(k);
             }
         }
         prev_end_line = Some(tokens[s.range.end - 1].line);
     }
-    flush_sentence_end_streak(&mut streak_ixs, &mut streak_base, tokens, sentences, threshold, &mut findings);
+    flush(&mut streak_ixs, &mut streak_base, &mut findings);
 
     findings
 }
 
-/// `sentence_end_repeat` の走査中に貯めた連続文末ストリークを、閾値を満たしていれば
-/// `Finding` として確定させてクリアする。
-fn flush_sentence_end_streak(
-    streak_ixs: &mut Vec<usize>,
-    streak_base: &mut Option<&str>,
-    tokens: &[STok],
-    sentences: &[SentenceSpan],
-    threshold: usize,
-    findings: &mut Vec<Finding>,
-) {
-    if streak_ixs.len() >= threshold {
-        let base = streak_base.expect("streak_ixs が非空なら streak_base も Some のはず");
-        let first = &sentences[streak_ixs[0]];
-        let last = &sentences[*streak_ixs.last().unwrap()];
-        findings.push(Finding {
-            rule: RuleId::SentenceEndRepeat,
-            severity: Severity::Information,
-            message: format!("文末「{base}」が{}文連続しています", streak_ixs.len()),
-            range: token_range(tokens, first.range.start, last.range.end - 1),
-        });
-    }
-    streak_ixs.clear();
-    *streak_base = None;
-}
-
 /// 文末(句点直前)の内容語を除いた最後のトークンが助動詞なら、その原形を返す。
+#[instrument(ret)]
 fn sentence_ending_auxiliary<'a>(tokens: &'a [STok], span: &SentenceSpan) -> Option<&'a str> {
     tokens[span.range.clone()]
         .iter()
@@ -200,6 +239,7 @@ fn sentence_ending_auxiliary<'a>(tokens: &'a [STok], span: &SentenceSpan) -> Opt
 }
 
 /// 「AのBのCのD」: 連体化の「の」が1文中に閾値回数以上出現していないか。
+#[instrument(ret)]
 pub(crate) fn no_chain(
     tokens: &[STok],
     sentences: &[SentenceSpan],
@@ -222,10 +262,7 @@ pub(crate) fn no_chain(
             findings.push(Finding {
                 rule: RuleId::NoChain,
                 severity: Severity::Information,
-                message: format!(
-                    "「の」が1文中に{}回使われています",
-                    positions.len()
-                ),
+                message: format!("「の」が1文中に{}回使われています", positions.len()),
                 range: token_range(tokens, positions[0], *positions.last().unwrap()),
             });
         }
@@ -242,6 +279,7 @@ fn is_compound_wa(tokens: &[STok], i: usize) -> bool {
 }
 
 /// 係助詞「は」(複合形を除く)が1文中に閾値回数以上出現していないか(主題の重複)。
+#[instrument(ret)]
 pub(crate) fn topic_duplicate(
     tokens: &[STok],
     sentences: &[SentenceSpan],
@@ -280,6 +318,7 @@ pub(crate) fn topic_duplicate(
 
 /// 「〜することができる」(動詞 + こと(非自立) + が/は/も + できる)は「〜できる」に言い換えられる。
 /// 台詞は口語表現として正当なため対象外。
+#[instrument(ret)]
 pub(crate) fn redundant_can_do(tokens: &[STok], sentences: &[SentenceSpan]) -> Vec<Finding> {
     let mut findings = Vec::new();
     for s in sentences {
@@ -313,6 +352,7 @@ pub(crate) fn redundant_can_do(tokens: &[STok], sentences: &[SentenceSpan]) -> V
 }
 
 /// 「という」(格助詞「と」+ 動詞「いう」)の近接反復。台詞中の使用は対象外。
+#[instrument(ret)]
 pub(crate) fn redundant_to_iu(tokens: &[STok], config: &QualityConfig) -> Vec<Finding> {
     let positions: Vec<usize> = (1..tokens.len())
         .filter(|&i| {
@@ -344,6 +384,7 @@ pub(crate) fn redundant_to_iu(tokens: &[STok], config: &QualityConfig) -> Vec<Fi
 /// い抜き言葉。IPADIC は「てる/でる」を 動詞,非自立 の単一トークンとして辞書登録しており、
 /// 正規形「ている/でいる」との違いがそのままトークン単位で表れる(実測確認済み)。
 /// 台詞中の口語的な省略は正当な表現なので対象外にする。
+#[instrument(ret)]
 pub(crate) fn idrop_verb(tokens: &[STok]) -> Vec<Finding> {
     tokens
         .iter()
@@ -393,6 +434,7 @@ const RA_DROP_BASES: &[&str] = &[
 ];
 
 /// 台詞中のら抜きは口語表現として正当なため対象外。
+#[instrument(ret)]
 pub(crate) fn ra_drop(tokens: &[STok]) -> Vec<Finding> {
     tokens
         .iter()
@@ -416,6 +458,7 @@ pub(crate) fn ra_drop(tokens: &[STok]) -> Vec<Finding> {
 /// 二重敬語。「〜になる」(動詞,未然形)の直後に「れる/られる」(動詞,接尾)が続く形
 /// (例:「お読みになられる」)は、「になる」自体が既に敬語のため冗長。
 /// 台詞はキャラクターの口調(あえての過剰敬語等)の可能性があるため対象外。
+#[instrument(ret)]
 pub(crate) fn double_honorific(tokens: &[STok]) -> Vec<Finding> {
     let mut findings = Vec::new();
     for i in 0..tokens.len().saturating_sub(1) {
@@ -432,8 +475,7 @@ pub(crate) fn double_honorific(tokens: &[STok]) -> Vec<Finding> {
             findings.push(Finding {
                 rule: RuleId::DoubleHonorific,
                 severity: Severity::Warning,
-                message: "二重敬語の可能性があります(例:「〜になられる」→「〜になる」)"
-                    .to_string(),
+                message: "二重敬語の可能性があります(例:「〜になられる」→「〜になる」)".to_string(),
                 range: token_range(tokens, i, i + 1),
             });
         }
@@ -457,6 +499,7 @@ const FORMAL_KANJI_KANA_PAIRS: &[(&str, &str)] = &[
 /// 作者が一貫してその漢字表記を使っているなら、それはもう「誤り」ではなく文体(個性)。
 /// 文書内で対応する仮名表記が一度も使われていなければ指摘しない(=表記が首尾一貫している
 /// 限りは黙り、漢字/仮名が混在している語だけを指摘する)。台詞は対象外。
+#[instrument(ret)]
 pub(crate) fn kanji_formal_noun(tokens: &[STok]) -> Vec<Finding> {
     fn is_formal(t: &STok) -> bool {
         t.sub1() == "非自立" && matches!(t.pos(), "名詞" | "動詞") && !t.in_dialogue()
@@ -494,6 +537,7 @@ pub(crate) fn kanji_formal_noun(tokens: &[STok]) -> Vec<Finding> {
 /// 読点なしで一定文字数以上続く区間(地の文のみ)。
 /// 閾値は `config.comma_span_max_chars` を下限としつつ、文書全体の平均+2σがそれを
 /// 上回る場合はそちらを使う(句読点を控えめに打つ文体の作者を毎回誤検知させないため)。
+#[instrument(ret)]
 pub(crate) fn comma_span(
     tokens: &[STok],
     sentences: &[SentenceSpan],
@@ -520,6 +564,7 @@ pub(crate) fn comma_span(
 
 /// `comma_span` の下請け: 文(地の文のみ)を読点で分割した区間を
 /// `(開始トークン index, 終了トークン index, 文字数)` の列として集める。
+#[instrument(ret)]
 fn collect_comma_spans(tokens: &[STok], sentences: &[SentenceSpan]) -> Vec<(usize, usize, usize)> {
     let mut spans = Vec::new();
     for s in sentences {
@@ -544,6 +589,7 @@ fn collect_comma_spans(tokens: &[STok], sentences: &[SentenceSpan]) -> Vec<(usiz
 }
 
 /// 内容語(名詞,一般 / 動詞,自立 / 形容詞,自立。固有名詞・台詞は除外)の近接反復。
+#[instrument(skip(tokens), ret)]
 pub(crate) fn word_repeat(tokens: &[STok], config: &QualityConfig) -> Vec<Finding> {
     fn is_content_word(t: &STok) -> bool {
         if t.is_proper_noun() || t.in_dialogue() {
@@ -572,12 +618,19 @@ pub(crate) fn word_repeat(tokens: &[STok], config: &QualityConfig) -> Vec<Findin
     let mut findings = Vec::new();
     for base in order {
         let positions = &by_base[base];
-        for (a, b) in cluster_matches(positions, config.word_repeat_window, config.word_repeat_threshold) {
+        for (a, b) in cluster_matches(
+            positions,
+            config.word_repeat_window,
+            config.word_repeat_threshold,
+        ) {
             let (i, j) = (positions[a], positions[b]);
             findings.push(Finding {
                 rule: RuleId::WordRepeat,
                 severity: Severity::Information,
-                message: format!("「{base}」が近い範囲で{}回繰り返し使われています", b - a + 1),
+                message: format!(
+                    "「{base}」が近い範囲で{}回繰り返し使われています",
+                    b - a + 1
+                ),
                 range: token_range(tokens, i, j),
             });
         }
@@ -689,8 +742,7 @@ mod tests {
     #[test]
     fn test_sentence_end_repeat_continues_across_plain_line_break() {
         // 空行を挟まない単なる改行は連続を切らない。
-        let (lines, tokens, sentences) =
-            build_all("彼は走った。\n彼は笑った。\n彼は黙った。");
+        let (lines, tokens, sentences) = build_all("彼は走った。\n彼は笑った。\n彼は黙った。");
         let findings = sentence_end_repeat(&tokens, &sentences, &lines, &QualityConfig::default());
         assert_eq!(findings.len(), 1, "{:?}", findings);
     }
@@ -772,9 +824,8 @@ mod tests {
 
     #[test]
     fn test_redundant_to_iu_detects_repeated_use() {
-        let (tokens, _) = build(
-            "彼はそういうという。彼女もそういうという。彼らもまたそういうという。",
-        );
+        let (tokens, _) =
+            build("彼はそういうという。彼女もそういうという。彼らもまたそういうという。");
         let config = QualityConfig {
             to_iu_threshold: 3,
             ..Default::default()

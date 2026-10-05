@@ -22,6 +22,7 @@ mod frontmatter;
 mod highlight;
 mod llm;
 mod logging;
+mod metrics;
 mod outline;
 mod plot;
 mod plot_sync;

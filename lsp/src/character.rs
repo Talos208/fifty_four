@@ -268,7 +268,6 @@ impl CharacterStore {
     }
 
     /// ドキュメントパスを含む最長一致のワークスペースrootを返す。
-    #[instrument]
     pub(crate) fn resolve_workspace_for<'a>(
         doc_path: &Path,
         roots: &'a [PathBuf],
@@ -281,7 +280,7 @@ impl CharacterStore {
 
     /// 指定ワークスペースの許可名集合を構築する(人名ハイライトの絞り込み用)。
     /// 各ファイルの `included_characters`(wikilink先を#include展開済み)から名前を集める。
-    #[instrument]
+    #[instrument(skip(self), ret)]
     pub(crate) fn allowed_names(&self, workspace_root: &Path) -> std::collections::HashSet<String> {
         let mut names = std::collections::HashSet::new();
         let guard = self.0.workspaces.lock();
@@ -295,7 +294,7 @@ impl CharacterStore {
 
     /// 全ワークスペースの許可名の和集合(Linderaユーザー辞書構築用。トークナイズ品質の
     /// 担保だけが目的で、どのワークスペースの名前かを区別する必要はない)。
-    #[instrument]
+    #[instrument(skip(self), ret)]
     pub(crate) fn all_allowed_names(&self) -> std::collections::HashSet<String> {
         let mut names = std::collections::HashSet::new();
         let guard = self.0.workspaces.lock();
@@ -314,7 +313,7 @@ impl CharacterStore {
     /// 同じ wikilink 先が複数の追跡ファイルから到達可能だと、`included_characters` に
     /// 同一の見出しが重複して現れる。`included_character_files`(見出し → 実際の定義ファイル)
     /// で「定義元」単位に重複排除し、同じ内容を繰り返し表示しないようにする。
-    #[instrument]
+    #[instrument(skip(self), ret)]
     pub(crate) fn lookup_markdown(&self, workspace_root: &Path, surface: &str) -> Option<String> {
         if surface.is_empty() {
             return None;
@@ -357,7 +356,7 @@ impl CharacterStore {
     /// (`references`用: 本文走査で `Highlighter::is_recognized_name` の `allowed` として渡し、
     /// 品詞判定と絞り込みを同時に行う)。同名キャラが複数ファイルに存在する場合は
     /// 全員分の名前を和集合にする。
-    #[instrument]
+    #[instrument(skip(self), ret)]
     pub(crate) fn lookup_names(
         &self,
         workspace_root: &Path,
@@ -389,7 +388,7 @@ impl CharacterStore {
     /// (`goto_definition`用)。同名キャラが複数ファイルに存在する場合は全件返す
     /// (`lookup_markdown`が"---"区切りで全件連結するのと同じ方針)。
     /// 返り値はパスの昇順で安定させる(`HashMap`の走査順は不定なため)。
-    #[instrument]
+    #[instrument(skip(self), ret)]
     pub(crate) fn lookup_definitions(
         &self,
         workspace_root: &Path,
@@ -428,7 +427,7 @@ impl CharacterStore {
     /// `name`(部分一致)にマッチする最初のキャラクターについて、`tags`が示す属性の
     /// セクション本文を返す(`CharacterInfoTool`用)。ワークスペース内の全ファイルを
     /// 横断して検索する(1ファイルへの決め打ちをしない)。
-    #[cfg_attr(feature = "otel", tracing::instrument())]
+    #[cfg_attr(feature = "otel", instrument(skip(self), ret))]
     pub(crate) fn search(
         &self,
         workspace_root: &Path,
@@ -445,7 +444,10 @@ impl CharacterStore {
             });
         };
         for file in files.values() {
-            let Some((_, entry)) = file.included_characters.iter().find(|(k, _)| k.contains(name))
+            let Some((_, entry)) = file
+                .included_characters
+                .iter()
+                .find(|(k, _)| k.contains(name))
             else {
                 continue;
             };
@@ -998,8 +1000,16 @@ mod tests {
         let names = store.allowed_names(&root);
         assert!(names.contains("チャーチル"), "{:?}", names);
         assert!(names.contains("原顕三郎"), "1段目のリンク先: {:?}", names);
-        assert!(names.contains("高柳"), "2段目(推移的)のリンク先: {:?}", names);
-        assert!(names.contains("飛騨艦長"), "2段目リンク先のalias: {:?}", names);
+        assert!(
+            names.contains("高柳"),
+            "2段目(推移的)のリンク先: {:?}",
+            names
+        );
+        assert!(
+            names.contains("飛騨艦長"),
+            "2段目リンク先のalias: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -1040,7 +1050,11 @@ mod tests {
         );
         // lookup_definitions はcharactersベースなので、リンク先の名前では見つからない。
         assert!(store.lookup_definitions(&root, "エルミア").is_empty());
-        assert!(!store.lookup_definitions(&root, "ジェフ・クライン").is_empty());
+        assert!(
+            !store
+                .lookup_definitions(&root, "ジェフ・クライン")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1054,12 +1068,18 @@ mod tests {
                 "[[hoge/ijn.md]]\n\n# 近藤\n\n## 役割\n外務省職員。\n",
             )],
             &[
-                ("hoge/ijn.md", "[[高柳.md]]\n\n# 原顕三郎\n\n## 呼称\n- 原\n"),
+                (
+                    "hoge/ijn.md",
+                    "[[高柳.md]]\n\n# 原顕三郎\n\n## 呼称\n- 原\n",
+                ),
                 ("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n"),
             ],
         );
         let markdown = store.lookup_markdown(&root, "高柳");
-        assert!(markdown.is_some(), "wikilink経由のキャラでもhoverが出ること");
+        assert!(
+            markdown.is_some(),
+            "wikilink経由のキャラでもhoverが出ること"
+        );
         assert!(markdown.unwrap().contains("飛騨艦長"));
         // 自ファイルの見出しも従来通り引ける(回帰確認)。
         assert!(store.lookup_markdown(&root, "近藤").is_some());
@@ -1101,7 +1121,10 @@ mod tests {
                 "[[hoge/ijn.md]]\n\n# 近藤\n\n## 役割\n外務省職員。\n",
             )],
             &[
-                ("hoge/ijn.md", "[[高柳.md]]\n\n# 原顕三郎\n\n## 呼称\n- 原\n"),
+                (
+                    "hoge/ijn.md",
+                    "[[高柳.md]]\n\n# 原顕三郎\n\n## 呼称\n- 原\n",
+                ),
                 ("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n"),
             ],
         );
@@ -1122,7 +1145,12 @@ mod tests {
             &[("characters.md", "[[hoge/高柳.md]]も参照。\n")],
             &[("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n")],
         );
-        assert!(store.lookup_markdown(&root, "高柳").unwrap().contains("飛騨艦長"));
+        assert!(
+            store
+                .lookup_markdown(&root, "高柳")
+                .unwrap()
+                .contains("飛騨艦長")
+        );
 
         std::fs::write(
             root.join("hoge/高柳.md"),
@@ -1151,7 +1179,10 @@ mod tests {
         assert!(!store.is_tracked(&root, &target), "初期状態では未追跡");
 
         store.files_reachable_via_wikilink(&root);
-        assert!(store.is_tracked(&root, &target), "候補列挙で追跡対象へ昇格する");
+        assert!(
+            store.is_tracked(&root, &target),
+            "候補列挙で追跡対象へ昇格する"
+        );
 
         // ユーザーがそのファイルを編集した想定(did_save 経由の取り込み)。
         let edited = "# 高柳\n\n## 呼称\n\n- ユーザーが書いた呼称\n";
@@ -1203,7 +1234,11 @@ mod tests {
             "同一定義元の内容が重複しないこと: {:?}",
             markdown
         );
-        assert!(!markdown.contains("---"), "区切りが入らないこと: {:?}", markdown);
+        assert!(
+            !markdown.contains("---"),
+            "区切りが入らないこと: {:?}",
+            markdown
+        );
     }
 
     #[test]

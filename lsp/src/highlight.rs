@@ -4,7 +4,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::sync::atomic::Ordering::Relaxed;
-use std::usize;
 
 use lindera::mode::Mode;
 use lindera::tokenizer::TokenizerBuilder;
@@ -298,7 +297,7 @@ impl Highlighter {
             .filter_map(|mut t| {
                 let d = t.details();
                 if d[6] == "*" {
-                    trace!("\t{:?} {:?}", d[6], d[0..=3].to_vec());
+                    // trace!("\t{:?} {:?}", d[6], d[0..=3].to_vec());
                     if d[0] == "名詞" && d[1] == "サ変接続" {
                         // 不正なtokenはしまっちゃう
                         return None;

@@ -7,7 +7,7 @@
 
 use crate::character::CharacterStore;
 use crate::character_updater::UpdateState;
-use crate::flight_recorder::{FlightRecorder, PendingCandidate};
+use crate::flight_recorder::{FlightRecorder, PendingCandidate, QualityFindingRecord};
 use crate::highlight::Highlighter;
 use crate::llm::{Content, LlmError, LlmInterface};
 use crate::progress::CompletionProgress;
@@ -38,6 +38,13 @@ pub(crate) const LANGUAGE_ID: &str = "fiftyfour";
 /// `plot_sync::DEFAULT_PLOT_SYNC_IDLE_MS`(1500ms、破壊的なファイルリネームを伴うため長め)
 /// より短くし、タイピング追従と再解析コストのバランスを取る。
 const DEFAULT_QUALITY_IDLE_MS: u64 = 800;
+
+/// LLM 診断(`quality.llm_review`)を、最後の編集からどれだけ待って起動するかの既定値。
+/// 決定的診断(800ms)とは別に長めにして、打鍵ごとに LLM が走らないようにする。
+const DEFAULT_QUALITY_LLM_IDLE_MS: u64 = 5000;
+
+/// LLM 診断で1回の要求に載せる段落本文の最大文字数の既定値。
+const DEFAULT_QUALITY_LLM_MAX_CHARS: usize = 3000;
 
 /// `Backend` はサーバの状態を保持する構造体です。
 ///
@@ -92,6 +99,47 @@ pub(crate) struct Backend {
     // 次の `did_change` を通常の debounce ではなく即時実行に切り替えるための目印。
     // 詳細は `execute_command`/`note_quality_change` 参照。
     quality_fast_track: DashMap<String, ()>,
+    // `quality.rules`(閾値・語彙・disabled)。initialize で設定し、診断のたびに Arc を取り出す。
+    quality_config: Arc<parking_lot::RwLock<Arc<crate::quality::QualityConfig>>>,
+    // LLM 診断(オプトイン。既定は無効)。詳細は `run_llm_review`/`note_llm_review_change` 参照。
+    quality_llm_review: std::sync::atomic::AtomicBool,
+    quality_llm_idle_ms: std::sync::atomic::AtomicU64,
+    quality_llm_max_chars: std::sync::atomic::AtomicUsize,
+    // LLM 診断のアイドル待ち用世代カウンタ(決定的診断の `quality_generations` とは別)
+    quality_llm_generations: DashMap<String, Arc<parking_lot::Mutex<u64>>>,
+    // LLM 診断が実行中の URI。実行中の編集は無視する(中断も再予約もしない)
+    quality_llm_running: Arc<DashMap<String, ()>>,
+    // URI ごとの LLM 診断キャッシュ(段落ハッシュ → 指摘)
+    quality_llm_cache: Arc<DashMap<String, crate::quality::llm_review::ReviewCache>>,
+    // FlightRecorder へ記録済みの決定的指摘のキー集合(URI ごと。現在表示中の指摘と一致させる)
+    quality_recorded: Arc<DashMap<String, HashSet<u64>>>,
+}
+
+/// `quality` の解析・LLM 診断を detached task から呼ぶために、共有状態をひとまとめにしたもの。
+/// どのフィールドも `Arc`/ハンドルなので clone は安い(`Backend` を持ち込めない task 用)。
+#[derive(Clone)]
+struct QualityEnv {
+    text: Arc<DashMap<String, Vec<LineData>>>,
+    highlighter: Highlighter,
+    client: Client,
+    db: Arc<FlightRecorder>,
+    config: Arc<crate::quality::QualityConfig>,
+    llm_cache: Arc<DashMap<String, crate::quality::llm_review::ReviewCache>>,
+    recorded: Arc<DashMap<String, HashSet<u64>>>,
+    llm: Arc<tokio::sync::Mutex<Option<Box<dyn LlmInterface>>>>,
+    llm_running: Arc<DashMap<String, ()>>,
+}
+
+/// `quality_llm_running` の印を、早期 return・panic を含むどの経路でも確実に外す。
+struct LlmRunningGuard {
+    running: Arc<DashMap<String, ()>>,
+    key: String,
+}
+
+impl Drop for LlmRunningGuard {
+    fn drop(&mut self) {
+        self.running.remove(&self.key);
+    }
 }
 
 /// サーバの capabilities を組み立てる。`Backend`(`Client` を保持する)から独立した
@@ -347,14 +395,9 @@ fn build_semantic_tokens(
 ///
 /// `Highlighter::ensure_line_state` でトークン状態を畳み込んでから `quality::analyze_document`
 /// に渡す(`quality` モジュール冒頭のドキュメント参照)。
-#[instrument(skip(text, highlighter, client))]
-async fn run_quality_analysis(
-    text: &DashMap<String, Vec<LineData>>,
-    highlighter: &Highlighter,
-    client: &Client,
-    uri: &Uri,
-) {
-    let Some(mut lines) = text.get_mut(uri.as_str()) else {
+#[instrument(skip(env))]
+async fn run_quality_analysis(env: &QualityEnv, uri: &Uri) {
+    let Some(mut lines) = env.text.get_mut(uri.as_str()) else {
         debug!("quality[{}]: 未オープンの URI", uri.as_str());
         return;
     };
@@ -362,17 +405,188 @@ async fn run_quality_analysis(
         return;
     }
     let last = lines.len() - 1;
-    highlighter.ensure_line_state(&mut lines, last);
+    env.highlighter.ensure_line_state(&mut lines, last);
 
-    let config = crate::quality::QualityConfig::default();
-    let report = crate::quality::analyze_document(&lines, &config);
+    let analysis_started = std::time::Instant::now();
+    let report = crate::quality::analyze_document(&lines, &env.config);
+    crate::metrics::quality_analysis(analysis_started.elapsed().as_secs_f64());
     // 範囲に紐づかない文体統計(名詞率/MVR/文長分散等)は診断化せず、デバッグログにのみ残す
     // (将来レポート表示を足すまでの暫定。`quality::stats::DocStats` 参照)。
     debug!("quality[{}]: stats={:?}", uri.as_str(), report.stats);
-    let diagnostics = findings_to_diagnostics(&report.findings, &lines);
+
+    // FlightRecorder へは、前回の診断に無かった決定的ルールの指摘だけを記録する
+    // (debounce のたびに全件を書くと膨らむ。LLM の指摘は `run_llm_review` が記録する)。
+    let prev = env
+        .recorded
+        .get(uri.as_str())
+        .map(|s| s.clone())
+        .unwrap_or_default();
+    let (current, fresh) = crate::quality::new_findings(&prev, &report.findings, &lines);
+    let records: Vec<QualityFindingRecord> = fresh
+        .into_iter()
+        .map(|(f, excerpt)| QualityFindingRecord {
+            source: "rule",
+            rule_code: f.rule.code().to_string(),
+            severity: f.severity.as_str(),
+            line: f.range.start_line,
+            excerpt,
+            message: f.message.clone(),
+            review_id: None,
+        })
+        .collect();
+    for r in &records {
+        crate::metrics::quality_finding(&r.rule_code, r.source);
+    }
+    env.recorded.insert(uri.as_str().to_string(), current);
+
+    // LLM 診断のキャッシュを現在の本文へ当てはめて合流させる。`publish_diagnostics` は
+    // URI 単位の全置換なので、合流させないと決定的診断と LLM 診断が互いに消し合う。
+    let mut findings = report.findings;
+    if let Some(cache) = env.llm_cache.get(uri.as_str()) {
+        findings.extend(crate::quality::llm_review::restore_findings(&lines, &cache));
+    }
+    let diagnostics = findings_to_diagnostics(&findings, &lines);
     drop(lines);
 
-    client.publish_diagnostics(uri.clone(), diagnostics, None).await;
+    env.db.record_quality_findings(uri.as_str(), &records);
+    env.client
+        .publish_diagnostics(uri.clone(), diagnostics, None)
+        .await;
+}
+
+/// LLM による文章診断(オプトイン)。未診断の段落だけを batch にして `llm.deferred` の LLM へ送り、
+/// 結果を段落ハッシュ単位でキャッシュして診断を再発行する。
+///
+/// - 同じ URI で実行中なら何もしない。実行中に入った編集は無視する(中断も再予約もしない)。
+///   応答は**送信時点**の段落本文・ハッシュでキャッシュに入れるので、応答待ちの間に編集された
+///   段落の指摘は表示されない(次の編集のアイドル時か保存で再診断される)。
+/// - LLM 呼び出しが失敗したら、その batch 以降は諦める(キャッシュしないので次回やり直す)。
+/// - 要求・生応答・指摘(位置特定に失敗した抜粋も含む)を FlightRecorder に記録する。
+#[instrument(skip(env))]
+async fn run_llm_review(env: QualityEnv, uri: Uri, max_chars: usize) {
+    use crate::quality::llm_review;
+
+    if env
+        .llm_running
+        .insert(uri.as_str().to_string(), ())
+        .is_some()
+    {
+        debug!("quality llm[{}]: 実行中のためスキップ", uri.as_str());
+        crate::metrics::quality_llm_skipped_running();
+        return;
+    }
+    let _guard = LlmRunningGuard {
+        running: env.llm_running.clone(),
+        key: uri.as_str().to_string(),
+    };
+
+    let batches = {
+        let Some(lines) = env.text.get(uri.as_str()) else {
+            return;
+        };
+        let cache = env
+            .llm_cache
+            .get(uri.as_str())
+            .map(|c| c.clone())
+            .unwrap_or_default();
+        let paragraphs = llm_review::paragraphs(&lines);
+        let batches = llm_review::build_batches(&paragraphs, &cache, max_chars);
+        let pending: usize = batches.iter().map(|b| b.paragraphs.len()).sum();
+        crate::metrics::quality_llm_paragraphs(
+            "cache_hit",
+            paragraphs.len().saturating_sub(pending) as u64,
+        );
+        batches
+    };
+    if batches.is_empty() {
+        debug!("quality llm[{}]: 未診断の段落なし", uri.as_str());
+        return;
+    }
+
+    let Some((template, options)) = crate::frontmatter::load_prompt("prompt_quality_review.md")
+    else {
+        error!("prompt_quality_review.md not found");
+        return;
+    };
+
+    for batch in batches {
+        let vars = HashMap::from([
+            ("CONTEXT", batch.context.as_str()),
+            ("TARGET", batch.target.as_str()),
+        ]);
+        let prompt = crate::frontmatter::expand(&template, &vars);
+
+        let batch_len = batch.paragraphs.len() as u64;
+        let mut review_id = -1i64;
+        let result = crate::llm::use_llm_with_option(&env.llm, options.clone(), async |l| {
+            l.add(Content::Text(prompt));
+            l.reasoning_level(0.0);
+            review_id = env.db.record_quality_review(
+                uri.as_str(),
+                l.get_model(),
+                l.build_content().as_str(),
+            );
+            l.chat().await
+        })
+        .await;
+
+        let response = match result {
+            Ok(r) => r,
+            Err(LlmError::NotInitialized) => {
+                debug!("quality llm[{}]: LLM が未初期化", uri.as_str());
+                return;
+            }
+            Err(err) => {
+                warn!("quality llm[{}]: LLM 呼び出しに失敗: {:?}", uri.as_str(), err);
+                crate::metrics::quality_llm_paragraphs("failed", batch_len);
+                break;
+            }
+        };
+        crate::metrics::quality_llm_paragraphs("sent", batch_len);
+        env.db.record_quality_review_response(review_id, &response);
+
+        // 診断済みの段落は、指摘が無くても空の Vec で登録する(再送しない)。
+        let mut per_hash: HashMap<u64, Vec<llm_review::RawLlmFinding>> =
+            batch.paragraphs.iter().map(|p| (p.hash, Vec::new())).collect();
+        let mut records = Vec::new();
+        for pf in llm_review::parse_review(&response) {
+            // LLM が存在しない段落番号を返したら捨てる
+            let Some(para) = batch.paragraphs.iter().find(|p| p.line == pf.paragraph) else {
+                continue;
+            };
+            let located = llm_review::locate_quote(&para.text, &pf.raw.quote).is_some();
+            let mut message = llm_review::display_message(&pf.raw);
+            if !located {
+                message.push_str("(位置特定失敗)");
+            }
+            records.push(QualityFindingRecord {
+                source: "llm",
+                rule_code: crate::quality::RuleId::LlmReview.code().to_string(),
+                severity: crate::quality::Severity::Information.as_str(),
+                line: para.line,
+                excerpt: pf.raw.quote.clone(),
+                message,
+                review_id: (review_id > 0).then_some(review_id),
+            });
+            if let Some(v) = per_hash.get_mut(&para.hash) {
+                v.push(pf.raw);
+            }
+        }
+        for r in &records {
+            crate::metrics::quality_finding(&r.rule_code, r.source);
+        }
+        env.db.record_quality_findings(uri.as_str(), &records);
+
+        // 応答待ちの間にタブが閉じられていたら、キャッシュを復活させない。
+        if !env.text.contains_key(uri.as_str()) {
+            return;
+        }
+        env.llm_cache
+            .entry(uri.as_str().to_string())
+            .or_default()
+            .extend(per_hash);
+        run_quality_analysis(&env, &uri).await;
+    }
 }
 
 /// `quality::Finding` を LSP の `Diagnostic` へ変換する。
@@ -577,17 +791,42 @@ impl LanguageServer for Backend {
                     self.quality_include_md
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                // LLM 診断(オプトイン)。`llm.deferred` の LLM を使うので、課金・負荷を意識して既定は無効。
+                if q.get("llm_review").and_then(|v| v.as_bool()) == Some(true) {
+                    self.quality_llm_review
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(v) = q.get("llm_review_idle_ms").and_then(|v| v.as_u64()) {
+                    self.quality_llm_idle_ms
+                        .store(v, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(v) = q.get("llm_review_max_chars").and_then(|v| v.as_u64()) {
+                    self.quality_llm_max_chars
+                        .store(v as usize, std::sync::atomic::Ordering::Relaxed);
+                }
+                // 閾値・語彙・無効化するルール。書かなかった項目は既定値(`QualityConfig::from_value`)。
+                if let Some(rules) = q.get("rules") {
+                    *self.quality_config.write() =
+                        Arc::new(crate::quality::QualityConfig::from_value(rules));
+                }
             } else {
                 debug!("no quality config; using defaults");
             }
             debug!(
-                "quality effective: enabled={} idle_ms={} include_md={}",
+                "quality effective: enabled={} idle_ms={} include_md={} llm_review={} llm_idle_ms={} llm_max_chars={} disabled_rules={}",
                 self.quality_enabled
                     .load(std::sync::atomic::Ordering::Relaxed),
                 self.quality_idle_ms
                     .load(std::sync::atomic::Ordering::Relaxed),
                 self.quality_include_md
                     .load(std::sync::atomic::Ordering::Relaxed),
+                self.quality_llm_review
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.quality_llm_idle_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.quality_llm_max_chars
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.quality_config.read().disabled.len(),
             );
 
             if let Some(llm_root) = opt.get("llm") {
@@ -722,6 +961,7 @@ impl LanguageServer for Backend {
 
         // quality: 開いた直後に一度、debounce を待たず診断する。
         self.run_quality_now(&params.text_document.uri).await;
+        self.start_llm_review_now(&params.text_document.uri);
 
         // plot_sync: baseline(ディスク上の .txt 群と一致していると信じる章名の並び)を開いた時点の内容で種付けする。
         if self
@@ -770,6 +1010,7 @@ impl LanguageServer for Backend {
 
         // quality: 保存は「編集の確定」の明確なシグナルなので、debounce を待たず即座に診断し直す。
         self.run_quality_now(&params.text_document.uri).await;
+        self.start_llm_review_now(&params.text_document.uri);
 
         // plot_sync: 保存は「編集の確定」の明確なシグナルなので、debounce を待たず即座に章名変更を判定・実行する。
         if let Some(ws) = self.plot_md_workspace(&params.text_document.uri).await {
@@ -1026,6 +1267,12 @@ impl LanguageServer for Backend {
             .remove(params.text_document.uri.as_str());
         self.quality_fast_track
             .remove(params.text_document.uri.as_str());
+        self.quality_llm_generations
+            .remove(params.text_document.uri.as_str());
+        self.quality_llm_cache
+            .remove(params.text_document.uri.as_str());
+        self.quality_recorded
+            .remove(params.text_document.uri.as_str());
         self.client
             .publish_diagnostics(params.text_document.uri.clone(), Vec::new(), None)
             .await;
@@ -1055,6 +1302,7 @@ impl LanguageServer for Backend {
         &self,
         params: SemanticTokensParams,
     ) -> tower_lsp_server::jsonrpc::Result<Option<SemanticTokensResult>> {
+        let started = std::time::Instant::now();
         let uri = params.text_document.uri.as_str();
         let allowed = match self.resolve_workspace(&params.text_document.uri).await {
             Some(ws) => self.character_store.allowed_names(&ws),
@@ -1078,6 +1326,7 @@ impl LanguageServer for Backend {
             debug!("semantic_tokens_full[{}]: 未オープンの URI", uri);
             return Ok(None);
         };
+        crate::metrics::lsp_request("semanticTokens/full", started.elapsed().as_secs_f64());
 
         let tokens = SemanticTokens {
             result_id: None,
@@ -2236,6 +2485,18 @@ impl Backend {
             quality_idle_ms: std::sync::atomic::AtomicU64::new(DEFAULT_QUALITY_IDLE_MS),
             quality_include_md: std::sync::atomic::AtomicBool::new(false),
             quality_fast_track: DashMap::new(),
+            quality_config: Arc::new(parking_lot::RwLock::new(Arc::new(
+                crate::quality::QualityConfig::default(),
+            ))),
+            quality_llm_review: std::sync::atomic::AtomicBool::new(false),
+            quality_llm_idle_ms: std::sync::atomic::AtomicU64::new(DEFAULT_QUALITY_LLM_IDLE_MS),
+            quality_llm_max_chars: std::sync::atomic::AtomicUsize::new(
+                DEFAULT_QUALITY_LLM_MAX_CHARS,
+            ),
+            quality_llm_generations: DashMap::new(),
+            quality_llm_running: Arc::new(DashMap::new()),
+            quality_llm_cache: Arc::new(DashMap::new()),
+            quality_recorded: Arc::new(DashMap::new()),
         }
     }
 
@@ -2724,9 +2985,10 @@ impl Backend {
         } else {
             std::time::Duration::from_millis(self.quality_idle_ms.load(Relaxed))
         };
-        let text = self.text.clone();
-        let highlighter = self.highlighter.clone();
-        let client = self.client.clone();
+        // LLM 診断のアイドルタイマー(決定的診断とは独立。実行中の編集は無視する)
+        self.note_llm_review_change(uri);
+
+        let env = self.quality_env();
         let uri = uri.clone();
 
         tokio::spawn(async move {
@@ -2738,7 +3000,7 @@ impl Backend {
                 );
                 return;
             }
-            run_quality_analysis(&text, &highlighter, &client, &uri).await;
+            run_quality_analysis(&env, &uri).await;
         });
     }
 
@@ -2756,7 +3018,87 @@ impl Backend {
             let mut g = gen_cell.lock();
             *g += 1;
         }
-        run_quality_analysis(&self.text, &self.highlighter, &self.client, uri).await;
+        run_quality_analysis(&self.quality_env(), uri).await;
+    }
+
+    /// `quality` の解析・LLM 診断に必要な共有状態を束ねる(detached task へ渡す用)。
+    /// 設定(`quality.rules`)はこの時点のスナップショットを取る。
+    fn quality_env(&self) -> QualityEnv {
+        QualityEnv {
+            text: self.text.clone(),
+            highlighter: self.highlighter.clone(),
+            client: self.client.clone(),
+            db: self.db.clone(),
+            config: self.quality_config.read().clone(),
+            llm_cache: self.quality_llm_cache.clone(),
+            recorded: self.quality_recorded.clone(),
+            llm: self.background_llm.clone(),
+            llm_running: self.quality_llm_running.clone(),
+        }
+    }
+
+    /// `uri` の LLM 診断のアイドル待ち用世代カウンタを取得する。無ければ0で新規作成する。
+    fn quality_llm_generation(&self, uri: &Uri) -> Arc<parking_lot::Mutex<u64>> {
+        self.quality_llm_generations
+            .entry(uri.as_str().to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(0)))
+            .clone()
+    }
+
+    /// `did_change` から呼ぶ。LLM 診断(`quality.llm_review`)のアイドルタイマーを張る。
+    ///
+    /// 決定的診断(`note_quality_change`)と同じく世代カウンタ方式だが、待ち時間は長い
+    /// (`llm_review_idle_ms`、既定 5 秒)。**LLM が実行中の URI への編集は無視する**
+    /// (実行中の要求を中断も再予約もしない)。応答は送信時点の段落ハッシュでキャッシュされるので、
+    /// 応答待ち中に編集された段落の指摘は出ず、次の編集のアイドル時か保存で再診断される。
+    fn note_llm_review_change(&self, uri: &Uri) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.quality_llm_review.load(Relaxed) {
+            return;
+        }
+        if self.quality_llm_running.contains_key(uri.as_str()) {
+            debug!("quality llm[{}]: 実行中の編集は無視", uri.as_str());
+            return;
+        }
+        let gen_cell = self.quality_llm_generation(uri);
+        let generation = {
+            let mut g = gen_cell.lock();
+            *g += 1;
+            *g
+        };
+        let idle = std::time::Duration::from_millis(self.quality_llm_idle_ms.load(Relaxed));
+        let max_chars = self.quality_llm_max_chars.load(Relaxed);
+        let env = self.quality_env();
+        let uri = uri.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(idle).await;
+            if *gen_cell.lock() != generation {
+                debug!(
+                    "quality llm: superseded by a later change, skip (uri={})",
+                    uri.as_str()
+                );
+                return;
+            }
+            run_llm_review(env, uri, max_chars).await;
+        });
+    }
+
+    /// `did_open`/`did_save` から呼ぶ。アイドルを待たず、未診断の段落があれば LLM 診断を起動する。
+    fn start_llm_review_now(&self, uri: &Uri) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.quality_enabled.load(Relaxed)
+            || !self.quality_llm_review.load(Relaxed)
+            || !self.is_quality_target(uri)
+        {
+            return;
+        }
+        let max_chars = self.quality_llm_max_chars.load(Relaxed);
+        let env = self.quality_env();
+        let uri = uri.clone();
+        tokio::spawn(async move {
+            run_llm_review(env, uri, max_chars).await;
+        });
     }
 
     /// plot_sync の逆方向本体。plot.md 内の `old_name` 見出しを1件だけ特定し、章名部分だけを

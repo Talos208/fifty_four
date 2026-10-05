@@ -8,6 +8,7 @@
 
 ## Gotchas
 - `tower_lsp_server::jsonrpc::Result<T>` は1引数型エイリアス。`use` でインポートすると `std::result::Result` がシャドウされる。トレイト実装では `std::result::Result<T, E>` を完全修飾名で使うこと
+- 連続して呼ばれるメソッド、分岐や判断がほとんどないメソッド以外では、戻り値も含めtraceを出すこと
 
 ## Tests
 - `cd lsp && cargo test test_parse_characters_md` — CharacterInfoTool のユニットテスト
