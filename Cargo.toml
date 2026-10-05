@@ -1,4 +1,6 @@
 [workspace]
 members = ["lsp", "extension", "prepare"]
+# 既定の "1" を明示(edition 2024 の "3" にすると feature 解決が変わるため据え置き)
+resolver = "1"
 
 [workspace.dependencies]
