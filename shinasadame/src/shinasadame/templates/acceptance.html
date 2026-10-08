@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% from "_macros.html" import doc %}
+{% block title %}採用率 - shinasadame{% endblock %}
+{% block content %}
+<h1>補完の採用率</h1>
+
+{% if f.doc %}
+<p class="doc-filter">
+  文書: <strong>{{ doc(f.doc, full=True) }}</strong>
+  <a href="{{ qs(doc='') }}">すべての文書に戻す</a>
+</p>
+{% endif %}
+
+<form method="get" class="filters">
+  {% if f.doc %}<input type="hidden" name="doc" value="{{ f.doc }}">{% endif %}
+  <label>期間 <input type="date" name="from" value="{{ f['from'] }}"> 〜 <input type="date" name="to" value="{{ f['to'] }}"></label>
+  <label>モデル
+    <select name="model">
+      <option value="">すべて</option>
+      {% for m in models %}<option value="{{ m }}" {% if m == f.model %}selected{% endif %}>{{ m }}</option>{% endfor %}
+    </select>
+  </label>
+  <button type="submit">絞り込む</button>
+</form>
+
+<section class="cards">
+  <div class="card"><span class="label">補完リクエスト</span><span class="num">{{ summary.total }}</span></div>
+  <div class="card"><span class="label">採用あり</span><span class="num">{{ summary.accepted }}</span></div>
+  <div class="card"><span class="label">採用率(リクエスト単位)</span><span class="num">{{ summary.rate | pct }}</span></div>
+</section>
+<p class="muted">
+  「採用」は、挿入された文字列が候補と完全一致したときだけ記録されます。採用後に手直しした場合や、別の補完で上書きされた場合は未採用になるため、ここで示す採用率は<strong>下限値</strong>です。
+</p>
+
+<div class="charts">
+  <div><h2>日別推移</h2><div id="chart-day" class="chart"></div></div>
+  <div><h2>モデル別</h2><div id="chart-model" class="chart"></div></div>
+  <div><h2>順位別(候補単位)</h2><div id="chart-rank" class="chart"></div></div>
+</div>
+
+<h2>文書別</h2>
+<p class="muted">文書を選ぶと、上のサマリーとグラフがその文書だけの採用率になります。</p>
+<table>
+  <thead><tr><th>文書</th><th class="r">補完</th><th class="r">採用あり</th><th class="r">採用率</th></tr></thead>
+  <tbody>
+  {% for d in documents %}
+    <tr{% if d.key == f.doc %} class="current"{% endif %}>
+      <td><a href="{{ qs(doc=d.key) }}">{{ doc(d.key) }}</a></td>
+      <td class="r">{{ d.total }}</td><td class="r">{{ d.accepted }}</td><td class="r">{{ d.rate | pct }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="4" class="muted">データがありません</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<script src="/static/echarts.min.js"></script>
+<script>
+  const SID = {{ sid }};
+  const esc = s => String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+  const QS = location.search;
+  const FIXED = {
+    day: {title: '日', type: 'line'},
+    model: {title: 'モデル', type: 'bar'},
+    rank: {title: '順位', type: 'bar'},
+  };
+  async function draw(by) {
+    const res = await fetch(`/api/s/${SID}/acceptance${QS ? QS + '&' : '?'}by=${by}`);
+    const {rows} = await res.json();
+    const el = document.getElementById('chart-' + by);
+    if (!rows.length) { el.textContent = 'データがありません'; el.classList.add('muted'); return; }
+    const chart = echarts.init(el);
+    chart.setOption({
+      tooltip: {trigger: 'axis', formatter: ps => {
+        const r = rows[ps[0].dataIndex];
+        return `${esc(r.key)}<br>採用率 ${r.rate == null ? '—' : (r.rate * 100).toFixed(1) + '%'} (${r.accepted}/${r.total})`;
+      }},
+      grid: {left: 48, right: 16, top: 16, bottom: 56},
+      xAxis: {type: 'category', data: rows.map(r => by === 'rank' ? '#' + r.key : r.key), axisLabel: {interval: 0, rotate: by === 'model' ? 20 : 0}},
+      yAxis: {type: 'value', min: 0, max: 1, axisLabel: {formatter: v => (v * 100) + '%'}},
+      series: [{type: FIXED[by].type, data: rows.map(r => r.rate), smooth: false}],
+    });
+    window.addEventListener('resize', () => chart.resize());
+  }
+  ['day', 'model', 'rank'].forEach(draw);
+</script>
+{% endblock %}

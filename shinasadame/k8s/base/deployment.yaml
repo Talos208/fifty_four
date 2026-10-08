@@ -1,0 +1,64 @@
+# web と worker は同じ Pod に置き、同じ PVC 上の SQLite(app.db / queue.db)を共有する。
+# 同一ノード・同一ファイルシステムなので SQLite のロックが正しく働く。
+# PVC が RWO なので replicas は 1 固定。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shinasadame
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # RWO の PVC を新旧 Pod が取り合わないようにする
+  selector:
+    matchLabels:
+      app: shinasadame
+  template:
+    metadata:
+      labels:
+        app: shinasadame
+    spec:
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: web
+          image: shinasadame:latest
+          # docker build したイメージを registry-mirror 経由で pull する。タグを変えたら下のイメージ名も合わせる
+          imagePullPolicy: IfNotPresent
+          command: ["uvicorn", "shinasadame.app:app", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATA_DIR
+              value: /data
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://localhost:4317
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 10
+        - name: worker
+          image: shinasadame:latest
+          imagePullPolicy: IfNotPresent
+          command: ["huey_consumer", "shinasadame.tasks.huey", "-w", "1", "-k", "thread"]
+          env:
+            - name: DATA_DIR
+              value: /data
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://localhost:4317
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: shinasadame-data

@@ -1,0 +1,17 @@
+# LoadBalancer 直結(既定の k8s/)を、Traefik の Ingress 経由に切り替えるオーバーレイ。
+#   kubectl apply -k shinasadame/k8s/overlays/ingress
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: shinasadame
+resources:
+  - ../../base
+  - ingress.yaml
+patches:
+  # 外への公開は Ingress に任せ、Service はクラスタ内向けにする
+  - target:
+      kind: Service
+      name: shinasadame
+    patch: |-
+      - op: replace
+        path: /spec/type
+        value: ClusterIP

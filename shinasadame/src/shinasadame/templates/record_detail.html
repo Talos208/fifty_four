@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% from "_macros.html" import doc %}
+{% block title %}{{ spec.label }} #{{ record_id }} - shinasadame{% endblock %}
+
+{% macro cell(v) -%}
+  {%- if v is none -%}<span class="muted">—</span>
+  {%- elif v is string and (v | length > 80 or '\n' in v) -%}<pre>{{ v }}</pre>
+  {%- else -%}{{ v }}{%- endif -%}
+{%- endmacro %}
+
+{% block content %}
+<p><a href="/s/{{ sid }}/records/{{ table }}">← {{ spec.label }}の一覧</a></p>
+<h1>{{ spec.label }} #{{ record_id }}</h1>
+
+<dl class="fields">
+  {% for k, v in row.items() if k != 'snapshot_id' %}
+  <dt>{{ k }}</dt><dd>{% if k == 'document_uri' %}{{ doc(v, full=True) }}{% else %}{{ cell(v) }}{% endif %}</dd>
+  {% endfor %}
+</dl>
+
+{% if review %}
+<h2>関連する LLM レビュー</h2>
+<p><a href="/s/{{ sid }}/records/quality_reviews/{{ review.id }}">quality_reviews #{{ review.id }}</a> ({{ review.model_name }})</p>
+{% endif %}
+
+{% for label, child_table, items in children %}
+<h2>{{ label }} <small class="muted">{{ items | length }} 件</small></h2>
+{% if items %}
+<table>
+  <thead><tr>{% for k in items[0].keys() if k != 'snapshot_id' %}<th>{{ k }}</th>{% endfor %}</tr></thead>
+  <tbody>
+  {% for it in items %}
+    <tr>
+      {% for k, v in it.items() if k != 'snapshot_id' %}
+      <td class="{{ 'sel' if k == 'selected' and v == 1 else '' }}">
+        {% if k == 'selected' or k == 'applied' %}{{ '✓' if v == 1 else ('—' if v is none else '') }}
+        {% elif k == 'confidence' %}{{ '%.2f' | format(v) if v is not none else '—' }}
+        {% elif child_table == 'quality_findings' and k == 'id' %}<a href="/s/{{ sid }}/records/quality_findings/{{ v }}">{{ v }}</a>
+        {% elif k == 'document_uri' %}{{ doc(v) }}
+        {% else %}{{ cell(v) }}{% endif %}
+      </td>
+      {% endfor %}
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}<p class="muted">なし</p>{% endif %}
+{% endfor %}
+{% endblock %}

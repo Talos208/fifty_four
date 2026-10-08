@@ -1,0 +1,17 @@
+# Traefik(Ingress コントローラ)の Helm values。ingress 経由で公開する場合だけ使う。
+# 手順は ../README.md の「Ingress(Traefik)で公開する」を参照。
+#
+# 既存の LoadBalancer 直結(k8s/ そのまま)と同じ URL の感覚で使えるよう、
+# Traefik 自身を localhost:8054 に公開する。ホスト名は Ingress 側の host で振り分ける。
+
+ports:
+  web:
+    exposedPort: 8054 # LoadBalancer が公開するポート。コンテナ側(8000)は既定のまま
+  websecure:
+    expose:
+      default: false # TLS は使わない(ローカル専用)
+
+# IngressClass "traefik" を既定にする(チャートの既定値。明示しておく)
+ingressClass:
+  enabled: true
+  isDefaultClass: true
