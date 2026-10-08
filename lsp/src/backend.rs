@@ -533,11 +533,15 @@ async fn run_llm_review(env: QualityEnv, uri: Uri, max_chars: usize) {
         let response = match result {
             Ok(r) => r,
             Err(LlmError::NotInitialized) => {
-                debug!("quality llm[{}]: LLM が未初期化", uri.as_str());
+                error!("quality llm[{}]: LLM が未初期化", uri.as_str());
                 return;
             }
             Err(err) => {
-                warn!("quality llm[{}]: LLM 呼び出しに失敗: {:?}", uri.as_str(), err);
+                warn!(
+                    "quality llm[{}]: LLM 呼び出しに失敗: {:?}",
+                    uri.as_str(),
+                    err
+                );
                 crate::metrics::quality_llm_paragraphs("failed", batch_len);
                 break;
             }
@@ -546,8 +550,11 @@ async fn run_llm_review(env: QualityEnv, uri: Uri, max_chars: usize) {
         env.db.record_quality_review_response(review_id, &response);
 
         // 診断済みの段落は、指摘が無くても空の Vec で登録する(再送しない)。
-        let mut per_hash: HashMap<u64, Vec<llm_review::RawLlmFinding>> =
-            batch.paragraphs.iter().map(|p| (p.hash, Vec::new())).collect();
+        let mut per_hash: HashMap<u64, Vec<llm_review::RawLlmFinding>> = batch
+            .paragraphs
+            .iter()
+            .map(|p| (p.hash, Vec::new()))
+            .collect();
         let mut records = Vec::new();
         for pf in llm_review::parse_review(&response) {
             // LLM が存在しない段落番号を返したら捨てる
@@ -620,7 +627,10 @@ fn findings_to_diagnostics(
 /// ルールが不正なバイトオフセット(範囲外・文字境界の途中)を返してもスライスで panic しないよう、
 /// 長さと文字境界の両方へクランプする。
 fn finding_range_to_lsp(r: crate::quality::FindingRange, lines: &[LineData]) -> Range {
-    let start_text = lines.get(r.start_line).map(|l| l.text.as_str()).unwrap_or("");
+    let start_text = lines
+        .get(r.start_line)
+        .map(|l| l.text.as_str())
+        .unwrap_or("");
     let end_text = lines.get(r.end_line).map(|l| l.text.as_str()).unwrap_or("");
     let clamp = |text: &str, byte: usize| {
         let mut b = byte.min(text.len());
@@ -2014,16 +2024,25 @@ impl LanguageServer for Backend {
                     offset.saturating_sub(precursor_len as usize) as u32,
                 );
 
-                let items = crate::cursor_context::extract_candidate_lines(&response)
-                    .into_iter()
-                    .map(|r| {
+                // 確信度の高い順に並んで返る。クライアント側の並びは sort_text(rank)で固定する
+                let items = crate::code_action::parse_candidates(&response)
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, cand)| {
+                        let r = cand.text.as_str();
                         let sr = crate::cursor_context::decorate_candidate(context, r, prev_tail);
 
                         debug!("record candidate");
-                        self.db
-                            .record_candidate(completion_id, &sr, r, &mut pending);
+                        self.db.record_candidate(
+                            completion_id,
+                            rank,
+                            cand.confidence,
+                            &sr,
+                            r,
+                            &mut pending,
+                        );
 
-                        debug!("Completion Item");
+                        debug!("Completion Item {:?}", cand);
                         // newText/label は「直前の語トークン + 続き」。置換 range も
                         // トークン先頭からカーソルまでにすることで、確定時は
                         // トークンがトークン+続きへ置き換わり実質続きの挿入になる。
@@ -2032,9 +2051,11 @@ impl LanguageServer for Backend {
                             range: Range::new(edit_start, cursor),
                             new_text: new_text.clone(),
                         }));
+                        let sort_text = format!("{rank:03}");
                         if new_text.chars().count() > 25 {
                             CompletionItem {
                                 label: shorten(&new_text, 25),
+                                sort_text: Some(sort_text.clone()),
                                 kind: Some(CompletionItemKind::TEXT),
                                 filter_text: Some(precursor_token.clone()),
                                 documentation: Some(Documentation::MarkupContent(MarkupContent {
@@ -2049,6 +2070,7 @@ impl LanguageServer for Backend {
                         } else {
                             CompletionItem {
                                 label: new_text.clone(),
+                                sort_text: Some(sort_text),
                                 kind: Some(CompletionItemKind::TEXT),
                                 filter_text: Some(precursor_token.clone()),
                                 text_edit,
@@ -2277,13 +2299,13 @@ impl LanguageServer for Backend {
                     params.text_document.uri.clone(),
                     vec![TextEdit {
                         range: edit_range,
-                        new_text: candidate.clone(),
+                        new_text: candidate.text.clone(),
                     }],
                 )])),
                 ..Default::default()
             };
             CodeActionOrCommand::CodeAction(CodeAction {
-                title: candidate.clone(),
+                title: candidate.text.clone(),
                 kind: Some(CodeActionKind::REFACTOR_REWRITE),
                 edit: Some(edit),
                 ..Default::default()
@@ -2372,7 +2394,7 @@ impl LanguageServer for Backend {
                 args.uri.clone(),
                 vec![TextEdit {
                     range: edit_range,
-                    new_text: candidates[0].clone(),
+                    new_text: candidates[0].text.clone(),
                 }],
             )])),
             ..Default::default()
@@ -2512,7 +2534,7 @@ impl Backend {
         target_range: Range,
         mode: crate::code_action::ActionMode,
         target_text: &str,
-    ) -> Option<tokio::sync::watch::Receiver<Option<Arc<Vec<String>>>>> {
+    ) -> Option<tokio::sync::watch::Receiver<Option<Arc<Vec<crate::code_action::Candidate>>>>> {
         let uri = document_uri.as_str();
 
         let before = crate::cursor_context::before_sentences_upto(
@@ -2629,7 +2651,12 @@ impl Backend {
                 }
             };
             for (i, candidate) in candidates.iter().enumerate() {
-                db.record_code_action_candidate(action_id, i, candidate);
+                db.record_code_action_candidate(
+                    action_id,
+                    i,
+                    &candidate.text,
+                    candidate.confidence,
+                );
             }
             // 受信側が誰もいなくても(全リクエストがキャンセル済みでも)送信でき、
             // その場合は結果を無視してよい(次に同じ範囲へ来たリクエストが拾う)。

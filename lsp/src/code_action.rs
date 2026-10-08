@@ -5,6 +5,7 @@
 //! CodeAction 組み立ては `backend.rs` の `code_action` ハンドラが担う。
 
 use crate::types::LineData;
+use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 use tokio::task::AbortHandle;
 use tower_lsp_server::lsp_types::{Position, Range, Uri};
@@ -60,7 +61,7 @@ impl JobKey {
 /// 結果を拾える。
 #[derive(Debug)]
 pub(crate) struct RunningJob {
-    pub(crate) rx: tokio::sync::watch::Receiver<Option<Arc<Vec<String>>>>,
+    pub(crate) rx: tokio::sync::watch::Receiver<Option<Arc<Vec<Candidate>>>>,
     pub(crate) abort: AbortHandle,
 }
 
@@ -174,44 +175,114 @@ pub(crate) fn decide_mode(texts: &[LineData], range: Range) -> ActionMode {
 /// Anthropic など `maxItems` 非対応のプロバイダでは送信前に除去されるためここで揃える。
 const MAX_CANDIDATES: usize = 3;
 
-/// LLM 応答を候補の列へ分解する(最大 [`MAX_CANDIDATES`] 件)。
+/// LLM が返した候補1件。`confidence` は LLM 自己申告の確信度(0.0〜1.0)で、
+/// 返さなかった/不正だった場合は `None`(並びは末尾、FlightRecorder では NULL)。
+#[derive(Clone, PartialEq)]
+pub(crate) struct Candidate {
+    pub(crate) text: String,
+    pub(crate) confidence: Option<f64>,
+}
+
+impl Debug for Candidate {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Candidate")
+            .field("conf.", &self.confidence)
+            .field("text", &self.text)
+            .finish()
+    }
+}
+
+impl Candidate {
+    fn new(text: impl Into<String>, confidence: Option<f64>) -> Self {
+        Self {
+            text: text.into(),
+            confidence,
+        }
+    }
+}
+
+/// LLM の自己申告した確信度を 0.0〜1.0 に正規化する。
 ///
-/// プロンプトは frontmatter の `schema` で `{"candidates": ["...", "..."]}` を要求する
-/// (`use_llm_with_option` が構造化出力 / プロンプト埋め込みのどちらでも面倒を見る)。
-/// **候補内の改行を保つためにこの形式が必要**で、補完が使っている
-/// `extract_candidate_lines` のような行分割だと、複数行にわたる書き換えが
-/// 別々の候補にバラされてしまう。
+/// - 有限でない値(NaN/∞)は信用できないので `None`
+/// - 1.0 を超え 100.0 以下は「0〜100 のスケールで答えた」とみなして 100 で割る
+/// - それ以外の範囲外は 0.0〜1.0 へ丸める
+pub(crate) fn normalize_confidence(raw: f64) -> Option<f64> {
+    if !raw.is_finite() {
+        return None;
+    }
+    let v = if raw > 1.0 && raw <= 100.0 {
+        raw / 100.0
+    } else {
+        raw
+    };
+    Some(v.clamp(0.0, 1.0))
+}
+
+/// 確信度の降順に安定ソートする。`None` は末尾、同値は LLM が返した順を保つ。
+fn sort_by_confidence_desc(list: &mut [Candidate]) {
+    list.sort_by(|a, b| match (a.confidence, b.confidence) {
+        (Some(x), Some(y)) => y.total_cmp(&x),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+}
+
+/// LLM 応答を候補の列へ分解し、確信度の高い順に並べる(最大 [`MAX_CANDIDATES`] 件)。
 ///
-/// JSON として読めなかった場合(スキーマを無視するモデル等)は行分割へフォールバック
-/// する。その場合だけは複数行の候補を表現できない。
+/// プロンプトは frontmatter の `schema` で
+/// `{"candidates": [{"text": "...", "confidence": 0.8}, ...]}` を要求する
+///
+/// JSON として読めなかった場合(スキーマを無視するモデル等)はの旧形式行分割へ
+/// フォールバックする。その場合は確信度は None になる
 #[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
 #[instrument]
-pub(crate) fn parse_candidates(response: &str) -> Vec<String> {
+pub(crate) fn parse_candidates(response: &str) -> Vec<Candidate> {
     if let Some(mut list) = parse_candidates_json(response) {
+        // 切り詰めの前に並べ替える(確信度の高い候補を残すため)
+        sort_by_confidence_desc(&mut list);
         list.truncate(MAX_CANDIDATES);
         return list;
+    }
+    // `candidates` キーを持つのは半端なJSONになってしまった応答。行分割すると `{"candidates":`
+    // のような JSON 断片が候補として挿入されてしまうので、空にして「候補なし」扱いにする
+    if response.contains("\"candidates\"") {
+        log::debug!("parse_candidates: malformed/empty candidates JSON, no candidates");
+        return Vec::new();
     }
     log::debug!("parse_candidates: not JSON, falling back to line split");
     crate::cursor_context::extract_candidate_lines(response)
         .into_iter()
         .take(MAX_CANDIDATES)
-        .map(|s| s.to_string())
+        .map(|s| Candidate::new(s, None))
         .collect()
 }
 
 /// `{"candidates": [...]}` 形式のパース。候補が1件も取れなければ `None`
 /// (呼び出し元が行分割へフォールバックできるようにするため)。
 #[instrument]
-fn parse_candidates_json(response: &str) -> Option<Vec<String>> {
+fn parse_candidates_json(response: &str) -> Option<Vec<Candidate>> {
     let json = crate::text::extract_json(response)?;
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     let items = value.get("candidates")?.as_array()?;
-    let list: Vec<String> = items
+    let list: Vec<Candidate> = items
         .iter()
-        .filter_map(|v| v.as_str())
+        .filter_map(|v| match v {
+            serde_json::Value::String(s) => Some((s.as_str(), None)),
+            serde_json::Value::Object(o) => {
+                let text = o.get("text")?.as_str()?;
+                let confidence = o
+                    .get("confidence")
+                    .and_then(|c| c.as_f64())
+                    .and_then(normalize_confidence);
+                Some((text, confidence))
+            }
+            _ => None,
+        })
         // 候補「内部」の改行は保つが、前後の空白・改行は落とす。
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .map(|(s, c)| (s.trim(), c))
+        .filter(|(s, _)| !s.is_empty())
+        .map(|(s, c)| Candidate::new(s, c))
         .collect();
     (!list.is_empty()).then_some(list)
 }
@@ -311,13 +382,21 @@ mod tests {
 
     // ---- parse_candidates ----
 
+    fn texts(list: Vec<Candidate>) -> Vec<String> {
+        list.into_iter().map(|c| c.text).collect()
+    }
+
+    fn cand(text: &str, confidence: Option<f64>) -> Candidate {
+        Candidate::new(text, confidence)
+    }
+
     #[test]
     fn test_parse_candidates_json_preserves_newlines_within_candidate() {
         // 本題: 複数行の書き換えが1つの候補として保たれること
         // (行分割だと "一行目" と "二行目" が別候補にバラされてしまう)。
         let response = r#"{"candidates": ["一行目です。\n二行目です。", "別案です。"]}"#;
         assert_eq!(
-            parse_candidates(response),
+            texts(parse_candidates(response)),
             vec!["一行目です。\n二行目です。", "別案です。"]
         );
     }
@@ -325,26 +404,33 @@ mod tests {
     #[test]
     fn test_parse_candidates_truncates_to_max() {
         let response = r#"{"candidates": ["a", "b", "c", "d", "e"]}"#;
-        assert_eq!(parse_candidates(response), vec!["a", "b", "c"]);
+        assert_eq!(texts(parse_candidates(response)), vec!["a", "b", "c"]);
     }
 
     #[test]
     fn test_parse_candidates_json_inside_code_fence() {
         let response = "以下が結果です:\n```json\n{\"candidates\": [\"候補1\", \"候補2\"]}\n```";
-        assert_eq!(parse_candidates(response), vec!["候補1", "候補2"]);
+        assert_eq!(texts(parse_candidates(response)), vec!["候補1", "候補2"]);
     }
 
     #[test]
     fn test_parse_candidates_json_drops_empty_and_trims() {
         let response = r#"{"candidates": ["  候補1  ", "", "   "]}"#;
-        assert_eq!(parse_candidates(response), vec!["候補1"]);
+        assert_eq!(texts(parse_candidates(response)), vec!["候補1"]);
     }
 
     #[test]
     fn test_parse_candidates_falls_back_to_line_split() {
         // スキーマを無視して素の行を返すモデルへのフォールバック。
         let response = "候補1\n候補2\n候補3";
-        assert_eq!(parse_candidates(response), vec!["候補1", "候補2", "候補3"]);
+        assert_eq!(
+            parse_candidates(response),
+            vec![
+                cand("候補1", None),
+                cand("候補2", None),
+                cand("候補3", None)
+            ]
+        );
     }
 
     #[test]
@@ -352,6 +438,68 @@ mod tests {
         // JSON ではあるが期待キーが無い場合も行分割へ倒す(空リストで詰まらせない)。
         let response = r#"{"result": ["候補1"]}"#;
         assert!(!parse_candidates(response).is_empty());
+    }
+
+    #[test]
+    fn test_parse_candidates_empty_or_truncated_candidates_json_yields_nothing() {
+        // JSON の断片が行分割で候補として挿入されないこと
+        assert!(parse_candidates(r#"{"candidates": []}"#).is_empty());
+        assert!(parse_candidates(r#"{"candidates": [{"text": "途中で切"#).is_empty());
+    }
+
+    #[test]
+    fn test_parse_candidates_object_form_sorted_by_confidence_desc() {
+        let response = r#"{"candidates": [
+            {"text": "低", "confidence": 0.2},
+            {"text": "高", "confidence": 0.9},
+            {"text": "中", "confidence": 0.5}
+        ]}"#;
+        assert_eq!(
+            parse_candidates(response),
+            vec![
+                cand("高", Some(0.9)),
+                cand("中", Some(0.5)),
+                cand("低", Some(0.2))
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_candidates_sort_is_stable_and_none_goes_last() {
+        let response = r#"{"candidates": [
+            {"text": "不明", "confidence": null},
+            {"text": "同値1", "confidence": 0.5},
+            "文字列",
+            {"text": "同値2", "confidence": 0.5}
+        ]}"#;
+        assert_eq!(
+            texts(parse_candidates(response)),
+            vec!["同値1", "同値2", "不明"]
+        );
+    }
+
+    #[test]
+    fn test_parse_candidates_sorts_before_truncating() {
+        // 4件目が最高確信度でも、切り詰めで捨てられないこと
+        let response = r#"{"candidates": [
+            {"text": "a", "confidence": 0.1},
+            {"text": "b", "confidence": 0.2},
+            {"text": "c", "confidence": 0.3},
+            {"text": "d", "confidence": 0.9}
+        ]}"#;
+        assert_eq!(texts(parse_candidates(response)), vec!["d", "c", "b"]);
+    }
+
+    #[test]
+    fn test_normalize_confidence() {
+        assert_eq!(normalize_confidence(0.0), Some(0.0));
+        assert_eq!(normalize_confidence(0.85), Some(0.85));
+        assert_eq!(normalize_confidence(1.0), Some(1.0));
+        assert_eq!(normalize_confidence(85.0), Some(0.85)); // 0〜100 スケール誤用
+        assert_eq!(normalize_confidence(1000.0), Some(1.0));
+        assert_eq!(normalize_confidence(-0.3), Some(0.0));
+        assert_eq!(normalize_confidence(f64::NAN), None);
+        assert_eq!(normalize_confidence(f64::INFINITY), None);
     }
 
     // ---- decide_job ----

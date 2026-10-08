@@ -1,6 +1,6 @@
 ---
 schema: >
-  {"type":"object","properties":{"candidates":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":3}},"required":["candidates"],"additionalProperties":false}
+  {"type":"object","properties":{"candidates":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string"},"confidence":{"type":"number"}},"required":["text","confidence"],"additionalProperties":false},"minItems":1,"maxItems":3}},"required":["candidates"],"additionalProperties":false}
 schema_name: rewrite_candidates
 # 対象テキスト(選択範囲)長に比例。長め(~650字)の選択でも3候補(短い/同程度/長い)が収まるよう厚めに確保
 max_tokens: 4096
@@ -17,18 +17,19 @@ max_tokens: 4096
 - `plot_info`: この章（chapter_name に「{{CHAPTER}}」を指定）のプロットや伏線を取得する
 - `character_info`: 場面に登場する人物の設定（口調・性格・関係性など）を取得する
 取得した情報は候補を作る判断にのみ用いること。
+現在{{CHAPTER}}の章を執筆している。{{PROGRESS}}
 
 # 禁止事項
 - 対象テキストと異なる意味・展開への変更
 - 対象テキストの一部だけを返すこと
-- マークダウン化、番号付け、括弧類での囲み
 - 候補の意図や狙いの説明（例:「〜を強調する表現」のような、候補そのものではない文）
 
-出力は `{"candidates": ["候補1", "候補2", "候補3"]}` という JSON のみとし、JSON 以外の文字を一切含めないこと。
+各候補には `confidence`(0.0〜1.0 の小数)を付けよ。文脈との整合性などから見て、その候補が著者に採用される見込みの高さを正直に自己評価した値とし、候補間で差をつけること(1.0 は「ほぼ確実」、0.0 は「ほぼ採用されない」)。
+出力は `{"candidates": [{"text": "候補1", "confidence": 0.8}, {"text": "候補2", "confidence": 0.5}, {"text": "候補3", "confidence": 0.3}]}` という JSON のみとし、JSON 以外の文字を一切含めないこと。
 
-現在小説の{{CHAPTER}}の章を執筆している。{{PROGRESS}}以下の対象テキストを、意味を変えずにより良い表現へ書き換えたい。
-
+# 著者は以下の質問をしている。候補を作る参考にしてもよい
 {{CHAT}}
+
 # 直前の文脈
 {{TEXT}}
 

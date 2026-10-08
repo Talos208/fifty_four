@@ -129,6 +129,8 @@ impl FlightRecorder {
     pub(crate) fn record_candidate(
         &self,
         completion_id: u32,
+        rank: usize,
+        confidence: Option<f64>,
         candidate_text: &str,
         display_text: &str,
         pending: &mut Vec<PendingCandidate>,
@@ -137,10 +139,10 @@ impl FlightRecorder {
             match db.query_row(
                 indoc!(
                     "INSERT INTO completion_candidates
-                    (completion_id, rank, candidate)
-                    VALUES (?,?,?) RETURNING id;"
+                    (completion_id, rank, confidence, candidate)
+                    VALUES (?,?,?,?) RETURNING id;"
                 ),
-                rusqlite::params![completion_id, 0, candidate_text],
+                rusqlite::params![completion_id, rank as i64, confidence, candidate_text],
                 |row| row.get::<_, i64>(0),
             ) {
                 Ok(id) => pending.push(PendingCandidate {
@@ -253,15 +255,16 @@ impl FlightRecorder {
         code_action_id: i64,
         rank: usize,
         candidate: &str,
+        confidence: Option<f64>,
     ) {
         if let Some(db) = self.conn.try_lock_for(std::time::Duration::from_secs(1)) {
             if let Err(e) = db.execute(
                 indoc!(
                     "INSERT INTO code_action_candidates
-                    (code_action_id, rank, candidate)
-                    VALUES (?,?,?);"
+                    (code_action_id, rank, candidate, confidence)
+                    VALUES (?,?,?,?);"
                 ),
-                rusqlite::params![code_action_id, rank as i64, candidate],
+                rusqlite::params![code_action_id, rank as i64, candidate, confidence],
             ) {
                 debug!("record_code_action_candidate failed: {}", e);
             }
@@ -446,6 +449,33 @@ mod tests {
     }
 
     #[test]
+    fn test_candidate_confidence_roundtrip() {
+        let fr = FlightRecorder::new(&temp_db("confidence"));
+        let cid = fr.record_completion("file:///a.txt", 0, 0, "model-x", "prompt");
+        let mut pending = Vec::new();
+        fr.record_candidate(cid, 0, Some(0.9), "高", "高", &mut pending);
+        fr.record_candidate(cid, 1, None, "不明", "不明", &mut pending);
+        let aid = fr.record_code_action("file:///a.txt", "rephrase", "対象", "model-x", "prompt");
+        fr.record_code_action_candidate(aid, 0, "案", Some(0.7));
+
+        let db = fr.conn.lock();
+        let got: Vec<(i64, Option<f64>)> = db
+            .prepare("SELECT rank, confidence FROM completion_candidates ORDER BY rank")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(got, vec![(0, Some(0.9)), (1, None)]);
+        let ca: Option<f64> = db
+            .query_row("SELECT confidence FROM code_action_candidates", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(ca, Some(0.7));
+    }
+
+    #[test]
     fn test_record_quality_findings_empty_is_noop() {
         let fr = FlightRecorder::new(&temp_db("empty"));
         fr.record_quality_findings("file:///a.txt", &[]);
@@ -483,6 +513,8 @@ impl FlightRecorder {
     pub(crate) fn record_candidate(
         &self,
         _completion_id: u32,
+        _rank: usize,
+        _confidence: Option<f64>,
         _candidate_text: &str,
         _display_text: &str,
         _pending: &mut Vec<PendingCandidate>,
@@ -514,6 +546,7 @@ impl FlightRecorder {
         _code_action_id: i64,
         _rank: usize,
         _candidate: &str,
+        _confidence: Option<f64>,
     ) {
     }
 
