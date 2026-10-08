@@ -1,0 +1,21 @@
+# ホスト名は *.localhost にする。File System Access API は secure context が必要で、
+# localhost と *.localhost は HTTP でも secure context として扱われる
+# (shinasadame.local のような独自ホスト名は、TLS が無いと取り込み画面が動かない)。
+# Chrome / Edge は *.localhost を自動でループバックに解決する。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shinasadame
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: shinasadame.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: shinasadame
+                port:
+                  number: 8054

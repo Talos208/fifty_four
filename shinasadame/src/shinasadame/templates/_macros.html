@@ -1,0 +1,10 @@
+{# document_uri を日本語のファイル名で出す。フルパスはツールチップ(full=True なら本文にも) #}
+{% macro doc(uri, full=False) -%}
+  {%- set d = uri | doc_name -%}
+  {%- if d is none -%}<span class="muted">—</span>
+  {%- else -%}
+    <span title="{{ d.path }}">{{ d.name }}</span>
+    {%- if d.folder %} <small class="muted">{{ d.folder }}</small>{% endif %}
+    {%- if full %}<br><small class="muted">{{ d.path }}</small>{% endif %}
+  {%- endif -%}
+{%- endmacro %}

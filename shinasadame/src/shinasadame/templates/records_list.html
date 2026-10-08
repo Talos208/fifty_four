@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% from "_macros.html" import doc %}
+{% block title %}{{ spec.label }} - shinasadame{% endblock %}
+{% block content %}
+<h1>{{ spec.label }} <small class="muted">{{ total }} 件</small></h1>
+
+<form method="get" class="filters">
+  <input type="search" name="q" value="{{ q }}" placeholder="プロンプト・候補を検索" size="40">
+  <button type="submit">検索</button>
+  {% if q %}<a href="/s/{{ sid }}/records/{{ table }}">クリア</a>{% endif %}
+</form>
+
+<table>
+  <thead>
+    <tr>
+      {% for c in spec.columns %}<th>{{ '文書' if c == 'document_uri' else c }}</th>{% endfor %}
+      {% for c in spec.long_columns %}<th>{{ c }}</th>{% endfor %}
+      {% if spec.count_child %}<th class="r">候補</th><th class="r">採用</th>{% endif %}
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      {% for c in spec.columns %}
+        {% if c == 'id' %}
+        <td><a href="/s/{{ sid }}/records/{{ table }}/{{ r.id }}">{{ r.id }}</a></td>
+        {% else %}
+        <td>{% if c == 'document_uri' %}{{ doc(r[c]) }}{% else %}{{ r[c] if r[c] is not none else '—' }}{% endif %}</td>
+        {% endif %}
+      {% endfor %}
+      {% for c in spec.long_columns %}<td class="snippet">{{ r[c] if r[c] is not none else '—' }}</td>{% endfor %}
+      {% if spec.count_child %}
+        <td class="r">{{ r.n_candidates }}</td>
+        <td class="r">{{ '✓' if r.n_selected else '' }}</td>
+      {% endif %}
+    </tr>
+  {% else %}
+    <tr><td colspan="12" class="muted">該当するレコードがありません</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+{% if pages > 1 %}
+<p class="pager">
+  {% if page > 1 %}<a href="?q={{ q | urlencode }}&page={{ page - 1 }}">← 前</a>{% endif %}
+  {{ page }} / {{ pages }}
+  {% if page < pages %}<a href="?q={{ q | urlencode }}&page={{ page + 1 }}">次 →</a>{% endif %}
+</p>
+{% endif %}
+{% endblock %}

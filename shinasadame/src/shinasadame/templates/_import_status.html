@@ -1,0 +1,18 @@
+{% if imp.status in ('queued', 'running') %}
+<div hx-get="/imports/{{ imp.id }}/status" hx-trigger="every 1s" hx-swap="outerHTML" class="progress">
+  取り込み中… ({{ '待機中' if imp.status == 'queued' else '実行中' }})
+  {% if stalled %}
+  <p class="warn">
+    待機したまま進みません。取り込みを処理する worker(<code>huey_consumer</code>)が動いていない可能性があります。
+    ローカルなら別のターミナルで <code>uv run huey_consumer shinasadame.tasks.huey -w 1 -k thread</code> を起動してください。
+    起動すれば、このジョブはそのまま処理されます。
+  </p>
+  {% endif %}
+</div>
+{% else %}
+<div class="error">
+  <p><strong>取り込みに失敗しました。</strong></p>
+  <pre>{{ imp.error }}</pre>
+  <button type="button" onclick="retryImport()">再試行</button>
+</div>
+{% endif %}

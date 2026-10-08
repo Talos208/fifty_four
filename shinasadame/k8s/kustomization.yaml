@@ -1,0 +1,5 @@
+# 既定は LoadBalancer 直結(base)。Ingress 経由にしたいときは overlays/ingress を使う。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - base

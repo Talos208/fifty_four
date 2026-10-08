@@ -12,7 +12,7 @@ FlightRecorder(`lsp/src/flight_recorder.rs`)が debug ビルドで記録する S
 ### 前提・制約
 
 - 公開先はローカルのみ。基盤は Docker Desktop の Kubernetes(**kind 方式**、ノード3台、containerd)。
-- SigNoz は同クラスタの `signoz` namespace にある(OTLP: `signoz-otel-collector.signoz:4317`)。
+- SigNoz は同クラスタの `signoz` namespace にある(OTLP: `http://localhost:4317`)。
 - kind ノードからは Windows のファイルシステムが見えないため、hostPath で `db/` をマウントする方式は取れない。
 - `docker build` したイメージは Docker Desktop の `registry-mirror` 経由で kind から pull できる(push 不要)。
 - LoadBalancer Service は localhost に公開される。
@@ -35,8 +35,8 @@ FlightRecorder(`lsp/src/flight_recorder.rs`)が debug ビルドで記録する S
 
 ```
 Windows ホスト (Chrome/Edge)
- ├─ fifty_four/target/debug/db/fifty_four.db (現行)
- └─ fifty_four/db/fifty_four.db              (旧)
+ ├─ fifty_four/target/debug/db/fifty_four.db (LSP が今書いている DB)
+ └─ fifty_four/db/fifty_four.db              (以前の LSP が書いた DB など、任意の FlightRecorder DB)
         │ File System Access API(FileHandle を IndexedDB に保存)
         │ 取り込みボタン → ファイル読み取り → POST /api/imports (multipart)
         ▼  http://localhost:8054
@@ -44,12 +44,12 @@ k8s namespace: shinasadame
  Deployment: shinasadame (replicas 1)
  ├─ container: web     FastAPI + Jinja2 + HTMX (uvicorn)
  ├─ container: worker  Huey consumer (SqliteHuey)
- └─ PVC /data (1Gi, storageClass standard, RWO)
+ └─ PVC /data (512Mi, storageClass standard, RWO)
      ├─ queue.db      Huey のキュー
      ├─ app.db (WAL)  imports / snapshots / fr_* テーブル
      └─ uploads/      アップロードの一時置き場
  Service: LoadBalancer 8054 → localhost:8054
- OTLP gRPC → signoz-otel-collector.signoz:4317
+ OTLP gRPC → http://localhost:4317
 ```
 
 - web と worker は**同一 Pod** に置き、同じ PVC 上の SQLite を共有する。同一ノード・同一ファイルシステムなので SQLite のロックが正しく機能する。PVC は RWO のため replicas は 1 固定。
@@ -60,7 +60,8 @@ k8s namespace: shinasadame
 
 ### 取り込み元
 
-- 「現行」(`target/debug/db/fifty_four.db`)と「旧」(`db/fifty_four.db`)の2つを、ブラウザで一度ずつ登録する。FileHandle は IndexedDB に保存する。
+- 取り込むファイルをブラウザで登録する(何個でもよい。取り込み元の種別は区別しない)。FileHandle は IndexedDB に保存する。
+- 取り込む前に、名前・サイズ・最終更新日時が同じスナップショットが残っていないかを `GET /api/snapshots/lookup` で問い合わせる。残っていれば、読み込みをスキップしてそれを開くか、取り込み直すかを選べる。中身のハッシュではなくメタデータで判定するのは、ファイルを読まずに判定するため。
 - File System Access API は secure context が必要。`http://localhost:8054` でアクセスする前提(LB の IP `172.19.0.x` 経由では使えない)。
 - 対応していないブラウザでは `<input type=file>` で代替する。
 
@@ -68,7 +69,7 @@ k8s namespace: shinasadame
 
 | パス | 内容 |
 |---|---|
-| `/` | 取り込み元の選択(現行/旧、未登録なら登録ボタン)と取り込みボタンのみ。押すと進捗表示に切り替わり、1秒ごとにジョブ状態を問い合わせる。完了したら `HX-Redirect` で `/s/{sid}/acceptance` へ |
+| `/` | 登録済みファイルの一覧(サイズ・更新日時・取り込み済みか)、ファイルの登録、各ファイルの取り込みボタンのみ。押すと進捗表示に切り替わり、1秒ごとにジョブ状態を問い合わせる。完了したら `HX-Redirect` で `/s/{sid}/acceptance` へ |
 | `/s/{sid}/acceptance` | 補完の採用率。期間・モデルで絞り込み。日別推移(折れ線)、モデル別・順位別(棒)、文書別(表) |
 | `/s/{sid}/records/{table}` | レコード一覧。プロンプト・候補の LIKE 検索、ページ送り。対象: completions / code_actions / character_updates / quality_reviews / quality_findings |
 | `/s/{sid}/records/{table}/{id}` | 詳細。プロンプト、生の応答、候補(selected・confidence)、キャラ更新の各項目(applied・skip_reason) |
@@ -77,7 +78,8 @@ k8s namespace: shinasadame
 
 ## エンドポイント
 
-- `POST /api/imports`(multipart: `source`, `file`): 202 と `import_id` を返し、Huey にジョブを投入する
+- `GET /api/snapshots/lookup?name=&size=&mtime=`: 同じファイルの取り込み済みスナップショット(残っているもののうち最新)。無ければ `{"snapshot": null}`
+- `POST /api/imports`(multipart: `file`, `file_mtime`): 202 と `import_id` を返し、Huey にジョブを投入する
 - `GET /imports/{id}/status`: 進捗表示用の HTML 断片(取り込み中 / 失敗+理由+再試行ボタン / 完了なら `HX-Redirect`)
 - `GET /api/s/{sid}/acceptance?by=day|model|rank|document&from=&to=&model=`: ECharts 用 JSON
 - HTML ページ: 上記「画面」の各パス
@@ -86,9 +88,9 @@ k8s namespace: shinasadame
 
 1. アップロードを `uploads/` の一時ファイルに保存する。
 2. `PRAGMA integrity_check` が `ok` を返すこと、`refinery_schema_history` から最大バージョンを取得できることを確認する。
-3. `snapshots` テーブルに取り込み元・スキーマバージョン・取り込み日時(UTC)を記録する。
+3. `snapshots` テーブルにファイルの指紋(名前・サイズ・最終更新日時)・スキーマバージョン・取り込み日時(UTC)を記録する。
 4. FlightRecorder の各テーブル(completions, completion_candidates, code_actions, code_action_candidates, character_updates, character_update_sections, quality_reviews, quality_findings)を `fr_<table>` に **snapshot_id 付きで**コピーする。旧スキーマで存在しない列(`confidence` など)は NULL。
-5. 取り込み元ごとに最新10件のスナップショットだけを残し、それより古いものは行ごと削除する。
+5. 全体で最新10件のスナップショットだけを残し、それより古いものは行ごと削除する。
 6. 一時ファイルを削除する。
 
 手順 3〜5 は1つのトランザクションで行う。
@@ -116,8 +118,8 @@ k8s namespace: shinasadame
 app.db の中身はすべて FlightRecorder の DB から再生成できる派生データ。マイグレーション機構は入れず、起動時にスキーマのハッシュを比べ、変わっていたら作り直す。
 
 テーブル:
-- `imports`(id, source, status[queued/running/done/failed], error, snapshot_id, created_at, updated_at)
-- `snapshots`(id, source, schema_version, imported_at)
+- `imports`(id, file_name, file_size, file_mtime, status[queued/running/done/failed], error, snapshot_id, created_at, updated_at)
+- `snapshots`(id, file_name, file_size, file_mtime, schema_version, imported_at)
 - `fr_*`(元テーブルの列 + `snapshot_id`。主キーは `(snapshot_id, id)`)
 - `meta`(schema_hash)
 

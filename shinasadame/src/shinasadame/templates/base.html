@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}shinasadame{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/htmx.min.js"></script>
+</head>
+<body>
+<header>
+  <a class="brand" href="/">品定め <small>shinasadame</small></a>
+  {% if sid %}
+  <nav>
+    <a href="/s/{{ sid }}/acceptance" {% if active == 'acceptance' %}class="on"{% endif %}>採用率</a>
+    {% for key, spec in record_specs.items() %}
+    <a href="/s/{{ sid }}/records/{{ key }}" {% if table == key %}class="on"{% endif %}>{{ spec.label }}</a>
+    {% endfor %}
+  </nav>
+  {% endif %}
+  {# レコード詳細の id は別のスナップショットには無い(別のレコードか 404)ので、一覧へ移る #}
+  {% set here = request.url.path.rsplit('/', 1)[0] if record_id is defined else request.url.path %}
+  <label class="snap">スナップショット
+    <select onchange="if (this.value) location.href = this.value">
+      {% if not sid %}<option value="">(選択)</option>{% endif %}
+      {% for s in snapshots %}
+      {# 同じ画面のまま別スナップショットへ移る。スナップショット未選択の画面からは採用率へ #}
+      <option value="{{ here.replace('/s/' ~ sid ~ '/', '/s/' ~ s.id ~ '/', 1) if sid else '/s/' ~ s.id ~ '/acceptance' }}"
+              {% if s.id == sid %}selected{% endif %}>
+        #{{ s.id }} {{ s.file_name }}(更新 {{ s.file_mtime | mtime }}) {{ s.imported_at[:16].replace('T', ' ') }} 取り込み
+      </option>
+      {% endfor %}
+    </select>
+  </label>
+</header>
+<main>
+  {% if snapshot and snapshot.schema_version > known_version %}
+  <p class="warn">このスナップショットはスキーマ V{{ snapshot.schema_version }} です。V{{ known_version }} までの列だけを取り込んでいます(V{{ known_version + 1 }} 以降の列は未対応)。</p>
+  {% endif %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>

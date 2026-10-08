@@ -1,0 +1,13 @@
+# LoadBalancer は localhost に公開される。http://localhost:8054 で開くこと
+# (File System Access API は secure context が必要で、LB の IP 経由では使えない)。
+apiVersion: v1
+kind: Service
+metadata:
+  name: shinasadame
+spec:
+  type: LoadBalancer
+  selector:
+    app: shinasadame
+  ports:
+    - port: 8054
+      targetPort: 8000

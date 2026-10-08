@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}取り込み - shinasadame{% endblock %}
+{% block content %}
+<h1>FlightRecorder の取り込み</h1>
+<p class="muted">
+  LSP が debug ビルドで記録した SQLite(<code>target/debug/db/fifty_four.db</code> など)を取り込みます。
+  ファイルは一度登録すれば、次回からボタン 1 つで読み直せます。
+  同じファイル(名前・サイズ・更新日時が一致)を取り込み済みなら、読み込みをスキップしてそれを開くこともできます。
+</p>
+
+<div id="files"></div>
+<p id="add-file"></p>
+<p id="message" class="muted"></p>
+<div id="progress"></div>
+
+<script src="/static/app.js"></script>
+{% endblock %}
