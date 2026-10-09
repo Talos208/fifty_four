@@ -31,6 +31,7 @@ mod quality;
 mod references;
 #[cfg(debug_assertions)]
 mod session_log;
+mod test_util;
 mod text;
 mod tools;
 mod types;
@@ -266,11 +267,12 @@ mod tests {
     use super::*;
 
     use crate::RUST_LOG_TEST_LOCK as ENV_LOCK;
+    use crate::test_util::EnvGuard;
 
     #[test]
     fn test_default_acp_log_level_sets_when_unset() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::remove_var("RUST_LOG") };
+        let _env = EnvGuard::unset("RUST_LOG");
 
         default_acp_log_level();
 
@@ -279,14 +281,12 @@ mod tests {
         assert!(value.contains("fifty_four_lsp::acp_config=debug"));
         assert!(value.contains("fifty_four_lsp::writing_agent=debug"));
         assert!(value.contains("fifty_four_lsp::session_log=debug"));
-
-        unsafe { std::env::remove_var("RUST_LOG") };
     }
 
     #[test]
     fn test_default_acp_log_level_does_not_override_existing_when_it_names_the_crate() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("RUST_LOG", "warn,fifty_four_lsp=trace") };
+        let _env = EnvGuard::set("RUST_LOG", "warn,fifty_four_lsp=trace");
 
         default_acp_log_level();
 
@@ -294,8 +294,6 @@ mod tests {
             std::env::var("RUST_LOG").unwrap(),
             "warn,fifty_four_lsp=trace"
         );
-
-        unsafe { std::env::remove_var("RUST_LOG") };
     }
 
     /// Zed 自身の `RUST_LOG=lsp=trace` のような、このバイナリと無関係な値が
@@ -305,14 +303,12 @@ mod tests {
     #[test]
     fn test_default_acp_log_level_overrides_unrelated_inherited_value() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("RUST_LOG", "lsp=trace") };
+        let _env = EnvGuard::set("RUST_LOG", "lsp=trace");
 
         default_acp_log_level();
 
         let value = std::env::var("RUST_LOG").unwrap();
         assert!(value.contains("fifty_four_lsp::acp=debug"));
-
-        unsafe { std::env::remove_var("RUST_LOG") };
     }
 
     /// `--acp` 時、`.env` を読んだ**あと**に Anthropic の資格情報を消すという順序を
@@ -326,10 +322,8 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         // `.env` を読んだ直後の状態を模して、Anthropic のキーが環境に入っている
         // ケースを再現する(実際には dotenvx が .env から復号して入れる)。
-        unsafe {
-            std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-dummy-from-dotenv");
-            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "dummy-token-from-dotenv");
-        }
+        let _key = EnvGuard::set("ANTHROPIC_API_KEY", "sk-ant-dummy-from-dotenv");
+        let _token = EnvGuard::set("ANTHROPIC_AUTH_TOKEN", "dummy-token-from-dotenv");
 
         scrub_anthropic_credentials();
 

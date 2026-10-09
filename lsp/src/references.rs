@@ -78,17 +78,18 @@ mod tests {
     use crate::highlight::Highlighter;
     use indoc::indoc;
 
-    /// テストごとに独立したディレクトリを用意する(既存テストと同じ temp_dir 方式)。
-    fn fresh_root(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ff_references_{}", name));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// テストごとに独立したディレクトリを用意する(`TempDir` は Drop で削除される)。
+    fn fresh_root(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("ff_references_{name}_"))
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
     fn test_discover_reference_files_only_top_level_txt() {
-        let root = fresh_root("discover");
+        let _tmp = fresh_root("discover");
+        let root = _tmp.path();
         std::fs::write(root.join("chapter1.txt"), "").unwrap();
         std::fs::write(root.join("chapter2.TXT"), "").unwrap(); // 大文字拡張子も拾う
         std::fs::write(root.join("characters.md"), "").unwrap();
@@ -106,9 +107,13 @@ mod tests {
 
     #[test]
     fn test_discover_reference_files_missing_dir_returns_empty() {
-        let root = std::env::temp_dir().join("ff_references_does_not_exist");
-        let _ = std::fs::remove_dir_all(&root);
-        assert!(discover_reference_files(&root).is_empty());
+        let _tmp = tempfile::Builder::new()
+            .prefix("ff_references_does_not_exist_")
+            .tempdir()
+            .unwrap();
+        let root = _tmp.path();
+        let missing = root.join("missing");
+        assert!(discover_reference_files(&missing).is_empty());
     }
 
     /// 実 `Highlighter` を使ってトークナイズするクロージャを組み立てる。

@@ -2317,7 +2317,10 @@ mod tests {
         let characters = PathBuf::from("/ws/characters.md");
         let ijn = PathBuf::from("/ws/hoge/ijn.md");
         let snapshots = HashMap::from([
-            (characters.clone(), "# 近藤\n\n## 役割\n外務省職員。\n".to_string()),
+            (
+                characters.clone(),
+                "# 近藤\n\n## 役割\n外務省職員。\n".to_string(),
+            ),
             (ijn.clone(), "# 原顕三郎\n\n## 呼称\n- 原\n".to_string()),
         ]);
         let mut files = vec![characters, ijn.clone()];
@@ -2337,9 +2340,11 @@ mod tests {
     #[tokio::test]
     async fn test_apply_plan_missing_merge_keeps_old() {
         // バッチ結果から対象キーが欠落 → old 維持(ファイルを書き換えない)
-        let dir = std::env::temp_dir().join("ff_batch_merge_missing_test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _tmp = tempfile::Builder::new()
+            .prefix("ff_batch_merge_missing_test_")
+            .tempdir()
+            .unwrap();
+        let dir = _tmp.path();
         let file = dir.join("characters.md");
         std::fs::write(&file, PLAN_MD).unwrap();
 
@@ -2369,7 +2374,6 @@ mod tests {
             "マージ結果欠落時はファイルが書き換えられないこと"
         );
         drop(recorder);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // FlightRecorder::new(パス指定) は debug ビルドにしか無いため cfg で囲う(上のテストと同じ理由)。
@@ -2380,8 +2384,11 @@ mod tests {
         // 「高柳」への更新が hoge/高柳.md 自体へ書き込まれ、characters.md には
         // 重複したブロックが作られないことを確認する回帰テスト
         // (find_character_file が常に characters.md へフォールバックしてしまう旧バグの再現)。
-        let dir = std::env::temp_dir().join("ff_apply_updates_wikilink_test");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::Builder::new()
+            .prefix("ff_apply_updates_wikilink_test_")
+            .tempdir()
+            .unwrap();
+        let dir = _tmp.path();
         std::fs::create_dir_all(dir.join("hoge")).unwrap();
 
         let characters_md = "[[hoge/ijn.md]]\n\n# 近藤\n\n## 役割\n外務省職員。\n";
@@ -2399,7 +2406,15 @@ mod tests {
         let updates = plan_input(&[("高柳", "role", "戦艦「飛騨」の艦長。")]);
         let mut llm_client = FakeLlmClient::with_responses(&[]);
 
-        apply_updates(&updates, update_id, &store, &dir, &recorder, &mut llm_client).await;
+        apply_updates(
+            &updates,
+            update_id,
+            &store,
+            &dir,
+            &recorder,
+            &mut llm_client,
+        )
+        .await;
 
         let takayanagi_after = std::fs::read_to_string(dir.join("hoge/高柳.md")).unwrap();
         assert!(
@@ -2415,7 +2430,6 @@ mod tests {
         );
 
         drop(recorder);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(debug_assertions)]
@@ -2424,8 +2438,11 @@ mod tests {
         // ファイル名(ijn)とキャラ名(原顕三郎)が一致しないケース。ファイル名からの推測を
         // やめたので、実際に見出しを持つ hoge/ijn.md が宛先になる
         // (旧実装は characters.md へ重複ブロックを作っていた)。
-        let dir = std::env::temp_dir().join("ff_apply_updates_name_mismatch_test");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::Builder::new()
+            .prefix("ff_apply_updates_name_mismatch_test_")
+            .tempdir()
+            .unwrap();
+        let dir = _tmp.path();
         std::fs::create_dir_all(dir.join("hoge")).unwrap();
 
         let characters_md = "[[hoge/ijn.md]]\n\n# 近藤\n\n## 役割\n外務省職員。\n";
@@ -2441,7 +2458,15 @@ mod tests {
         let updates = plan_input(&[("原顕三郎", "role", "遣泰艦隊司令。")]);
         let mut llm_client = FakeLlmClient::with_responses(&[]);
 
-        apply_updates(&updates, update_id, &store, &dir, &recorder, &mut llm_client).await;
+        apply_updates(
+            &updates,
+            update_id,
+            &store,
+            &dir,
+            &recorder,
+            &mut llm_client,
+        )
+        .await;
 
         let ijn_after = std::fs::read_to_string(dir.join("hoge/ijn.md")).unwrap();
         assert!(
@@ -2457,7 +2482,6 @@ mod tests {
         );
 
         drop(recorder);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- strip_attribute_label のテスト ----

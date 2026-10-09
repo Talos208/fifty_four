@@ -401,31 +401,28 @@ mod tests {
     use super::*;
 
     use crate::RUST_LOG_TEST_LOCK as ENV_LOCK;
+    use crate::test_util::EnvGuard;
 
     #[test]
     fn test_logging_disabled_when_rust_log_is_off() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("RUST_LOG", "off") };
+        let _env = EnvGuard::set("RUST_LOG", "off");
 
         assert!(logging_disabled());
-
-        unsafe { std::env::remove_var("RUST_LOG") };
     }
 
     #[test]
     fn test_logging_disabled_when_rust_log_scopes_off_to_this_crate() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("RUST_LOG", "fifty_four_lsp=off") };
+        let _env = EnvGuard::set("RUST_LOG", "fifty_four_lsp=off");
 
         assert!(logging_disabled());
-
-        unsafe { std::env::remove_var("RUST_LOG") };
     }
 
     #[test]
     fn test_logging_not_disabled_when_rust_log_is_unset() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::remove_var("RUST_LOG") };
+        let _env = EnvGuard::unset("RUST_LOG");
 
         assert!(!logging_disabled());
     }
@@ -433,10 +430,8 @@ mod tests {
     #[test]
     fn test_logging_not_disabled_when_rust_log_has_a_real_level() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("RUST_LOG", "debug") };
+        let _env = EnvGuard::set("RUST_LOG", "debug");
 
         assert!(!logging_disabled());
-
-        unsafe { std::env::remove_var("RUST_LOG") };
     }
 }

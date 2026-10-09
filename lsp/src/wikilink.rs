@@ -107,7 +107,9 @@ fn collect_linked_files(
         let Some(target_path) = resolve_target(current_dir, &m.target) else {
             continue;
         };
-        let canon = target_path.canonicalize().unwrap_or_else(|_| target_path.clone());
+        let canon = target_path
+            .canonicalize()
+            .unwrap_or_else(|_| target_path.clone());
         if !visited.insert(canon) {
             // 既訪問(循環参照、または同じページへの複数リンク): 展開しない。
             continue;
@@ -203,28 +205,32 @@ mod tests {
 
     // ---- resolve_target ----
 
-    fn make_tree(name: &str, files: &[&str]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ff_wikilink_test_{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn make_tree(name: &str, files: &[&str]) -> tempfile::TempDir {
+        let tmp = tempfile::Builder::new()
+            .prefix(&format!("ff_wikilink_test_{name}_"))
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path();
         for f in files {
             let path = dir.join(f);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "").unwrap();
         }
-        dir
+        tmp
     }
 
     #[test]
     fn test_resolve_target_infers_md_extension() {
-        let dir = make_tree("resolve_infer_ext", &["ページA.md"]);
+        let _tmp = make_tree("resolve_infer_ext", &["ページA.md"]);
+        let dir = _tmp.path();
         let resolved = resolve_target(&dir, "ページA");
         assert_eq!(resolved, Some(dir.join("ページA.md")));
     }
 
     #[test]
     fn test_resolve_target_missing_returns_none() {
-        let dir = make_tree("resolve_missing", &[]);
+        let _tmp = make_tree("resolve_missing", &[]);
+        let dir = _tmp.path();
         let resolved = resolve_target(&dir, "存在しない");
         assert_eq!(resolved, None);
     }
@@ -232,7 +238,8 @@ mod tests {
     #[test]
     fn test_resolve_target_does_not_fallback_outside_current_dir() {
         // current_dir の外(親)にファイルがあっても解決しない(ワークスペース全体探索はしない)。
-        let dir = make_tree("resolve_no_fallback", &["ページA.md"]);
+        let _tmp = make_tree("resolve_no_fallback", &["ページA.md"]);
+        let dir = _tmp.path();
         let sub = dir.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         let resolved = resolve_target(&sub, "ページA");
@@ -243,7 +250,8 @@ mod tests {
 
     #[test]
     fn test_expand_content_transitive_a_b_c() {
-        let dir = make_tree("expand_transitive", &["A.md", "B.md", "C.md"]);
+        let _tmp = make_tree("expand_transitive", &["A.md", "B.md", "C.md"]);
+        let dir = _tmp.path();
         std::fs::write(dir.join("A.md"), "本文A[[B]]").unwrap();
         std::fs::write(dir.join("B.md"), "本文B[[C]]").unwrap();
         std::fs::write(dir.join("C.md"), "本文C").unwrap();
@@ -255,7 +263,8 @@ mod tests {
 
     #[test]
     fn test_expand_content_cycle_does_not_loop_forever() {
-        let dir = make_tree("expand_cycle", &["A.md", "B.md"]);
+        let _tmp = make_tree("expand_cycle", &["A.md", "B.md"]);
+        let dir = _tmp.path();
         std::fs::write(dir.join("A.md"), "本文A[[B]]").unwrap();
         std::fs::write(dir.join("B.md"), "本文B[[A]]").unwrap();
         // 停止すること自体がテスト(無限ループなら test がハングする)。
@@ -266,7 +275,8 @@ mod tests {
 
     #[test]
     fn test_expand_content_skips_missing_link_and_continues() {
-        let dir = make_tree("expand_missing_link", &["A.md"]);
+        let _tmp = make_tree("expand_missing_link", &["A.md"]);
+        let dir = _tmp.path();
         std::fs::write(dir.join("A.md"), "本文A[[存在しない]]").unwrap();
         let expanded = expand_content(&dir.join("A.md"), "本文A[[存在しない]]");
         assert_eq!(expanded, "本文A[[存在しない]]");
@@ -276,18 +286,23 @@ mod tests {
 
     #[test]
     fn test_expand_files_matches_expand_content_concatenation() {
-        let dir = make_tree("expand_files_matches", &["A.md", "B.md", "C.md"]);
+        let _tmp = make_tree("expand_files_matches", &["A.md", "B.md", "C.md"]);
+        let dir = _tmp.path();
         std::fs::write(dir.join("A.md"), "本文A[[B]]").unwrap();
         std::fs::write(dir.join("B.md"), "本文B[[C]]").unwrap();
         std::fs::write(dir.join("C.md"), "本文C").unwrap();
         let files = expand_files(&dir.join("A.md"), "本文A[[B]]");
         let concatenated: String = files.iter().map(|(_, c)| c.clone()).collect();
-        assert_eq!(concatenated, expand_content(&dir.join("A.md"), "本文A[[B]]"));
+        assert_eq!(
+            concatenated,
+            expand_content(&dir.join("A.md"), "本文A[[B]]")
+        );
     }
 
     #[test]
     fn test_expand_files_includes_start_and_target_paths() {
-        let dir = make_tree("expand_files_paths", &["A.md", "B.md"]);
+        let _tmp = make_tree("expand_files_paths", &["A.md", "B.md"]);
+        let dir = _tmp.path();
         std::fs::write(dir.join("A.md"), "本文A[[B]]").unwrap();
         std::fs::write(dir.join("B.md"), "本文B").unwrap();
         let files = expand_files(&dir.join("A.md"), "本文A[[B]]");

@@ -960,10 +960,12 @@ mod tests {
         name: &str,
         tracked_files: &[(&str, &str)],
         link_only_files: &[(&str, &str)],
-    ) -> (CharacterStore, PathBuf) {
-        let root = std::env::temp_dir().join(format!("ff_character_wikilink_test_{name}"));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+    ) -> (CharacterStore, tempfile::TempDir) {
+        let tmp = tempfile::Builder::new()
+            .prefix(&format!("ff_character_wikilink_test_{name}_"))
+            .tempdir()
+            .unwrap();
+        let root = tmp.path();
         let store = CharacterStore::new();
         for (rel, md) in link_only_files {
             let path = root.join(rel);
@@ -976,14 +978,14 @@ mod tests {
             std::fs::write(&path, md).unwrap();
             store.reconcile(&root, &path, md.to_string());
         }
-        (store, root)
+        (store, tmp)
     }
 
     #[test]
     fn test_allowed_names_transitive_two_hops() {
         // characters.md → hoge/ijn.md → hoge/高柳.md の2段リンクでも、
         // 最終到達先(高柳)の見出し・aliasが allowed_names に含まれること。
-        let (store, root) = make_store_on_disk(
+        let (store, _tmp) = make_store_on_disk(
             "transitive_two_hops",
             &[(
                 "characters.md",
@@ -997,6 +999,7 @@ mod tests {
                 ("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n"),
             ],
         );
+        let root = _tmp.path();
         let names = store.allowed_names(&root);
         assert!(names.contains("チャーチル"), "{:?}", names);
         assert!(names.contains("原顕三郎"), "1段目のリンク先: {:?}", names);
@@ -1016,7 +1019,7 @@ mod tests {
     fn test_allowed_names_includes_wikilink_target_file_characters() {
         // characters.md から memo/サブキャラ.md への wikilink を #include 展開し、
         // リンク先の見出しから抽出された名前も allowed_names に含まれること。
-        let (store, root) = make_store_on_disk(
+        let (store, _tmp) = make_store_on_disk(
             "expand_names",
             &[(
                 "characters.md",
@@ -1027,6 +1030,7 @@ mod tests {
                 "## エルミア（副長）\n### 背景・立場\n- 副長。\n",
             )],
         );
+        let root = _tmp.path();
         let names = store.allowed_names(&root);
         assert!(names.contains("ジェフ・クライン"), "{:?}", names);
         assert!(names.contains("エルミア"), "{:?}", names);
@@ -1037,7 +1041,7 @@ mod tests {
         // characters(位置情報つき)はこのファイル自身の見出しのみを対象にし、
         // wikilink先の見出しは含めない(heading_lineがこのファイル中の実在行を
         // 指さなくなるため、goto_definition等の位置参照に使えなくなることを防ぐ)。
-        let (store, root) = make_store_on_disk(
+        let (store, _tmp) = make_store_on_disk(
             "expand_positions",
             &[(
                 "characters.md",
@@ -1048,6 +1052,7 @@ mod tests {
                 "## エルミア（副長）\n### 背景・立場\n- 副長。\n",
             )],
         );
+        let root = _tmp.path();
         // lookup_definitions はcharactersベースなので、リンク先の名前では見つからない。
         assert!(store.lookup_definitions(&root, "エルミア").is_empty());
         assert!(
@@ -1061,7 +1066,7 @@ mod tests {
     fn test_lookup_markdown_finds_wikilink_only_character() {
         // 自ファイルに見出しの無い、wikilink経由でしか定義されていないキャラでも
         // hover表示用のMarkdownが返ること(高柳がcharacters.mdに直接無い、実機バグの回帰)。
-        let (store, root) = make_store_on_disk(
+        let (store, _tmp) = make_store_on_disk(
             "lookup_markdown_wikilink_only",
             &[(
                 "characters.md",
@@ -1075,6 +1080,7 @@ mod tests {
                 ("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n"),
             ],
         );
+        let root = _tmp.path();
         let markdown = store.lookup_markdown(&root, "高柳");
         assert!(
             markdown.is_some(),
@@ -1087,11 +1093,12 @@ mod tests {
 
     #[test]
     fn test_lookup_names_finds_wikilink_only_character_aliases() {
-        let (store, root) = make_store_on_disk(
+        let (store, _tmp) = make_store_on_disk(
             "lookup_names_wikilink_only",
             &[("characters.md", "[[hoge/高柳.md]]も参照。\n")],
             &[("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n")],
         );
+        let root = _tmp.path();
         let names = store.lookup_names(&root, "高柳");
         assert!(names.contains("高柳"), "{:?}", names);
         assert!(names.contains("飛騨艦長"), "{:?}", names);
@@ -1099,7 +1106,7 @@ mod tests {
 
     #[test]
     fn test_search_finds_wikilink_only_character() {
-        let (store, root) = make_store_on_disk(
+        let (store, _tmp) = make_store_on_disk(
             "search_wikilink_only",
             &[("characters.md", "[[hoge/高柳.md]]も参照。\n")],
             &[(
@@ -1107,6 +1114,7 @@ mod tests {
                 "# 高柳\n\n## 役割\n\n戦艦「飛騨」の艦長。\n",
             )],
         );
+        let root = _tmp.path();
         let result = store.search(&root, "高柳", &[CharacterAttribute::Role]);
         assert!(result.is_ok(), "{:?}", result);
         assert!(result.unwrap().contains("艦長"));
@@ -1114,7 +1122,7 @@ mod tests {
 
     #[test]
     fn test_files_reachable_via_wikilink_includes_tracked_and_linked_files() {
-        let (store, root) = make_store_on_disk(
+        let (store, _tmp) = make_store_on_disk(
             "files_reachable",
             &[(
                 "characters.md",
@@ -1128,6 +1136,7 @@ mod tests {
                 ("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n"),
             ],
         );
+        let root = _tmp.path();
         let files = store.files_reachable_via_wikilink(&root);
         assert!(files.contains_key(&root.join("characters.md")));
         assert!(files.contains_key(&root.join("hoge/ijn.md")));
@@ -1140,11 +1149,12 @@ mod tests {
         // wikilink先ファイルの内容が(character_updaterの書き込み等で)ディスク上で
         // 直接変わった後、refresh_includedを呼ぶと追跡ファイル側のincluded_charactersへ
         // 変更が反映されること。
-        let (store, root) = make_store_on_disk(
+        let (store, _tmp) = make_store_on_disk(
             "refresh_included",
             &[("characters.md", "[[hoge/高柳.md]]も参照。\n")],
             &[("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n")],
         );
+        let root = _tmp.path();
         assert!(
             store
                 .lookup_markdown(&root, "高柳")
@@ -1170,11 +1180,12 @@ mod tests {
         // から見えるようにするため)。昇格後もディスクの変更を reconcile で取り込めること
         // = 古い内容のまま固定されないこと を確認する
         // (取り込めないと、次の自動更新サイクルがユーザーの編集を巻き戻してしまう)。
-        let (store, root) = make_store_on_disk(
+        let (store, _tmp) = make_store_on_disk(
             "promoted_stays_syncable",
             &[("characters.md", "[[hoge/高柳.md]]も参照。\n")],
             &[("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n")],
         );
+        let root = _tmp.path();
         let target = root.join("hoge/高柳.md");
         assert!(!store.is_tracked(&root, &target), "初期状態では未追跡");
 
@@ -1205,21 +1216,23 @@ mod tests {
     #[test]
     fn test_discover_character_files_ignores_characters_folder() {
         // characters/ フォルダ形式は廃止(分割は wikilink で行う)。
-        let root = std::env::temp_dir().join("ff_discover_no_folder_test");
-        let _ = std::fs::remove_dir_all(&root);
+        let _tmp = tempfile::Builder::new()
+            .prefix("ff_discover_no_folder_test_")
+            .tempdir()
+            .unwrap();
+        let root = _tmp.path();
         std::fs::create_dir_all(root.join("characters")).unwrap();
         std::fs::write(root.join("characters.md"), "# 近藤\n").unwrap();
         std::fs::write(root.join("characters/ジェフ.md"), "# ジェフ\n").unwrap();
 
         let files = CharacterStore::discover_character_files(&root);
         assert_eq!(files, vec![root.join("characters.md")]);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn test_lookup_markdown_does_not_duplicate_shared_wikilink_target() {
         // 同じ wikilink 先が2つの追跡ファイルから到達可能でも、hover表示は1回だけ。
-        let (store, root) = make_store_on_disk(
+        let (store, _tmp) = make_store_on_disk(
             "lookup_markdown_dedup",
             &[
                 ("characters.md", "[[hoge/高柳.md]]も参照。\n"),
@@ -1227,6 +1240,7 @@ mod tests {
             ],
             &[("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n")],
         );
+        let root = _tmp.path();
         let markdown = store.lookup_markdown(&root, "高柳").unwrap();
         assert_eq!(
             markdown.matches("飛騨艦長").count(),
@@ -1777,9 +1791,11 @@ mod tests {
     async fn test_reconcile_ignores_self_write_echo() {
         // write() で書いた内容と同じ内容のreconcileは自己書き込みのエコーとしてfalseを返す
         // (再パース不要・変更なし)。異なる内容なら真の外部変更としてtrueを返す。
-        let dir = std::env::temp_dir().join("ff_character_store_echo_test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _tmp = tempfile::Builder::new()
+            .prefix("ff_character_store_echo_test_")
+            .tempdir()
+            .unwrap();
+        let dir = _tmp.path();
         let path = dir.join("characters.md");
 
         let store = CharacterStore::new();
@@ -1799,8 +1815,6 @@ mod tests {
             "内容が異なれば真の外部変更として取り込まれるはず"
         );
         assert_eq!(store.content_of(&dir, &path), Some(changed));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
