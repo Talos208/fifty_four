@@ -143,17 +143,18 @@ fn tail_chars(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
-    /// テストごとに独立したディレクトリを用意する(既存テストと同じ temp_dir 方式)。
-    fn fresh_root(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ff_chat_context_{}", name));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// テストごとに独立したディレクトリを用意する(`TempDir` は Drop で削除される)。
+    fn fresh_root(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("ff_chat_context_{name}_"))
+            .tempdir()
+            .unwrap()
     }
 
     #[test]
     fn test_write_then_read_roundtrip() {
-        let root = fresh_root("roundtrip");
+        let _tmp = fresh_root("roundtrip");
+        let root = _tmp.path();
         write_digest(&root, "いまは第3章の別れの場面を書いている。", "s1").unwrap();
 
         let got = read_digest(&root, DEFAULT_MAX_CHARS).unwrap();
@@ -162,20 +163,23 @@ mod tests {
 
     #[test]
     fn test_read_missing_file_returns_none() {
-        let root = fresh_root("missing");
+        let _tmp = fresh_root("missing");
+        let root = _tmp.path();
         assert!(read_digest(&root, DEFAULT_MAX_CHARS).is_none());
     }
 
     #[test]
     fn test_read_blank_content_returns_none() {
-        let root = fresh_root("blank");
+        let _tmp = fresh_root("blank");
+        let root = _tmp.path();
         write_digest(&root, "   \n\n  ", "s1").unwrap();
         assert!(read_digest(&root, DEFAULT_MAX_CHARS).is_none());
     }
 
     #[test]
     fn test_read_trims_from_the_head() {
-        let root = fresh_root("trim");
+        let _tmp = fresh_root("trim");
+        let root = _tmp.path();
         write_digest(&root, "あいうえおかきくけこ", "s1").unwrap();
 
         // 新しい話題(末尾)が残ること
@@ -185,7 +189,8 @@ mod tests {
 
     #[test]
     fn test_write_overwrites_previous_digest() {
-        let root = fresh_root("overwrite");
+        let _tmp = fresh_root("overwrite");
+        let root = _tmp.path();
         write_digest(&root, "ふるい", "s1").unwrap();
         write_digest(&root, "あたらしい", "s2").unwrap();
 
@@ -204,7 +209,8 @@ mod tests {
 
     #[test]
     fn test_owner_roundtrip() {
-        let root = fresh_root("owner_roundtrip");
+        let _tmp = fresh_root("owner_roundtrip");
+        let root = _tmp.path();
         assert!(owner(&root).is_none());
         write_digest(&root, "会話の要約", "session-abc").unwrap();
         assert_eq!(owner(&root).unwrap(), "session-abc");
@@ -212,7 +218,8 @@ mod tests {
 
     #[test]
     fn test_clear_removes_digest_and_owner() {
-        let root = fresh_root("clear");
+        let _tmp = fresh_root("clear");
+        let root = _tmp.path();
         write_digest(&root, "消えるはずの要約", "s1").unwrap();
         assert!(read_digest(&root, DEFAULT_MAX_CHARS).is_some());
         assert!(owner(&root).is_some());
@@ -225,7 +232,8 @@ mod tests {
 
     #[test]
     fn test_clear_on_missing_files_is_not_an_error() {
-        let root = fresh_root("clear_missing");
+        let _tmp = fresh_root("clear_missing");
+        let root = _tmp.path();
         clear(&root).unwrap();
     }
 

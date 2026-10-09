@@ -794,6 +794,7 @@ async fn update_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::EnvGuard;
     use agent_client_protocol::schema::v1::TextContent;
 
     #[test]
@@ -831,7 +832,7 @@ mod tests {
     #[test]
     fn test_digest_llm_config_defaults_to_gemini_when_unset() {
         let _guard = ACP_LLM_ENV_LOCK.lock().unwrap();
-        unsafe { std::env::remove_var("FIFTY_FOUR_ACP_LLM") };
+        let _env = EnvGuard::unset("FIFTY_FOUR_ACP_LLM");
 
         let cfg = digest_llm_config();
 
@@ -841,45 +842,35 @@ mod tests {
     #[test]
     fn test_digest_llm_config_uses_valid_override() {
         let _guard = ACP_LLM_ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var(
-                "FIFTY_FOUR_ACP_LLM",
-                r#"{"provider": "xai", "model": "grok-4.5"}"#,
-            );
-        }
+        let _env = EnvGuard::set(
+            "FIFTY_FOUR_ACP_LLM",
+            r#"{"provider": "xai", "model": "grok-4.5"}"#,
+        );
 
         let cfg = digest_llm_config();
 
         assert_eq!(cfg["provider"], "xai");
         assert_eq!(cfg["model"], "grok-4.5");
-
-        unsafe { std::env::remove_var("FIFTY_FOUR_ACP_LLM") };
     }
 
     #[test]
     fn test_digest_llm_config_falls_back_on_invalid_json() {
         let _guard = ACP_LLM_ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("FIFTY_FOUR_ACP_LLM", "{not json") };
+        let _env = EnvGuard::set("FIFTY_FOUR_ACP_LLM", "{not json");
 
         let cfg = digest_llm_config();
 
         assert_eq!(cfg["provider"], "google");
-
-        unsafe { std::env::remove_var("FIFTY_FOUR_ACP_LLM") };
     }
 
     #[test]
     fn test_digest_llm_config_falls_back_on_unknown_provider() {
         let _guard = ACP_LLM_ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("FIFTY_FOUR_ACP_LLM", r#"{"provider": "no-such-provider"}"#);
-        }
+        let _env = EnvGuard::set("FIFTY_FOUR_ACP_LLM", r#"{"provider": "no-such-provider"}"#);
 
         let cfg = digest_llm_config();
 
         assert_eq!(cfg["provider"], "google");
-
-        unsafe { std::env::remove_var("FIFTY_FOUR_ACP_LLM") };
     }
 
     fn turn(speaker: Speaker, text: &str) -> ChatTurn {

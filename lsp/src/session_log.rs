@@ -95,11 +95,11 @@ mod tests {
     use super::*;
     use crate::acp::Speaker;
 
-    fn fresh_root(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ff_session_log_{}", name));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn fresh_root(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("ff_session_log_{name}_"))
+            .tempdir()
+            .unwrap()
     }
 
     fn turn(speaker: Speaker, text: &str) -> ChatTurn {
@@ -111,7 +111,8 @@ mod tests {
 
     #[test]
     fn test_append_then_read_roundtrip_preserves_order() {
-        let root = fresh_root("roundtrip");
+        let _tmp = fresh_root("roundtrip");
+        let root = _tmp.path();
         append_turn(&root, "s1", &turn(Speaker::Author, "1ターン目")).unwrap();
         append_turn(&root, "s1", &turn(Speaker::Agent, "応答1")).unwrap();
         append_turn(&root, "s1", &turn(Speaker::Author, "2ターン目")).unwrap();
@@ -127,13 +128,15 @@ mod tests {
 
     #[test]
     fn test_read_missing_file_returns_empty() {
-        let root = fresh_root("missing");
+        let _tmp = fresh_root("missing");
+        let root = _tmp.path();
         assert!(read_turns(&root, "no-such-session").is_empty());
     }
 
     #[test]
     fn test_read_skips_corrupted_line_but_keeps_others() {
-        let root = fresh_root("corrupted");
+        let _tmp = fresh_root("corrupted");
+        let root = _tmp.path();
         append_turn(&root, "s1", &turn(Speaker::Author, "壊れていない発話1")).unwrap();
 
         // 壊れた1行(有効なgzipメンバーだが中身がJSONとして不正)を手動で追記する。
@@ -164,7 +167,8 @@ mod tests {
 
     #[test]
     fn test_log_uses_gzip_multi_member_and_is_smaller_than_plain_text_for_repetitive_text() {
-        let root = fresh_root("compressed");
+        let _tmp = fresh_root("compressed");
+        let root = _tmp.path();
         let long_text = "同じ話題について長めに話す。".repeat(50);
         for _ in 0..5 {
             append_turn(&root, "s1", &turn(Speaker::Author, &long_text)).unwrap();

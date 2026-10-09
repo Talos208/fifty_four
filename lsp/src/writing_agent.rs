@@ -549,6 +549,7 @@ impl WritingAgent for ClaudeAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::EnvGuard;
     use std::sync::Mutex;
 
     /// `APPDATA` は process-wide なので、テスト同士が並行実行されても
@@ -559,20 +560,17 @@ mod tests {
     #[cfg(windows)]
     fn test_windows_npm_fallback_finds_claude_cmd() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join("ff_writing_agent_appdata_hit");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _tmp = tempfile::Builder::new()
+            .prefix("ff_writing_agent_appdata_hit_")
+            .tempdir()
+            .unwrap();
+        let dir = _tmp.path();
         std::fs::create_dir_all(dir.join("npm")).unwrap();
         std::fs::write(dir.join("npm").join("claude.cmd"), "@echo off\n").unwrap();
 
-        let original = std::env::var_os("APPDATA");
-        unsafe { std::env::set_var("APPDATA", &dir) };
+        let _env = EnvGuard::set("APPDATA", &*dir);
 
         let found = windows_npm_fallback();
-
-        match original {
-            Some(v) => unsafe { std::env::set_var("APPDATA", v) },
-            None => unsafe { std::env::remove_var("APPDATA") },
-        }
 
         assert_eq!(found, Some(dir.join("npm").join("claude.cmd")));
     }
@@ -581,20 +579,16 @@ mod tests {
     #[cfg(windows)]
     fn test_windows_npm_fallback_returns_none_when_absent() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join("ff_writing_agent_appdata_miss");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let _tmp = tempfile::Builder::new()
+            .prefix("ff_writing_agent_appdata_miss_")
+            .tempdir()
+            .unwrap();
+        let dir = _tmp.path();
         // `npm/claude.cmd` を作らない。
 
-        let original = std::env::var_os("APPDATA");
-        unsafe { std::env::set_var("APPDATA", &dir) };
+        let _env = EnvGuard::set("APPDATA", &*dir);
 
         let found = windows_npm_fallback();
-
-        match original {
-            Some(v) => unsafe { std::env::set_var("APPDATA", v) },
-            None => unsafe { std::env::remove_var("APPDATA") },
-        }
 
         assert_eq!(found, None);
     }
