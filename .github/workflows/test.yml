@@ -14,13 +14,13 @@ env:
 
 jobs:
   extention:
-    name: cargo test (extention)
+    name: cargo test (extension)
     runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p extention --workspace
+      - run: cargo test -p extension --workspace
 
   lsp:
     name: cargo test (lsp)
