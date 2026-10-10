@@ -44,6 +44,17 @@ LLM は切り替えられ、fifty_four(LSP)が対応するすべての provider 
 
 `lsp/src/main.rs` の引数処理(`--acp` と同じ階層)に `--replay` を追加する。LSP プロトコルは話さない。
 
+### Cargo feature で分離する
+
+`--replay` は feature `replay` の裏に置く。**既定では有効にしない**(`default = ["otel"]` のまま)。
+
+- 実装は `lsp/src/replay.rs` に閉じ込め、`main.rs` の `mod replay;` と引数分岐を `#[cfg(feature = "replay")]` で囲む。
+- Zed 拡張として配布する通常の LSP ビルドには、`--replay` のコードが一切入らない。
+- shinasadame のイメージ用ビルドだけが `cargo build --release -p fifty_four_lsp --features replay` で有効にする。
+- `replay` 自体は新しい依存を必要としない(`tokio`・`serde_json` は既存)。ただし後述の HTTP 公開(未決)を選ぶ場合は、`axum` などを `replay` の optional 依存にして、通常ビルドに混ぜない。
+- feature 無効時に `--replay` が渡された場合は、「この実行ファイルは replay feature なしでビルドされている」と stderr に出して、終了コード 2 で終了する(黙って LSP として起動しない)。
+- CI(`cargo test -p fifty_four_lsp`)は既定 feature のテストに加え、`--features replay` のテストも走らせる。
+
 ### プロトコル(JSON Lines)
 
 標準入力から1行1リクエストを読み、標準出力へ1行1応答を返す。1行は改行を含まない JSON。
@@ -123,9 +134,27 @@ LLM は切り替えられ、fifty_four(LSP)が対応するすべての provider 
 
 ## ビルド・配備
 
-- `shinasadame/Dockerfile` を多段ビルドにする。ビルドステージで `cargo build --release -p fifty_four_lsp` を実行し、成果物を実行ステージの `/usr/local/bin/` へコピーする。
+- `shinasadame/Dockerfile` を多段ビルドにする。ビルドステージで `cargo build --release -p fifty_four_lsp --features replay` を実行し、成果物を実行ステージの `/usr/local/bin/` へコピーする。
 - Rust のビルドにはリポジトリルートが必要なので、ビルドコンテキストをリポジトリルートに変更し、Dockerfile のパスを調整する(`COPY` のパス、k8s のビルド手順)。
 - `lindera` の辞書埋め込み(`embed-ipadic`)と `rusqlite`(bundled)で、初回ビルドは重い。Rust ステージを依存だけ先にビルドしてレイヤーキャッシュを効かせる(cargo-chef 等)かは、実装計画で判断する。
+
+## 配備形態の選択肢(未決)
+
+上記は「web コンテナ内の子プロセス(stdio)」を基本形として書いている。別案として、`fifty_four_lsp` を**独立した Pod(またはサイドカーコンテナ)にして HTTP で呼ぶ**形も検討する。
+
+| 観点 | A: web 内の子プロセス(stdio) | B: 独立コンテナ/Pod(HTTP) |
+|---|---|---|
+| Python イメージ | Rust ビルドステージが必要(Dockerfile が重くなる) | Python のイメージは今のまま。Rust は別イメージ |
+| API キー | web コンテナが持つ | replay コンテナだけが持つ(web から分離できる) |
+| 障害・再起動 | 子プロセスの再起動を自前で実装 | k8s の再起動に任せられる |
+| 通信 | パイプ(設定不要) | HTTP(ポート、ヘルスチェック、Service が必要) |
+| 構成の重さ | 軽い | k8s マニフェストが増える |
+
+B の実現方法は2つ考えられる。
+1. **既存の `--replay`(stdio)を、CLI を HTTP で公開する汎用ラッパで包む**。ユーザーから `webify` や `http-cmd…` といった名前が挙がっているが、**ツールの実体・仕様は未確認**。常駐プロセスの標準入出力を HTTP に橋渡しできるか(リクエストごとに起動する方式だと、常駐の利点が失われる)を、採用前に調べる。
+2. **LSP 自身に HTTP サーバー(`axum` 等)を持たせる**。feature `replay-http` として optional 依存にし、通常ビルドには混ぜない。
+
+どちらでも成立するよう、**JSON のリクエスト/応答の形(上記プロトコル)をトランスポートから独立させる**。`ReplayClient` は `StdioTransport` と `HttpTransport` を差し替えられる作りにする。まず A(stdio)で実装し、B は同じプロトコルのまま後から足せる。
 
 ## エラー処理
 
@@ -153,5 +182,6 @@ Python(`shinasadame`):
 ## 将来の課題
 
 - tool の再現(上記)。
+- 独立 Pod 化(上記「配備形態の選択肢」)。ラッパの調査結果で A/B を判断する。
 - `llm.rs` を `fifty_four_llm` crate に切り出し、PyO3 で Python から直接呼ぶ構成。DSPy で大量の呼び出しを行う段階で、起動コストと IPC の置き換えを判断する。`llm.rs` が `crate::` 経由で依存するのは `metrics` / `assets` / `text` の3つだけなので、切り出しの見通しは立っている。
 - 試行結果の保存(履歴・比較)。必要になった時点で、app.db にテーブルを追加する。
