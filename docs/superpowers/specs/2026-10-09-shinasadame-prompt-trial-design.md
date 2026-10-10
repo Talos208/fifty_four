@@ -154,7 +154,8 @@ B の実現方法は2つ考えられる。
 1. **既存の `--replay`(stdio)を、CLI を HTTP で公開する汎用ラッパで包む**。調査結果(2026-10-10):
    - [`webify`](https://hub.docker.com/r/beefsack/webify)(beefsack): CGI 風のサーバー。**リクエストごとにコマンドを起動**し、リクエストボディを標準入力、標準出力をレスポンスボディにする。非ゼロ終了は HTTP 500。→ 起動のたびに辞書ロードなどの初期化が走り、常駐の利点が失われる。常駐 `--replay`(JSON Lines)とは噛み合わず、使うなら「1リクエスト1プロセス」の単発モードを別に用意することになる。
    - [`websocketd`](https://linuxmanpag.es/man/8/websocketd/): 標準入出力で動く任意の実行ファイルを WebSocket で公開する。接続ごとにプロセスを起動して標準入出力を橋渡しするので、**接続を保てば常駐の JSON Lines と相性が良い**。ただし接続の管理(再接続・多重化)が Python 側に増える。
-   - `http-cmdtokade`: 検索で見つからなかった。綴りまたは入手元の確認が必要(**未確認**)。
+   - [`http-cmd`](https://www.lib.rs/crates/http-cmd)(Rust の crate): ローカルサーバーを立て、POST のボディを標準入力または引数としてコマンドを実行し、出力を返す。静的サイトジェネレーター向けで、**リクエストごとの実行**(常駐しない)。インターネットに公開しないこと、と README に注意書きがある。→ `webify` と同じ理由で常駐の `--replay` とは噛み合わない。(ユーザーが挙げた `http-cmdtokade` は、この `http-cmd` を指すと理解しているが、`tokade` の部分は未確認)
+   - [`servep`](https://www.npmjs.org/package/servep)(npm): 標準入出力で動く実行ファイルを TCP/HTTP/WebSocket で公開する。HTTP では session-id ごとにプロセスを1つ起動し、同じ session-id のリクエストを同じプロセスの標準入力へ流す。**常駐プロセスを HTTP で扱える**が、Node.js の依存が増える。
 2. **LSP 自身に HTTP サーバー(`axum` 等)を持たせる**。feature `replay-http` として optional 依存にし、通常ビルドには混ぜない。
 
 どちらでも成立するよう、**JSON のリクエスト/応答の形(上記プロトコル)をトランスポートから独立させる**。`ReplayClient` は `StdioTransport` と `HttpTransport` を差し替えられる作りにする。まず A(stdio)で実装し、B は同じプロトコルのまま後から足せる。
