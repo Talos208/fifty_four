@@ -1,0 +1,12 @@
+# クラスタ内からだけ届く。外部には公開しない。
+apiVersion: v1
+kind: Service
+metadata:
+  name: replay
+spec:
+  type: ClusterIP
+  selector:
+    app: replay
+  ports:
+    - port: 8080
+      targetPort: 8080
