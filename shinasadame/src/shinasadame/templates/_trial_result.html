@@ -1,0 +1,28 @@
+{# 試行結果。result は ReplayOk か ReplayFailed。HTTP は常に 200(htmx がスワップできるように) #}
+{% set error_labels = {
+  'bad_request': 'リクエストが不正です',
+  'auth': '認証に失敗しました',
+  'timeout': 'タイムアウトしました',
+  'llm': 'LLM がエラーを返しました',
+  'internal': 'replay サービスの内部エラーです',
+  'unavailable': 'replay サービスに接続できません',
+} %}
+{% if result.kind is defined %}
+  <div class="trial-error">
+    <strong>{{ error_labels.get(result.kind, '失敗しました') }}</strong>
+    <pre>{{ result.message }}</pre>
+  </div>
+{% else %}
+  <p class="muted">{{ result.model }} · {{ result.elapsed_ms }} ms</p>
+  {% if result.truncated %}<p class="muted">応答が長いため途中で切り詰めました</p>{% endif %}
+  <div class="trial-compare">
+    <div>
+      <h3>元の出力</h3>
+      {% if original is none %}<p class="muted">—</p>{% else %}<pre>{{ original }}</pre>{% endif %}
+    </div>
+    <div>
+      <h3>試行結果</h3>
+      <pre>{{ result.response }}</pre>
+    </div>
+  </div>
+{% endif %}

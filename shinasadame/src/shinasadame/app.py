@@ -4,9 +4,10 @@ import uuid
 from urllib.parse import urlencode
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path, PureWindowsPath
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -15,6 +16,7 @@ from sqlalchemy import insert, select
 from . import config, db, etl, records, tasks
 from .analysis import acceptance as acc
 from .display import doc_name
+from .replay import ReplayClient, ReplayFailed, ReplayUnavailable, replay_model_for
 from .telemetry import setup_telemetry
 
 BASE = Path(__file__).parent
@@ -40,10 +42,18 @@ templates.env.filters["mtime"] = _mtime
 templates.env.filters["doc_name"] = doc_name
 
 
+@lru_cache
+def get_replay_client() -> ReplayClient:
+    """FastAPI の依存関係。接続を使い回すため 1 つだけ作る。テストは dependency_overrides で差し替える。"""
+    return ReplayClient()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     db.init_db()
     yield
+    if get_replay_client.cache_info().currsize:
+        await get_replay_client().aclose()
 
 
 # トレース送信は setup_telemetry が gRPC で行う。FastAPI 本体の自動設定(OTEL_* を読んで
@@ -245,6 +255,10 @@ def record_detail(request: Request, sid: int, table: str, record_id: int):
     detail = records.get_record(db.get_engine(), sid, table, record_id)
     if detail is None:
         raise HTTPException(404, "レコードが見つかりません")
+    # 「試す」のモデル選択肢: 記録のモデルを replay が解釈できる形にしたものを先頭に、
+    # SHINASADAME_MODELS の候補を重複なしで並べる
+    default_model = replay_model_for(str(detail["row"].get("model_name") or ""))
+    model_options = [default_model, *(m for m in config.model_choices() if m != default_model)]
     return _render(
         request,
         "record_detail.html",
@@ -253,5 +267,45 @@ def record_detail(request: Request, sid: int, table: str, record_id: int):
         table=table,
         spec=spec,
         record_id=record_id,
+        can_try=table in records.PROMPT_TABLES,
+        model_options=model_options,
+        default_model=default_model,
         **detail,
+    )
+
+
+@app.post("/s/{sid}/records/{table}/{record_id}/try")
+async def try_prompt(
+    request: Request,
+    sid: int,
+    table: str,
+    record_id: int,
+    prompt: str = Form(...),
+    model: str = Form(...),
+    model_custom: str = Form(""),
+    client: ReplayClient = Depends(get_replay_client),
+):
+    """編集したプロンプトを replay サービスに投げ、元の出力と並べる部分テンプレートを返す。
+
+    エラーも HTTP 200 で返す(htmx は 4xx/5xx の本文をスワップしないため)。
+    """
+    _snapshot_or_404(sid)
+    _spec_or_404(table)
+    if table not in records.PROMPT_TABLES:
+        raise HTTPException(404, "このテーブルにはプロンプトがありません")
+    detail = records.get_record(db.get_engine(), sid, table, record_id)
+    if detail is None:
+        raise HTTPException(404, "レコードが見つかりません")
+
+    # 一覧にないモデルを自由入力したときは、そちらを優先する
+    model = model_custom.strip() or model.strip()
+    prompt = prompt.replace("\r\n", "\n")  # ブラウザは改行を CRLF で送る
+    try:
+        result = await client.run(model, prompt)
+    except ReplayUnavailable as e:
+        result = ReplayFailed(kind="unavailable", message=str(e))
+    return templates.TemplateResponse(
+        request,
+        "_trial_result.html",
+        {"original": records.original_output(detail), "result": result, "model": model},
     )

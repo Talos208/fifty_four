@@ -39,3 +39,26 @@ def upload_path(import_id: int) -> Path:
 
 def otlp_endpoint() -> str | None:
     return os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or None
+
+
+def replay_url() -> str:
+    return os.environ.get("REPLAY_URL", "http://replay:8080").rstrip("/")
+
+
+def replay_default_timeout_secs() -> int:
+    try:
+        value = int(os.environ.get("REPLAY_DEFAULT_TIMEOUT_SECS", "120"))
+    except ValueError:
+        return 120
+    return value if value > 0 else 120
+
+
+def lmstudio_host() -> str:
+    """LM Studio 系モデルを replay に渡すときの `host:port`。replay Pod から見えるアドレス。"""
+    return os.environ.get("REPLAY_LMSTUDIO_HOST", "").strip() or "host.docker.internal:1234"
+
+
+def model_choices() -> list[str]:
+    """画面の選択肢にする `provider/model`。`SHINASADAME_MODELS` をカンマ区切りで読む。"""
+    raw = os.environ.get("SHINASADAME_MODELS", "")
+    return [m.strip() for m in raw.split(",") if m.strip()]
