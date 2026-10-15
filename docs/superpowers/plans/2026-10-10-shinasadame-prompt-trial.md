@@ -1954,6 +1954,8 @@ RUN mkdir -p lsp/src extension/src prepare/src \
 COPY lsp ./lsp
 COPY extension ./extension
 COPY prepare ./prepare
+# プロンプト等のアセットは rust-embed が `lsp/` から見て `../data/` を埋め込む(lsp/src/assets.rs)
+COPY data ./data
 # 依存のダミービルドより新しいと判定されるよう、ソースの更新時刻を進める
 RUN touch lsp/src/main.rs \
     && cargo build --release -p fifty_four_lsp --features replay
