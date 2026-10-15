@@ -15,6 +15,8 @@ LLM は切り替えられ、fifty_four(LSP)が対応するすべての provider 
 - LLM の provider ごとの差異(reasoning、構造化出力、未対応パラメータの自動除去、LM Studio の能力判定など)は `lsp/src/llm.rs` が吸収している。Python 側で再実装せず、**LSP の Rust コードを再利用**する。
 - shinasadame は Docker Desktop の kind 上で動き、ホストのワークスペース(`characters.md`、`plot.md`)は見えない。
 - 公開先はローカルのみ(既存の前提のまま)。
+- 既知の制限(a): `lmstudio@host:port/model` により、ブラウザの利用者が replay Pod から到達できる任意の host:port を呼ばせられる。ローカル専用の前提で許容し、NetworkPolicy / 許可リストは将来の課題とする。
+- 既知の制限(b): replay は元の呼び出しのオプション(response_format / temperature / reasoning / capabilities)を引き継がない。そのため出力形式(例: code_actions の JSON)が記録と異なることがある。
 
 ### スコープ
 
@@ -104,9 +106,9 @@ fifty_four_lsp --replay [--listen 0.0.0.0:8080]
 
 ### 動作
 
-- LLM 呼び出しは既存の `build_client` / `use_llm_with_option` を通し、`crate::metrics` の計装もそのまま働く。
+- LLM 呼び出しは `LlmClientBuilder` で生成したクライアントの `chat()` を直接呼ぶ(`crate::metrics` の計装は `chat()` 内にあるのでそのまま働く)。
 - tool は登録しない。記録されている `prompt` を、そのままユーザープロンプトとして渡す。
-- **未確認**: LSP は `build_client` にシステムプロンプト名(`sys_prompt_name`)を渡す経路があるが、記録される `prompt` にそれが含まれるかは未確認。含まれない場合、再実行は元と条件が異なる。実装計画の最初に確認し、必要ならリクエストに `system` を足す。
+- **システムプロンプト**: LSP の補完・コードアクションは `build_client_async(cfg, "system.md")` でシステムプロンプト `system.md` を付けて呼んでいる。記録される `prompt` はそのユーザー部分なので、再実行も既定で `system.md`(`crate::assets::load("system.md")`)を付ける。リクエストの `system` で上書きでき、空文字ならシステムプロンプトなしにする。`character_updates` や `quality_reviews` など別のシステムプロンプトを使う機能では、元の実行と条件が異なる場合がある(画面の注記に含める)。
 - 同時実行数は `tokio::sync::Semaphore` で制限する(環境変数 `REPLAY_MAX_CONCURRENCY`、既定 4)。上限を超えたリクエストは待機する。
 - リクエストボディの上限は 1 MiB。応答は 1,000,000 文字で切り詰め、切り詰めたら `truncated: true` を返す。
 - `cfg(debug_assertions)` で囲わない。イメージには release ビルドを入れるため(FlightRecorder だけが debug 専用)。
@@ -144,6 +146,7 @@ fifty_four_lsp --replay [--listen 0.0.0.0:8080]
 | `REPLAY_URL` | replay サービスの URL | `http://replay:8080` |
 | `SHINASADAME_MODELS` | 選択肢にする `provider/model`(カンマ区切り) | 空 |
 | `REPLAY_DEFAULT_TIMEOUT_SECS` | LLM 呼び出しの上限 | 120 |
+| `REPLAY_LMSTUDIO_HOST` | 「試す」の既定モデルで LM Studio 系の名前に補う `host:port`(`lmstudio@<host>/<model>`) | `host.docker.internal:1234` |
 
 ## ビルド・配備
 
