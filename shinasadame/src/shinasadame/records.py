@@ -77,6 +77,21 @@ SPECS: dict[str, Spec] = {
 }
 
 
+# プロンプトを持つテーブル。画面の「試す」パネルの対象。
+PROMPT_TABLES = frozenset(name for name, t in FR_TABLES.items() if "prompt" in t.c)
+
+
+def original_output(detail: dict) -> str | None:
+    """元の実行の出力。`response` 列があればそれ、無ければ(補完)候補を順位順に連結する。"""
+    row = detail["row"]
+    if row.get("response") is not None:
+        return row["response"]
+    for _label, child_table, items in detail["children"]:
+        if child_table.endswith("_candidates") and items:
+            return "\n---\n".join(it["candidate"] for it in items)
+    return None
+
+
 def _like(term: str) -> str:
     escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"

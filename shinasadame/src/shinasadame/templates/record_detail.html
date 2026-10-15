@@ -18,6 +18,30 @@
   {% endfor %}
 </dl>
 
+{% if can_try %}
+<h2>試す</h2>
+<form class="trial" hx-post="/s/{{ sid }}/records/{{ table }}/{{ record_id }}/try"
+      hx-target="#trial-result" hx-disabled-elt="find button" hx-indicator="#trial-spinner">
+  <p class="muted">tool なしで実行します。元の実行とは条件が異なります。</p>
+  <label>プロンプト
+    <textarea name="prompt" rows="12" required>
+{{ row.prompt }}</textarea>
+  </label>
+  <label>モデル
+    <select name="model" required>
+      {% for m in model_options %}<option value="{{ m }}"{% if m == default_model %} selected{% endif %}>{{ m }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>一覧にないモデル(入力するとこちらを優先)
+    <input name="model_custom" placeholder="provider/model 例: openai/gpt-5.3">
+  </label>
+  <button type="submit">試す</button>
+  <span id="trial-spinner" class="htmx-indicator muted">実行中…</span>
+</form>
+<div id="trial-result"></div>
+{% endif %}
+
 {% if review %}
 <h2>関連する LLM レビュー</h2>
 <p><a href="/s/{{ sid }}/records/quality_reviews/{{ review.id }}">quality_reviews #{{ review.id }}</a> ({{ review.model_name }})</p>

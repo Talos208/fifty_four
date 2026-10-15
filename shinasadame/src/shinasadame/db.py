@@ -20,9 +20,9 @@ from sqlalchemy import (
     MetaData,
     Table,
     Text,
-    create_engine,
     event,
 )
+import sqlalchemy
 from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.schema import CreateIndex, CreateTable
 
@@ -226,7 +226,9 @@ def get_engine(path: Path | None = None) -> Engine:
     with _lock:
         engine = _engines.get(path)
         if engine is None:
-            engine = create_engine(f"sqlite:///{path}")
+            # `from sqlalchemy import create_engine` にしない。OTel の計装は `sqlalchemy.create_engine` を
+            # 差し替えるので、import 時に取った参照では計装が効かない。
+            engine = sqlalchemy.create_engine(f"sqlite:///{path}")
 
             @event.listens_for(engine, "connect")
             def _pragmas(dbapi_conn, _record):  # noqa: ANN001
