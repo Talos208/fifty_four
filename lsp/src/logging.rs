@@ -19,17 +19,35 @@ pub struct Logger {
     meter_provider: Option<SdkMeterProvider>,
 }
 
+/// このプロセスの役割。otel 有効時の `service.name` を分けるのに使う
+/// (どれも別プロセスとして起動されるため、コレクタ側で出力元を区別できるようにする)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogMode {
+    Lsp,
+    Acp,
+    /// `--replay`(feature `replay` のビルドにだけ存在する)
+    #[cfg(feature = "replay")]
+    Replay,
+}
+
+impl LogMode {
+    /// `--acp` の有無から決める(`--replay` は呼び出し側が `Replay` を直接渡す)。
+    pub fn from_acp(acp: bool) -> Self {
+        if acp { LogMode::Acp } else { LogMode::Lsp }
+    }
+}
+
 #[allow(unused)]
 impl Logger {
-    /// `acp` は ACP モード(`--acp`)かどうか。otel 有効時、`service.name` を
-    /// LSP/ACP で分けるのに使う(otel 無効時は無視する)。
-    pub fn new(acp: bool) -> Self {
+    /// otel 有効時、`mode` で `service.name` を LSP/ACP/replay に分ける(otel 無効時は無視する)。
+    pub fn new(mode: LogMode) -> Self {
         #[cfg(feature = "otel")]
         {
-            prepare_tracing(acp)
+            prepare_tracing(mode)
         }
         #[cfg(not(feature = "otel"))]
         {
+            let _ = mode;
             prepare_env_logger();
             Logger {}
         }
@@ -82,12 +100,24 @@ use {
     },
 };
 
-/// LSP/ACP で service.name を分ける(ACPは別プロセスとして起動されるため、
-/// コレクタ側でどちらの出力か区別できるようにする)。
+/// LSP/ACP/replay で service.name を分ける(別プロセスとして起動されるため、
+/// コレクタ側でどの出力か区別できるようにする)。
 #[cfg(feature = "otel")]
 const SERVICE_NAME_LSP: &str = "fifty_four_lsp";
 #[cfg(feature = "otel")]
 const SERVICE_NAME_ACP: &str = "fifty_four_acp";
+#[cfg(all(feature = "otel", feature = "replay"))]
+const SERVICE_NAME_REPLAY: &str = "fifty_four_replay";
+
+#[cfg(feature = "otel")]
+fn service_name(mode: LogMode) -> &'static str {
+    match mode {
+        LogMode::Lsp => SERVICE_NAME_LSP,
+        LogMode::Acp => SERVICE_NAME_ACP,
+        #[cfg(feature = "replay")]
+        LogMode::Replay => SERVICE_NAME_REPLAY,
+    }
+}
 
 /// tonic/h2/hyper/tower が出す gRPC フレーム単位の低レベルログと、
 /// OTel SDK 自身のバッチ処理スレッドが定期タイマーで吐く内部housekeepingログ
@@ -165,7 +195,7 @@ fn network_target() -> Option<String> {
 }
 
 #[cfg(feature = "otel")]
-fn prepare_tracing(acp: bool) -> Logger {
+fn prepare_tracing(mode: LogMode) -> Logger {
     // 明示的に無効化されていれば、エクスポータもプロバイダも一切作らずに即終了する。
     if logging_disabled() {
         eprintln!("Logging disabled.");
@@ -177,7 +207,7 @@ fn prepare_tracing(acp: bool) -> Logger {
     }
 
     if network_target().filter(|t| !t.is_empty()).is_some() {
-        return prepare_network_tracing(acp);
+        return prepare_network_tracing(mode);
     }
 
     // 出力先が stderr のとき: ネットワークへは一切接続を試みない
@@ -197,13 +227,9 @@ fn prepare_tracing(acp: bool) -> Logger {
 /// 出力先がネットワーク(OTel)のときの設定。stderr へは(エクスポータ構築失敗時を
 /// 含めて)絶対に何も出さない。
 #[cfg(feature = "otel")]
-fn prepare_network_tracing(acp: bool) -> Logger {
+fn prepare_network_tracing(mode: LogMode) -> Logger {
     eprintln!("Logging to Otel.");
-    let service_name = if acp {
-        SERVICE_NAME_ACP
-    } else {
-        SERVICE_NAME_LSP
-    };
+    let service_name = service_name(mode);
 
     let resource = Resource::builder()
         .with_service_name(service_name)
@@ -402,6 +428,20 @@ mod tests {
 
     use crate::RUST_LOG_TEST_LOCK as ENV_LOCK;
     use crate::test_util::EnvGuard;
+
+    #[test]
+    fn test_service_name_is_distinct_per_mode() {
+        assert_eq!(service_name(LogMode::Lsp), "fifty_four_lsp");
+        assert_eq!(service_name(LogMode::Acp), "fifty_four_acp");
+        assert_eq!(LogMode::from_acp(true), LogMode::Acp);
+        assert_eq!(LogMode::from_acp(false), LogMode::Lsp);
+    }
+
+    #[cfg(feature = "replay")]
+    #[test]
+    fn test_service_name_for_replay_is_its_own() {
+        assert_eq!(service_name(LogMode::Replay), "fifty_four_replay");
+    }
 
     #[test]
     fn test_logging_disabled_when_rust_log_is_off() {

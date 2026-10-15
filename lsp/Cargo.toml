@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 default = ["otel"]
 release = []
+replay = ["dep:axum"]
 otel = [
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",
@@ -62,6 +63,12 @@ tracing = { version = "0.1.44", features = ["std"], optional = true }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "registry", "std", "fmt"], optional = true }
 tracing-opentelemetry = { version = "0.32", optional = true }
 tracing-log = { version = "0.2", optional = true }
+axum = { version = "0.8", optional = true }
 
 [dev-dependencies]
+# replay のトレース連結のテストでメモリ上の exporter を使う
+opentelemetry_sdk = { version = "0.31.0", features = ["testing"] }
 tempfile = "3.27.0"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["test-util"] }

@@ -29,8 +29,11 @@ mod plot_sync;
 mod progress;
 mod quality;
 mod references;
+#[cfg(feature = "replay")]
+mod replay;
 #[cfg(debug_assertions)]
 mod session_log;
+#[cfg(test)]
 mod test_util;
 mod text;
 mod tools;
@@ -126,6 +129,22 @@ fn default_acp_log_level() {
 /// (`std::env::remove_var` は他スレッドが環境を読んでいると UB であり、
 /// ワーカースレッドが立った後では安全に呼べない)。
 fn main() {
+    if std::env::args().skip(1).any(|a| a == "--replay") {
+        #[cfg(feature = "replay")]
+        {
+            return replay::main();
+        }
+        // LSP の stdio は JSON-RPC 用なので、黙って LSP として起動してはいけない。
+        #[cfg(not(feature = "replay"))]
+        {
+            eprintln!(
+                "fifty_four_lsp: --replay は replay feature なしでビルドされています \
+                 (cargo build --release -p fifty_four_lsp --features replay)"
+            );
+            std::process::exit(2);
+        }
+    }
+
     let acp = std::env::args().skip(1).any(|a| a == "--acp");
 
     // ここはまだシングルスレッド。環境変数の操作は他スレッドが立つ前に済ませる。
@@ -228,7 +247,7 @@ fn append_to_acp_panic_log(line: &str) {
 async fn async_main(acp: bool) {
     // ロガー/トレーサの設置はここに一本化。
     // ACP 経路も計装対象にするため、分岐より前に置く。
-    let _log = Logger::new(acp);
+    let _log = Logger::new(logging::LogMode::from_acp(acp));
 
     if acp {
         #[cfg(debug_assertions)]

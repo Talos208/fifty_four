@@ -120,7 +120,10 @@ impl Provider {
             "openai" => Ok(Provider::OpenAI(model.to_string())),
             "anthropic" => Ok(Provider::Anthropic(model.to_string())),
             "xai" => Ok(Provider::XAi(model.to_string())),
-            "lmstudio" => Ok(Provider::LMStudio(model.to_string(), Some(url.to_string()))),
+            "lmstudio" => Ok(Provider::LMStudio(
+                model.to_string(),
+                Some(normalize_lmstudio_url(url)),
+            )),
             "cloudflare" => Ok(Provider::Cloudflare(model.to_string())),
             _ => Err(format!("Unsupported provider: {}", name)),
         }
@@ -341,6 +344,26 @@ impl Drop for InFlightRequest {
 static LMSTUDIO_CAP_CACHE: std::sync::LazyLock<
     dashmap::DashMap<(String, String), ModelCapability>,
 > = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// `lmstudio@host:port/model` 形式の `host:port` を、genai が `chat/completions` を
+/// `join` できるベース URL(`http://host:port/v1/`)へ正規化する。
+/// スキームがあればそれを、`/v1` を含むパスがあればそれを尊重し、末尾スラッシュだけ保証する。
+fn normalize_lmstudio_url(url: &str) -> String {
+    let mut u = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("http://{url}")
+    };
+    if !u.ends_with('/') {
+        u.push('/');
+    }
+    // `http://host:port/` のようにパスが無いときだけ `v1/` を補う。
+    let after_scheme = u.split_once("://").map_or(u.as_str(), |(_, r)| r);
+    if after_scheme.trim_end_matches('/').find('/').is_none() {
+        u.push_str("v1/");
+    }
+    u
+}
 
 /// 設定に書かれた LMStudio の URL(`http://localhost:1234` / `.../v1` / `.../v1/` など
 /// 表記が揺れる)から `/api/v0` を生やすためのルートを求める。
@@ -2242,6 +2265,31 @@ mod tests_lmstudio_probe {
             capabilities_from_chat_template("{{{ not a template at all \0\0"),
             ModelCapability::empty()
         );
+    }
+
+    #[test]
+    fn test_from_name_lmstudio_chat_endpoint_url() {
+        let chat_url = |name: &str| match Provider::from_name(name).unwrap() {
+            Provider::LMStudio(_, Some(u)) => reqwest::Url::parse(&u)
+                .unwrap()
+                .join("chat/completions")
+                .unwrap()
+                .to_string(),
+            other => panic!("unexpected provider: {other:?}"),
+        };
+        assert_eq!(
+            chat_url("lmstudio@h:1234/m"),
+            "http://h:1234/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_url("lmstudio/m"),
+            "http://localhost:1234/v1/chat/completions"
+        );
+        // 明示的なスキーム・パスは尊重し、末尾スラッシュだけ補う。
+        assert_eq!(normalize_lmstudio_url("https://h:1/v1"), "https://h:1/v1/");
+        assert_eq!(normalize_lmstudio_url("http://h:1"), "http://h:1/v1/");
+        // プローブは /v1 を剥がして /api/v0 を引く。
+        assert_eq!(lmstudio_api_root("http://h:1234/v1/"), "http://h:1234");
     }
 
     #[test]
