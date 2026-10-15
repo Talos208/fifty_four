@@ -1,5 +1,6 @@
 """全テーブルのレコード一覧・検索・詳細。"""
 
+import json
 from dataclasses import dataclass, field
 
 from sqlalchemy import Engine, Table, and_, exists, func, or_, select
@@ -81,15 +82,33 @@ SPECS: dict[str, Spec] = {
 PROMPT_TABLES = frozenset(name for name, t in FR_TABLES.items() if "prompt" in t.c)
 
 
-def original_output(detail: dict) -> str | None:
-    """元の実行の出力。`response` 列があればそれ、無ければ(補完)候補を順位順に連結する。"""
-    row = detail["row"]
-    if row.get("response") is not None:
-        return row["response"]
-    for _label, child_table, items in detail["children"]:
-        if child_table.endswith("_candidates") and items:
-            return "\n---\n".join(it["candidate"] for it in items)
-    return None
+# 構造化出力(スキーマ付き)で試すテーブルと、そのプロンプトテンプレート(`data/` のアセット名)。
+# replay がテンプレートの frontmatter(スキーマ・max_tokens)を LSP と同じ経路で適用する。
+# 補完のテンプレート(prompt_completion*.md)は、スキーマが全て同一。
+TRIAL_TEMPLATES = {"completions": "prompt_completion.md"}
+
+
+def parse_candidates(response: str) -> list[dict] | None:
+    """構造化出力 `{"candidates": [{"text", "confidence"}, ...]}` を、候補の表の行に直す。
+
+    形が違うときは None(呼び出し側が、生の応答をそのまま見せる)。confidence が無い・数値でない
+    候補は `confidence=None`(表示は「—」)。
+    """
+    try:
+        data = json.loads(response)
+    except ValueError:
+        return None
+    items = data.get("candidates") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None
+    rows: list[dict] = []
+    for rank, item in enumerate(items):
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            return None
+        conf = item.get("confidence")
+        is_number = isinstance(conf, int | float) and not isinstance(conf, bool)
+        rows.append({"rank": rank, "candidate": item["text"], "confidence": conf if is_number else None})
+    return rows
 
 
 def _like(term: str) -> str:

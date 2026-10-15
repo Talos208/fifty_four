@@ -55,11 +55,12 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 13px/1.5 u
 .doc-filter { padding: 8px 12px; background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 6px; }
 .doc-filter a { margin-left: 12px; }
 tr.current td { background: color-mix(in srgb, var(--accent) 12%, transparent); }
-.trial textarea { width: 100%; font-family: monospace; }
-.trial label { display: block; margin: .5rem 0; }
-.trial select[name="model"], .trial input[name="model_custom"] { width: 100%; max-width: 40em; box-sizing: border-box; }
-.trial-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
-.trial-compare pre { white-space: pre-wrap; }
+.trial-edit { margin-bottom: 12px; }
+.trial-edit summary { cursor: pointer; color: var(--accent); margin-bottom: 8px; }
+.trial-fields textarea { width: 100%; box-sizing: border-box; field-sizing: content; min-height: 6em; padding: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--fg); font: 13px/1.5 ui-monospace, "Cascadia Mono", monospace; }
+.trial-fields select, .trial-fields input[name="model_custom"] { width: 100%; max-width: 40em; box-sizing: border-box; }
+.trial-candidates { margin-top: 8px; }
+.trial-candidates td { white-space: pre-wrap; }
 .trial-error { border-left: 4px solid #c33; padding-left: .75rem; }
 .htmx-indicator { display: none; }
 .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { display: inline; }

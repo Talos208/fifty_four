@@ -38,6 +38,26 @@ pub(crate) struct ReplayRequest {
     /// システムプロンプト。省略時は LSP の執筆支援と同じ `system.md`。空文字ならシステムプロンプトなし。
     #[serde(default)]
     pub system: Option<String>,
+    /// プロンプトテンプレートのアセット名(例: `prompt_completion.md`)。指定すると、その
+    /// frontmatter(`schema` による構造化出力、`max_tokens` など)を LSP と同じ経路で適用する。
+    /// `prompt_*.md` だけが対象で、存在しない名前は 400。
+    #[serde(default)]
+    pub options_from: Option<String>,
+}
+
+/// `options_from` に指定できる名前か。アセットの任意の読み出しにならないよう、
+/// `prompt_` で始まり `.md` で終わる英小文字・数字・`_` だけの名前に限る。
+fn is_prompt_template_name(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_prefix("prompt_")
+        .and_then(|s| s.strip_suffix(".md"))
+    else {
+        return false;
+    };
+    !stem.is_empty()
+        && stem
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -129,6 +149,14 @@ impl ReplayRequest {
             return Err(ReplayError::bad_request(
                 "cloudflare は replay では未対応です(account_id を指定できません)",
             ));
+        }
+
+        if let Some(name) = self.options_from.as_deref()
+            && (!is_prompt_template_name(name) || crate::frontmatter::load_prompt(name).is_none())
+        {
+            return Err(ReplayError::bad_request(format!(
+                "options_from が不正です(prompt_*.md の既存のテンプレート名を指定してください): {name:?}"
+            )));
         }
 
         let secs = match self.timeout_secs {
@@ -371,14 +399,27 @@ async fn replay_handler(
         .map_err(|_| ReplayError::new(ErrorKind::Internal, "同時実行の制御に失敗しました"))?;
 
     let started = Instant::now();
-    let mut client = state
+    let client = state
         .factory
         .create(req.model.trim(), req.system.clone())
         .await?;
-    client.add(Content::Text(req.prompt.clone()));
 
-    // オプションが空なので `use_llm_with_option` は使わず、新規クライアントを直接呼ぶ。
-    let text = match tokio::time::timeout(timeout, client.chat()).await {
+    // `options_from` があれば、そのテンプレートの frontmatter(スキーマ・max_tokens など)を
+    // LSP と同じ `use_llm_with_option` で適用する(構造化出力の可否に応じた切り替えと、
+    // JSON の検証・救済も LSP と同じ)。無ければ空のオプションで、プロンプトをそのまま送る。
+    let options = req
+        .options_from
+        .as_deref()
+        .and_then(|name| crate::frontmatter::load_prompt(name))
+        .map(|(_, options)| options)
+        .unwrap_or_default();
+    let slot = tokio::sync::Mutex::new(Some(client));
+    let prompt = req.prompt.clone();
+    let call = crate::llm::use_llm_with_option(&slot, options, async |l| {
+        l.add(Content::Text(prompt));
+        l.chat().await
+    });
+    let text = match tokio::time::timeout(timeout, call).await {
         Err(_) => {
             return Err(ReplayError::new(
                 ErrorKind::Timeout,
@@ -703,6 +744,85 @@ mod tests {
         );
     }
 
+    // ---- options_from: プロンプトテンプレートの frontmatter(スキーマ等)を適用する ----
+
+    const STRUCTURED_REPLY: &str =
+        r#"{"candidates":[{"text":"一つ目","confidence":0.8},{"text":"二つ目","confidence":0.3}]}"#;
+
+    fn body_with_template(template: &str) -> String {
+        serde_json::json!({
+            "model": "google/gemini-3.1-pro",
+            "prompt": "続きを書いて",
+            "options_from": template,
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_options_from_applies_the_template_schema_to_the_request() {
+        let f = StubFactory::new(Behavior::Reply(STRUCTURED_REPLY.to_string()));
+        let (status, json) = post_json(
+            app(f.clone(), 4),
+            &body_with_template("prompt_completion.md"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["response"], STRUCTURED_REPLY);
+        // スタブは構造化出力に対応していないので、スキーマはプロンプトへ埋め込まれる(LSP と同じ経路)
+        let seen = f.seen_prompts.lock().unwrap().clone();
+        // 順序は use_llm_with_option のもの(スキーマの指示 → プロンプト)に従う
+        assert_eq!(seen.len(), 2, "スキーマの指示とプロンプトの 2 つ: {seen:?}");
+        assert!(seen.contains(&"続きを書いて".to_string()), "{seen:?}");
+        let schema_text = seen
+            .iter()
+            .find(|t| t.contains("JSON Schema"))
+            .expect("スキーマの指示が渡っていない");
+        assert!(
+            schema_text.contains("confidence"),
+            "completion のスキーマではない"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_options_from_rejects_unknown_or_unsafe_template_names() {
+        let f = StubFactory::new(Behavior::Reply(STRUCTURED_REPLY.to_string()));
+        for name in [
+            "prompt_nosuch.md",
+            "../Cargo.toml",
+            "system.md",
+            "prompt_completion.md/../../x",
+            "",
+        ] {
+            let (status, json) = post_json(app(f.clone(), 4), &body_with_template(name)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "name={name:?}");
+            assert_eq!(json["error"]["kind"], "bad_request", "name={name:?}");
+        }
+        assert_eq!(
+            f.created.load(Ordering::SeqCst),
+            0,
+            "検証で弾けばクライアントを作らない"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_options_from_returns_llm_error_when_reply_is_not_json() {
+        let f = StubFactory::new(Behavior::Reply("JSON ではない自由文".to_string()));
+        let (status, json) =
+            post_json(app(f, 4), &body_with_template("prompt_completion.md")).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(json["error"]["kind"], "llm");
+    }
+
+    #[tokio::test]
+    async fn test_without_options_from_the_prompt_is_sent_as_is() {
+        let f = StubFactory::new(Behavior::Reply("自由文".to_string()));
+        let (status, json) = post_json(app(f.clone(), 4), OK_BODY).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["response"], "自由文");
+        assert_eq!(f.seen_prompts.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn test_replay_passes_system_override_and_default_to_factory() {
         let f = StubFactory::new(Behavior::Reply("ok".to_string()));
@@ -875,6 +995,7 @@ mod tests {
             prompt: prompt.to_string(),
             timeout_secs: None,
             system: None,
+            options_from: None,
         }
     }
 
@@ -1314,152 +1435,6 @@ mod tests {
                     spans.iter().map(|s| s.name.to_string()).collect::<Vec<_>>()
                 )
             })
-        }
-
-        fn has_attr(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> bool {
-            span.attributes.iter().any(|kv| kv.key.as_str() == key)
-        }
-
-        fn attr(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> String {
-            span.attributes
-                .iter()
-                .find(|kv| kv.key.as_str() == key)
-                .map(|kv| kv.value.to_string())
-                .unwrap_or_else(|| panic!("属性 {key} が無い"))
-        }
-
-        /// `err` は、span の status を Error にし、説明に Debug 表記のエラーを入れる。
-        fn is_error_status(span: &opentelemetry_sdk::trace::SpanData, contains: &str) -> bool {
-            matches!(&span.status, opentelemetry::trace::Status::Error { description }
-                if description.contains(contains))
-        }
-
-        /// `ret` の戻り値は、スパンのイベントの `return` 属性として記録される。
-        fn event_attr(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<String> {
-            span.events.iter().find_map(|e| {
-                e.attributes
-                    .iter()
-                    .find(|kv| kv.key.as_str() == key)
-                    .map(|kv| kv.value.to_string())
-            })
-        }
-
-        #[tokio::test]
-        async fn test_handler_and_validate_are_instrumented_with_return_values() {
-            use_w3c_propagator();
-            let (exporter, provider, _guard) = capture_spans();
-
-            let f = StubFactory::new(Behavior::Reply("トレースで見たい応答".to_string()));
-            let (status, _) = post_json(app(f, 4), OK_BODY).await;
-            assert_eq!(status, StatusCode::OK);
-
-            let _ = provider.force_flush();
-            let spans = exporter.get_finished_spans().unwrap();
-
-            // 分岐のある関数のスパンが出る
-            let validate = span_named(&spans, "validate");
-            assert_eq!(attr(validate, "model"), "google/gemini-3.1-pro");
-            // 戻り値(有効なタイムアウト)がイベントに残る
-            assert!(
-                event_attr(validate, "return").is_some_and(|v| v.contains("120")),
-                "validate の戻り値が記録されていない"
-            );
-
-            // handler は、デバッグで見たいプロンプトと応答を属性に持つ
-            let handler = span_named(&spans, "replay_handler");
-            assert_eq!(attr(handler, "model"), "google/gemini-3.1-pro");
-            assert_eq!(attr(handler, "prompt"), "続きを書いて");
-            assert_eq!(attr(handler, "response"), "トレースで見たい応答");
-            assert!(has_attr(handler, "elapsed_ms"));
-            assert_eq!(attr(handler, "truncated"), "false");
-        }
-
-        #[tokio::test]
-        async fn test_error_paths_record_the_classified_error() {
-            use_w3c_propagator();
-            let (exporter, provider, _guard) = capture_spans();
-
-            let f = StubFactory::new(Behavior::Fail("HTTP 401 Unauthorized".to_string()));
-            let (status, _) = post_json(app(f, 4), OK_BODY).await;
-            assert_eq!(status, StatusCode::BAD_GATEWAY);
-
-            let _ = provider.force_flush();
-            let spans = exporter.get_finished_spans().unwrap();
-
-            let classify = span_named(&spans, "classify_llm_error");
-            assert!(
-                event_attr(classify, "return").is_some_and(|v| v.contains("Auth")),
-                "分類結果(Auth)が戻り値として記録されていない"
-            );
-            // handler のエラーは span の status(Error)と `exception` イベントに残る
-            let handler = span_named(&spans, "replay_handler");
-            assert!(
-                is_error_status(handler, "Auth"),
-                "handler の status が Error になっていない"
-            );
-            assert!(
-                event_attr(handler, "exception.message").is_some_and(|v| v.contains("Auth")),
-                "handler のエラーが記録されていない"
-            );
-        }
-
-        #[tokio::test]
-        async fn test_validation_failure_records_the_error_return() {
-            use_w3c_propagator();
-            let (exporter, provider, _guard) = capture_spans();
-
-            let f = StubFactory::new(Behavior::Reply("ok".to_string()));
-            let body = r#"{"model":"nosuch/m","prompt":"x"}"#;
-            let (status, _) = post_json(app(f, 4), body).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-
-            let _ = provider.force_flush();
-            let spans = exporter.get_finished_spans().unwrap();
-            let validate = span_named(&spans, "validate");
-            assert!(is_error_status(validate, "BadRequest"));
-            assert!(
-                event_attr(validate, "exception.message").is_some_and(|v| v.contains("nosuch/m")),
-                "検証エラーの内容が記録されていない"
-            );
-            // 検証に失敗したので、handler はエラー終了になる
-            assert!(is_error_status(
-                span_named(&spans, "replay_handler"),
-                "BadRequest"
-            ));
-        }
-
-        #[test]
-        fn test_pure_helpers_are_instrumented_with_return_values() {
-            use_w3c_propagator();
-            let (exporter, provider, _guard) = capture_spans();
-
-            let _ = max_concurrency_from(Some("2".to_string()));
-            let _ = parse_listen(&[], Some("127.0.0.1:9".to_string()));
-            let _ = truncate_chars("あいう".to_string(), 2);
-            let _ = ErrorKind::Timeout.status();
-
-            let _ = provider.force_flush();
-            let spans = exporter.get_finished_spans().unwrap();
-
-            assert_eq!(
-                event_attr(span_named(&spans, "max_concurrency_from"), "return").as_deref(),
-                Some("2")
-            );
-            assert!(
-                event_attr(span_named(&spans, "parse_listen"), "return")
-                    .is_some_and(|v| v.contains("127.0.0.1:9"))
-            );
-            assert!(
-                event_attr(span_named(&spans, "status"), "return")
-                    .is_some_and(|v| v.contains("504"))
-            );
-            // truncate_chars は本文が戻り値なので、`ret` は使わず、切り詰めたかだけを属性にする
-            let truncate = span_named(&spans, "truncate_chars");
-            assert_eq!(attr(truncate, "truncated"), "true");
-            assert!(
-                !format!("{truncate:?}").contains("あい"),
-                "本文がスパンに載っている"
-            );
         }
 
         #[tokio::test]

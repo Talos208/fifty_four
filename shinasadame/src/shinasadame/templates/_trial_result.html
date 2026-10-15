@@ -15,14 +15,21 @@
 {% else %}
   <p class="muted">{{ result.model }} · {{ result.elapsed_ms }} ms</p>
   {% if result.truncated %}<p class="muted">応答が長いため途中で切り詰めました</p>{% endif %}
-  <div class="trial-compare">
-    <div>
-      <h3>元の出力</h3>
-      {% if original is none %}<p class="muted">—</p>{% else %}<pre>{{ original }}</pre>{% endif %}
-    </div>
-    <div>
-      <h3>試行結果</h3>
-      <pre>{{ result.response }}</pre>
-    </div>
-  </div>
+  {% if candidates is not none %}
+    {# 構造化出力。記録の「候補」と同じ列で見せる #}
+    <table class="trial-candidates">
+      <thead><tr><th>rank</th><th>candidate</th><th>confidence</th></tr></thead>
+      <tbody>
+      {% for c in candidates %}
+        <tr>
+          <td>{{ c.rank }}</td>
+          <td>{{ c.candidate }}</td>
+          <td>{{ '%.2f' | format(c.confidence) if c.confidence is not none else '—' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <pre>{{ result.response }}</pre>
+  {% endif %}
 {% endif %}

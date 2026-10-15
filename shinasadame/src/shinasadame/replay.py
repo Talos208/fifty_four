@@ -62,13 +62,22 @@ class ReplayClient:
         await self._client.aclose()
 
     async def run(
-        self, model: str, prompt: str, timeout_secs: int | None = None
+        self,
+        model: str,
+        prompt: str,
+        timeout_secs: int | None = None,
+        options_from: str | None = None,
     ) -> ReplayOk | ReplayFailed:
+        """`options_from` は、プロンプトテンプレートのアセット名(例: `prompt_completion.md`)。
+        指定すると replay が、その frontmatter のスキーマ等を LSP と同じ経路で適用する。"""
         timeout = timeout_secs or config.replay_default_timeout_secs()
+        payload: dict = {"model": model, "prompt": prompt, "timeout_secs": timeout}
+        if options_from:
+            payload["options_from"] = options_from
         try:
             res = await self._client.post(
                 "/v1/replay",
-                json={"model": model, "prompt": prompt, "timeout_secs": timeout},
+                json=payload,
                 # サーバー側のタイムアウトより少し長く待つ(サーバーの 504 を受け取れるように)
                 timeout=timeout + 10,
             )

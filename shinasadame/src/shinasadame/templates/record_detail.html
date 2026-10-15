@@ -18,30 +18,6 @@
   {% endfor %}
 </dl>
 
-{% if can_try %}
-<h2>試す</h2>
-<form class="trial" hx-post="/s/{{ sid }}/records/{{ table }}/{{ record_id }}/try"
-      hx-target="#trial-result" hx-disabled-elt="find button" hx-indicator="#trial-spinner">
-  <p class="muted">tool なしで実行します。元の実行とは条件が異なります。</p>
-  <label>プロンプト
-    <textarea name="prompt" rows="12" required>
-{{ row.prompt }}</textarea>
-  </label>
-  <label>モデル
-    <select name="model" required>
-      {% for m in model_options %}<option value="{{ m }}"{% if m == default_model %} selected{% endif %}>{{ m }}</option>
-      {% endfor %}
-    </select>
-  </label>
-  <label>一覧にないモデル(入力するとこちらを優先)
-    <input name="model_custom" placeholder="provider/model 例: openai/gpt-5.3">
-  </label>
-  <button type="submit">試す</button>
-  <span id="trial-spinner" class="htmx-indicator muted">実行中…</span>
-</form>
-<div id="trial-result"></div>
-{% endif %}
-
 {% if review %}
 <h2>関連する LLM レビュー</h2>
 <p><a href="/s/{{ sid }}/records/quality_reviews/{{ review.id }}">quality_reviews #{{ review.id }}</a> ({{ review.model_name }})</p>
@@ -70,4 +46,34 @@
 </table>
 {% else %}<p class="muted">なし</p>{% endif %}
 {% endfor %}
+
+{% if can_try %}
+<h2>試す</h2>
+<form class="trial" hx-post="/s/{{ sid }}/records/{{ table }}/{{ record_id }}/try"
+      hx-target="#trial-result" hx-disabled-elt="find button" hx-indicator="#trial-spinner">
+  <p class="muted">tool なしで実行します。元の実行とは条件が異なります。</p>
+  {# 編集欄は最初は閉じておく(閉じていても、フォームの値としては送られる) #}
+  <details class="trial-edit">
+    <summary>プロンプトとモデルを編集する</summary>
+    <dl class="fields trial-fields">
+      <dt>プロンプト</dt>
+      {# 高さは中身に合わせる(CSS の field-sizing)。非対応のブラウザ向けに rows も行数から出す #}
+      <dd><textarea name="prompt" rows="{{ [row.prompt.count('\n') + 1, 6] | max }}" required>
+{{ row.prompt }}</textarea></dd>
+      <dt>モデル</dt>
+      <dd>
+        <select name="model" required>
+          {% for m in model_options %}<option value="{{ m }}"{% if m == default_model %} selected{% endif %}>{{ m }}</option>
+          {% endfor %}
+        </select>
+      </dd>
+      <dt>一覧にないモデル</dt>
+      <dd><input name="model_custom" placeholder="provider/model 例: openai/gpt-5.3"> <span class="muted">入力するとこちらを優先</span></dd>
+    </dl>
+  </details>
+  <p><button type="submit">試す</button>
+  <span id="trial-spinner" class="htmx-indicator muted">実行中…</span></p>
+</form>
+<div id="trial-result"></div>
+{% endif %}
 {% endblock %}
