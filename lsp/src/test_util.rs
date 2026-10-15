@@ -1,48 +1,6 @@
-//! テスト共通のヘルパ。`tempfile` クレートは使わない方針なので、同等の最小限をここに持つ。
+//! テスト共通のヘルパ(一時ディレクトリは `tempfile` クレートを使う)。
 
 use std::ffi::{OsStr, OsString};
-use std::ops::Deref;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// テストごとに一意な一時ディレクトリ。Drop(assert 失敗による panic を含む)で削除する。
-///
-/// 名前に PID と連番を含めるので、並列テストや複数の `cargo test` が同時に走っても
-/// 衝突しない(固定名だと、同名を使うテストが増えたときに互いのファイルを消し合う)。
-pub(crate) struct TestDir(PathBuf);
-
-impl TestDir {
-    pub(crate) fn new(tag: &str) -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "ff_{}_{}_{}",
-            tag,
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed),
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Deref for TestDir {
-    type Target = Path;
-    fn deref(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl AsRef<Path> for TestDir {
-    fn as_ref(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// 環境変数を差し替え、Drop(panic を含む)で元の値へ戻す。
 ///
