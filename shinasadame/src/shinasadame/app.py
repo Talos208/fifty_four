@@ -16,7 +16,7 @@ from sqlalchemy import insert, select
 from . import config, db, etl, records, tasks
 from .analysis import acceptance as acc
 from .display import doc_name
-from .replay import ReplayClient, ReplayFailed, ReplayUnavailable, replay_model_for
+from .replay import ReplayClient, ReplayFailed, ReplayOk, ReplayUnavailable, replay_model_for
 from .telemetry import setup_telemetry
 
 BASE = Path(__file__).parent
@@ -285,7 +285,9 @@ async def try_prompt(
     model_custom: str = Form(""),
     client: ReplayClient = Depends(get_replay_client),
 ):
-    """編集したプロンプトを replay サービスに投げ、元の出力と並べる部分テンプレートを返す。
+    """編集したプロンプトを replay サービスに投げ、結果の部分テンプレートを返す。
+
+    補完は構造化出力(候補と confidence)で試し、記録の「候補」と同じ表で見せる。
 
     エラーも HTTP 200 で返す(htmx は 4xx/5xx の本文をスワップしないため)。
     """
@@ -300,12 +302,16 @@ async def try_prompt(
     # 一覧にないモデルを自由入力したときは、そちらを優先する
     model = model_custom.strip() or model.strip()
     prompt = prompt.replace("\r\n", "\n")  # ブラウザは改行を CRLF で送る
+    options_from = records.TRIAL_TEMPLATES.get(table)
     try:
-        result = await client.run(model, prompt)
+        result = await client.run(model, prompt, options_from=options_from)
     except ReplayUnavailable as e:
         result = ReplayFailed(kind="unavailable", message=str(e))
+    candidates = None
+    if options_from and isinstance(result, ReplayOk):
+        candidates = records.parse_candidates(result.response)
     return templates.TemplateResponse(
         request,
         "_trial_result.html",
-        {"original": records.original_output(detail), "result": result, "model": model},
+        {"result": result, "model": model, "candidates": candidates},
     )

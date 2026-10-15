@@ -1,3 +1,4 @@
+import re
 import pytest
 from fastapi.testclient import TestClient
 
@@ -13,9 +14,11 @@ class FakeReplay:
         self.result = result
         self.error = error
         self.calls = []
+        self.options_from = []
 
-    async def run(self, model, prompt, timeout_secs=None):
+    async def run(self, model, prompt, timeout_secs=None, options_from=None):
         self.calls.append((model, prompt))
+        self.options_from.append(options_from)
         if self.error:
             raise self.error
         return self.result
@@ -45,13 +48,13 @@ def test_prompt_tables_are_derived_from_columns():
     assert records.PROMPT_TABLES == {"completions", "code_actions", "character_updates", "quality_reviews"}
 
 
-def test_original_output_uses_response_or_joined_candidates(engine, sid):
-    ca = records.get_record(engine, sid, "code_actions", 1)
-    assert records.original_output(ca) == '{"candidates":[]}'
-    comp = records.get_record(engine, sid, "completions", 1)
-    assert records.original_output(comp) == "採用された続き\n---\n別案その一\n---\n別案その二"
-    finding = records.get_record(engine, sid, "quality_findings", 1)
-    assert records.original_output(finding) is None
+def test_original_output_is_gone():
+    assert not hasattr(records, "original_output")
+
+
+def test_structured_templates_are_defined_for_completions_only():
+    assert records.TRIAL_TEMPLATES == {"completions": "prompt_completion.md"}
+    assert set(records.TRIAL_TEMPLATES) <= records.PROMPT_TABLES
 
 
 def test_detail_page_shows_try_panel_with_original_prompt_and_note(client, sid, monkeypatch):
@@ -111,7 +114,7 @@ def test_detail_page_hides_try_panel_for_tables_without_prompt(client, sid):
     assert "/try" not in page
 
 
-def test_try_shows_original_and_trial_side_by_side(client, sid):
+def test_try_shows_the_trial_result_without_the_original_output(client, sid):
     fake = use(FakeReplay(result=OK))
     res = client.post(
         f"/s/{sid}/records/code_actions/1/try",
@@ -121,9 +124,55 @@ def test_try_shows_original_and_trial_side_by_side(client, sid):
     assert res.status_code == 200
     assert fake.calls == [("google/gemini-3.1-pro", "編集後のプロンプト")]
     assert "試行の応答" in res.text
-    assert '{&#34;candidates&#34;:[]}' in res.text or '{"candidates":[]}' in res.text  # 元の応答
+    assert "元の出力" not in res.text  # 元の出力は候補の表で見られる
     assert "1234" in res.text  # elapsed_ms
     assert "google/gemini-3.1-pro" in res.text
+    assert fake.options_from == [None]  # code_actions は構造化出力のテンプレートを指定しない
+
+
+STRUCTURED = (
+    '{"candidates":[{"text":"一つ目の候補","confidence":0.8},'
+    '{"text":"二つ目の候補","confidence":0.35}]}'
+)
+
+
+def test_try_completions_asks_for_structured_output_and_shows_confidence(client, sid):
+    fake = use(FakeReplay(result=ReplayOk(STRUCTURED, "google/x", 10, False)))
+    res = client.post(
+        f"/s/{sid}/records/completions/1/try", data={"prompt": "p", "model": "google/x"}
+    )
+
+    assert fake.options_from == ["prompt_completion.md"]
+    # 記録の候補と同じ見せ方(順位・候補・confidence の表)
+    assert "一つ目の候補" in res.text and "二つ目の候補" in res.text
+    assert "0.80" in res.text and "0.35" in res.text
+    assert "<table" in res.text
+    assert "confidence" in res.text
+
+
+def test_try_completions_escapes_candidate_text(client, sid):
+    body = '{"candidates":[{"text":"<script>alert(1)</script>","confidence":0.5}]}'
+    use(FakeReplay(result=ReplayOk(body, "m", 1, False)))
+    res = client.post(f"/s/{sid}/records/completions/1/try", data={"prompt": "p", "model": "google/x"})
+    assert "<script>alert(1)</script>" not in res.text
+    assert "&lt;script&gt;" in res.text
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "JSON ではない自由文",
+        '{"candidates": "not a list"}',
+        '{"other": 1}',
+        '["candidates"]',
+        '{"candidates":[{"text":"x"}]}',  # confidence が無くても表示は壊さない
+    ],
+)
+def test_try_completions_falls_back_to_raw_text_when_not_structured(client, sid, body):
+    use(FakeReplay(result=ReplayOk(body, "m", 1, False)))
+    res = client.post(f"/s/{sid}/records/completions/1/try", data={"prompt": "p", "model": "google/x"})
+    assert res.status_code == 200
+    assert "Traceback" not in res.text
 
 
 def test_try_escapes_html_in_llm_output(client, sid):
@@ -185,7 +234,7 @@ def test_textarea_has_leading_newline_so_a_leading_newline_in_prompt_survives(cl
         t = db.FR_TABLES["completions"]
         conn.execute(t.update().where(t.c.snapshot_id == sid, t.c.id == 1).values(prompt="\n本文"))
     page = client.get(f"/s/{sid}/records/completions/1").text
-    assert '<textarea name="prompt" rows="12" required>\n\n本文</textarea>' in page
+    assert re.search(r'<textarea name="prompt" rows="\d+" required>\n\n本文</textarea>', page)
 
 
 def test_try_normalises_crlf_in_prompt(client, sid):
@@ -208,3 +257,57 @@ def test_edit_area_escapes_closing_textarea(client, sid):
     page = client.get(f"/s/{sid}/records/completions/1").text
     assert "</textarea><b>" not in page
     assert "&lt;/textarea&gt;" in page
+
+
+# ---- 画面のレイアウト: パラメータ → 候補 → 試す ----
+
+
+def test_detail_page_orders_params_then_candidates_then_try(client, sid):
+    page = client.get(f"/s/{sid}/records/completions/1").text
+    params = page.index('<dl class="fields">')
+    candidates = page.index("候補 <small")
+    try_panel = page.index('class="trial"')
+    assert params < candidates < try_panel
+
+
+def test_prompt_and_model_inputs_are_hidden_until_expanded(client, sid):
+    page = client.get(f"/s/{sid}/records/completions/1").text
+    # 編集欄(プロンプト・モデル)は閉じた <details> の中。「試す」ボタンは外に出ていて、すぐ押せる
+    start = page.index('<details class="trial-edit"')
+    end = page.index("</details>", start)
+    inner = page[start:end]
+    assert " open" not in page[start : page.index(">", start)]
+    assert 'name="prompt"' in inner and 'name="model"' in inner and 'name="model_custom"' in inner
+    assert '<button type="submit">' in page[end:]
+
+
+def test_prompt_field_uses_the_same_grid_as_the_parameters(client, sid):
+    page = client.get(f"/s/{sid}/records/completions/1").text
+    # パラメータの欄(dl.fields)と同じ列幅・フォントで揃える
+    assert 'class="fields trial-fields"' in page
+    assert "<dt>プロンプト</dt>" in page
+
+
+def test_textarea_height_follows_the_prompt_length(client, sid):
+    # 中身より低いと内側にスクロールが出て、パラメータの欄(全文が見える)と見た目が揃わない。
+    # field-sizing 非対応のブラウザ向けに、行数から rows も出す。
+    body = "\n".join(f"{i} 行目" for i in range(30))
+    with db.get_engine().begin() as conn:
+        t = db.FR_TABLES["completions"]
+        conn.execute(t.update().where(t.c.snapshot_id == sid, t.c.id == 1).values(prompt=body))
+    page = client.get(f"/s/{sid}/records/completions/1").text
+    assert 'rows="30"' in page
+
+
+def test_textarea_has_a_minimum_rows_for_short_prompts(client, sid):
+    page = client.get(f"/s/{sid}/records/completions/1").text  # "prompt one"(1 行)
+    assert 'rows="6"' in page
+
+
+def test_textarea_css_grows_with_content():
+    from pathlib import Path
+
+    css = (Path(__file__).parent.parent / "src/shinasadame/static/style.css").read_text(encoding="utf-8")
+    block = css[css.index(".trial-fields textarea") :].split("}")[0]
+    assert "field-sizing: content" in block
+    assert "min-height: 12em" not in block  # 固定の最小高さで中身を切らない
