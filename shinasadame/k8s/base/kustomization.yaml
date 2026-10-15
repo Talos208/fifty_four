@@ -6,3 +6,5 @@ resources:
   - pvc.yaml
   - deployment.yaml
   - service.yaml
+  - replay-deployment.yaml
+  - replay-service.yaml

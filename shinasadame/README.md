@@ -73,7 +73,7 @@ kubectl apply -k shinasadame/k8s
 
 - `http://localhost:8054` で開く(LoadBalancer が localhost に公開される)
 - web と worker は同じ Pod で、PVC(`/data`、512Mi)上の `app.db` / `queue.db` を共有する。PVC が RWO なので replicas は 1 固定
-- トレースは `OTEL_EXPORTER_OTLP_ENDPOINT`(`k8s/base/deployment.yaml` では `http://localhost:4317`)へ送る。未設定なら送らない
+- トレースは `OTEL_EXPORTER_OTLP_ENDPOINT` へ送る(OTLP/gRPC なので 4317。未設定なら送らない)。`k8s/base` では Pod の中から届く SigNoz の Collector の Service(`http://signoz-otel-collector.signoz.svc.cluster.local:4317`)を指す。Pod の中の `localhost` は Pod 自身なので、ホスト側の `http://localhost:4317` は使えない
 - イメージ名を変える場合は `k8s/base/deployment.yaml` の 2 箇所(web / worker)を合わせる
 
 ### Ingress(Traefik)で公開する
@@ -144,3 +144,51 @@ File System Access API の部分は自動テストできないので、次の手
 - スナップショットは、どのファイルから取り込んだかに関係なく、全体で新しい順に 10 件だけ残る
 - 「取り込み済み」の判定は、ファイルの名前・サイズ・最終更新日時の一致で行う(中身は読まない)。
   10 件から押し出されて消えたスナップショットは、取り込み済みとはみなさない
+
+## プロンプト試行(replay サービス)
+
+レコード詳細の「試す」パネルは、別 Pod の `replay` サービス(`fifty_four_lsp --replay`)を呼ぶ。
+
+1. イメージをビルドする(リポジトリルートで):
+
+   ```bash
+   docker build -f lsp/Dockerfile.replay -t fifty-four-replay:latest .
+   ```
+
+2. API キーの Secret を作る(使う provider の分だけ。replay の Pod だけがこれを読む):
+
+   ```bash
+   kubectl -n shinasadame create secret generic replay-keys \
+     --from-literal=GEMINI_API_KEY=... \
+     --from-literal=ANTHROPIC_API_KEY=... \
+     --from-literal=OPENAI_API_KEY=... \
+     --from-literal=XAI_API_KEY=...
+   ```
+
+   使わない provider のキー行は削除する(プレースホルダ値でキーを作らない)。
+
+3. 配備する: `kubectl apply -k shinasadame/k8s`
+
+- 選択肢にするモデルは web コンテナの環境変数 `SHINASADAME_MODELS`(カンマ区切りの `provider/model`)。画面では自由入力もできる。
+- LM Studio(ホスト)は `lmstudio@host.docker.internal:1234/<model>` で指定する。
+- 「試す」の既定モデルは、記録の素のモデル名を replay が解釈できる形に直したもの(`gemini-` / `gpt-` / `claude-` / `grok-` は provider 接頭辞を補い、それ以外は LM Studio とみなして `lmstudio@<host>/<model>` にする)。`<host>` は環境変数 `REPLAY_LMSTUDIO_HOST`(既定 `host.docker.internal:1234`)。
+- ローカルで `fifty_four_lsp --replay` を直接動かすときは `.env` を読まない。API キーは環境変数で渡す(k8s では Secret)。
+- tool(`character_info` / `plot_info`)は渡さない。元の実行とは条件が異なる。
+- 試行結果は保存しない。
+
+## Skaffold で更新する
+
+イメージのビルドから Pod の更新までを `skaffold` で 1 コマンドにできる(リポジトリ直下の `skaffold.yaml`)。
+タグは入力ファイルの内容から決まるので、`latest` 固定のように Pod が更新されないことはない。
+
+```bash
+winget install -e --id GoogleContainerTools.Skaffold   # 初回のみ(入手元は環境に合わせる)
+skaffold run              # 両方のイメージをビルドして apply する
+skaffold run -p web       # shinasadame だけ(重い Rust のビルドを避ける)
+skaffold run -p replay    # replay だけ
+skaffold dev              # ソース変更のたびに再ビルド→再デプロイ
+```
+
+- `skaffold dev` の終了時と `skaffold delete` は、デプロイしたものを namespace と PVC ごと消す。デバッグ用途ではそれを許容している。残したいときは `skaffold dev --cleanup=false`。
+- API キーの Secret `replay-keys` は管理対象外(手動で作る。上の「プロンプト試行」を参照)。
+- 設定の確認: `skaffold diagnose`(設定の検証)、`skaffold render`(置換後のマニフェストの表示。`image:` が新しいタグになっていること)。

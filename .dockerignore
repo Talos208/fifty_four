@@ -1,0 +1,11 @@
+target/
+**/target/
+.git/
+.env*
+.claude/
+.idea/
+dist/
+db/
+shinasadame/.venv/
+shinasadame/.data/
+**/__pycache__/

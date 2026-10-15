@@ -1,0 +1,38 @@
+# replay サービス(fifty_four_lsp --replay)用のイメージ。
+# ビルドコンテキストはリポジトリルート:
+#   docker build -f lsp/Dockerfile.replay -t fifty-four-replay:latest .
+FROM rust:1-bookworm AS build
+WORKDIR /src
+
+# 依存だけ先にビルドしてレイヤーキャッシュを効かせる。
+# lindera の辞書埋め込み(embed-ipadic)と rusqlite(bundled)で初回は重い。
+COPY Cargo.toml Cargo.lock* ./
+COPY lsp/Cargo.toml lsp/Cargo.toml
+COPY extension/Cargo.toml extension/Cargo.toml
+COPY prepare/Cargo.toml prepare/Cargo.toml
+RUN mkdir -p lsp/src extension/src prepare/src \
+    && echo 'fn main() {}' > lsp/src/main.rs \
+    && echo '' > extension/src/lib.rs \
+    && echo 'fn main() {}' > prepare/src/main.rs \
+    && cargo build --release -p fifty_four_lsp --features replay || true
+
+COPY lsp ./lsp
+COPY extension ./extension
+COPY prepare ./prepare
+# プロンプト等のアセットは rust-embed が `lsp/` から見て `../data/` を埋め込む(lsp/src/assets.rs)
+COPY data ./data
+# 依存のダミービルドより新しいと判定されるよう、ソースの更新時刻を進める
+RUN touch lsp/src/main.rs \
+    && cargo build --release -p fifty_four_lsp --features replay
+
+FROM debian:bookworm-slim
+# 各 provider へ HTTPS で接続するために CA 証明書が要る
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --no-create-home replay
+COPY --from=build /src/target/release/fifty_four_lsp /usr/local/bin/fifty_four_lsp
+USER 10001
+ENV REPLAY_LISTEN=0.0.0.0:8080
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/fifty_four_lsp", "--replay"]
