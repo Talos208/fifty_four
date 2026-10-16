@@ -27,3 +27,7 @@ Thumbs.db
 **/extension.wasm
 **/*.db
 docs/plans/
+.superpowers/
+
+# Zed でこのリポジトリを開くと LSP が空の characters.md を作る(lsp/src/character.rs の load_workspace)
+/characters.md

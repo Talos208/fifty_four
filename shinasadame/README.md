@@ -155,24 +155,15 @@ File System Access API の部分は自動テストできないので、次の手
    docker build -f lsp/Dockerfile.replay -t fifty-four-replay:latest .
    ```
 
-2. API キーの Secret を作る(使う provider の分だけ。replay の Pod だけがこれを読む):
-
-   ```bash
-   kubectl -n shinasadame create secret generic replay-keys \
-     --from-literal=GEMINI_API_KEY=... \
-     --from-literal=ANTHROPIC_API_KEY=... \
-     --from-literal=OPENAI_API_KEY=... \
-     --from-literal=XAI_API_KEY=...
-   ```
-
-   使わない provider のキー行は削除する(プレースホルダ値でキーを作らない)。
+2. API キーを OpenBao の `secret/fifty-four` に入れる(replay の Pod だけがこれを読む)。
+   手順は `docs/openbao-csi/README.md` を参照。
 
 3. 配備する: `kubectl apply -k shinasadame/k8s`
 
 - 選択肢にするモデルは web コンテナの環境変数 `SHINASADAME_MODELS`(カンマ区切りの `provider/model`)。画面では自由入力もできる。
 - LM Studio(ホスト)は `lmstudio@host.docker.internal:1234/<model>` で指定する。
 - 「試す」の既定モデルは、記録の素のモデル名を replay が解釈できる形に直したもの(`gemini-` / `gpt-` / `claude-` / `grok-` は provider 接頭辞を補い、それ以外は LM Studio とみなして `lmstudio@<host>/<model>` にする)。`<host>` は環境変数 `REPLAY_LMSTUDIO_HOST`(既定 `host.docker.internal:1234`)。
-- ローカルで `fifty_four_lsp --replay` を直接動かすときは `.env` を読まない。API キーは環境変数で渡す(k8s では Secret)。
+- ローカルで `fifty_four_lsp --replay` を直接動かすときは `.env` を読まない。API キーは環境変数で渡す(k8s では OpenBao から CSI で取得した Secret)。
 - tool(`character_info` / `plot_info`)は渡さない。元の実行とは条件が異なる。
 - 試行結果は保存しない。
 
@@ -190,5 +181,5 @@ skaffold dev              # ソース変更のたびに再ビルド→再デプ�
 ```
 
 - `skaffold dev` の終了時と `skaffold delete` は、デプロイしたものを namespace と PVC ごと消す。デバッグ用途ではそれを許容している。残したいときは `skaffold dev --cleanup=false`。
-- API キーの Secret `replay-keys` は管理対象外(手動で作る。上の「プロンプト試行」を参照)。
+- API キーは OpenBao から CSI で取得する。Driver と Provider は Skaffold の管理外(`docs/openbao-csi/README.md`)。
 - 設定の確認: `skaffold diagnose`(設定の検証)、`skaffold render`(置換後のマニフェストの表示。`image:` が新しいタグになっていること)。
