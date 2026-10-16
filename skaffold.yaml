@@ -7,7 +7,7 @@
 #
 # 注意: `dev` の終了時と `skaffold delete` は、デプロイしたリソース(namespace と PVC を含む)を
 # 消す。デバッグ用途なので取り込み済みデータの消失は許容している。残したいときは
-# `skaffold dev --cleanup=false` を使う。API キーの Secret(replay-keys)は管理対象外で、手動で作る。
+# `skaffold dev --cleanup=false` を使う。API キーは OpenBao から CSI で取得する(Driver は管理対象外。docs/openbao-csi/README.md)。
 apiVersion: skaffold/v4beta11 # インストールした skaffold が古くて拒否されたら `skaffold fix` で直す
 kind: Config
 metadata:

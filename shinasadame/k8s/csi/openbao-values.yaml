@@ -1,0 +1,7 @@
+# OpenBao CSI Provider だけを入れる。OpenBao サーバーは外部ホストにあるので入れない。
+server:
+  enabled: false
+injector:
+  enabled: false
+csi:
+  enabled: true

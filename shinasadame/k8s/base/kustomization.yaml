@@ -8,3 +8,5 @@ resources:
   - service.yaml
   - replay-deployment.yaml
   - replay-service.yaml
+  - replay-serviceaccount.yaml
+  - replay-secretproviderclass.yaml
