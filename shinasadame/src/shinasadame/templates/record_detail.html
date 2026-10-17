@@ -62,8 +62,16 @@
 {{ row.prompt }}</textarea></dd>
       <dt>モデル</dt>
       <dd>
-        <select name="model" required>
-          {% for m in model_options %}<option value="{{ m }}"{% if m == default_model %} selected{% endif %}>{{ m }}</option>
+        {# 会社ごとの <optgroup>。JS があれば、これを複数段のメニュー(会社 ▸ 系列 ▸ モデル)に差し替える(static/model_menu.js)。
+           先頭は記録のモデルから作った既定値(選択済み)。data-series は系列のラベルで、表示用 #}
+        <select name="model" required data-cascade>
+          <option value="{{ default_model }}" selected>{{ default_model }}</option>
+          {% if other_models %}<optgroup label="その他">
+            {% for m in other_models %}<option value="{{ m }}">{{ m }}</option>
+            {% endfor %}</optgroup>{% endif %}
+          {% for g in model_groups %}<optgroup label="{{ g.provider }}">
+            {% for s in g.series %}{% for m in s.models %}<option value="{{ m }}"{% if s.label %} data-series="{{ s.label }}"{% endif %}>{{ m }}</option>
+            {% endfor %}{% endfor %}</optgroup>
           {% endfor %}
         </select>
       </dd>
@@ -75,5 +83,6 @@
   <span id="trial-spinner" class="htmx-indicator muted">実行中…</span></p>
 </form>
 <div id="trial-result"></div>
+<script src="/static/model_menu.js"></script>
 {% endif %}
 {% endblock %}

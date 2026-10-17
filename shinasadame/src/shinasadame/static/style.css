@@ -64,3 +64,16 @@ tr.current td { background: color-mix(in srgb, var(--accent) 12%, transparent); 
 .trial-error { border-left: 4px solid #c33; padding-left: .75rem; }
 .htmx-indicator { display: none; }
 .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { display: inline; }
+
+/* 「試す」のモデル欄の複数段メニュー(static/model_menu.js)。JS が無ければ select のまま */
+.cascade { position: relative; display: inline-block; max-width: 40em; width: 100%; }
+.cascade-button { width: 100%; text-align: left; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--fg); font: inherit; cursor: pointer; }
+.cmenu { list-style: none; margin: 0; padding: 4px 0; min-width: 12em; background: var(--card); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 6px 18px rgba(0, 0, 0, .25); z-index: 20; }
+.cascade > .cmenu { position: absolute; top: 100%; left: 0; margin-top: 2px; }
+.cmenu-sub { position: fixed; overflow-y: auto; }
+.cmenu[hidden] { display: none; }
+.cmenu-item { display: flex; justify-content: space-between; gap: 16px; padding: 3px 12px; white-space: nowrap; cursor: pointer; }
+.cmenu-item:hover, .cmenu-item:focus { background: var(--accent); color: #fff; outline: none; }
+.cmenu-item .cmenu { cursor: default; color: var(--fg); }
+.cmenu-arrow { opacity: .7; }
+.cmenu-selected > span:first-child { font-weight: 700; }

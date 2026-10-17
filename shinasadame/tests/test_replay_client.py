@@ -87,6 +87,8 @@ def test_config_defaults_and_model_choices(monkeypatch):
     monkeypatch.delenv("REPLAY_URL", raising=False)
     monkeypatch.delenv("REPLAY_DEFAULT_TIMEOUT_SECS", raising=False)
     monkeypatch.delenv("SHINASADAME_MODELS", raising=False)
+    # 環境変数が無ければ models.json を使う。ここでは空のカタログにして「どちらも無ければ空」を確かめる
+    monkeypatch.setattr(config.model_catalog, "load_catalog", lambda path=None: [])
     assert config.replay_url() == "http://replay:8080"
     assert config.replay_default_timeout_secs() == 120
     assert config.model_choices() == []

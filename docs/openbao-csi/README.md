@@ -20,8 +20,8 @@ replay Pod (ServiceAccount: replay)
 ```
 
 - OpenBao からクラスタへは到達できないので、クラスタの JWKS 公開鍵を OpenBao に静的に登録する(`setup-openbao.sh`)。
-- `SecretProviderClass`(`shinasadame/k8s/base/replay-secretproviderclass.yaml`)は kustomize / Skaffold で配備される。
-  Driver と Provider(helm)と OpenBao 側の設定は Skaffold の管理外。
+- `SecretProviderClass`(`shinasadame/k8s/base/replay-secretproviderclass.yaml`)は kustomize / DevSpace で配備される。
+  Driver と Provider(helm)と OpenBao 側の設定は DevSpace の管理外。
 
 ## 初回導入
 
@@ -58,7 +58,7 @@ replay Pod (ServiceAccount: replay)
 4. 配備する:
 
    ```bash
-   skaffold run -p replay      # または kubectl apply -k shinasadame/k8s
+   devspace deploy -p replay    # または kubectl apply -k shinasadame/k8s
    kubectl -n shinasadame rollout status deploy/replay
    ```
 
@@ -87,7 +87,7 @@ KV に無いキーを SecretProviderClass に書くとマウントに失敗し�
    ```
 
 2. `replay-secretproviderclass.yaml` の `objects` と `secretObjects` の**両方**に、そのキーを足す。
-3. 再配備する: `kubectl apply -k shinasadame/k8s`(または `skaffold run -p replay`)。
+3. 再配備する: `kubectl apply -k shinasadame/k8s`(または `devspace deploy -p replay`)。
 4. Pod を再作成する(下の「キーの更新」)。
 
 使わなくなった provider は、同じ 2 箇所から外す。

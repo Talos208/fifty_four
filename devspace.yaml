@@ -1,0 +1,123 @@
+# shinasadame と replay の「イメージをビルドして Pod を更新する」までを 1 コマンドにする。
+#   devspace deploy             # 両方のイメージをビルドして(並列)apply する
+#   devspace deploy -p web      # shinasadame だけ(重い Rust のビルドを避ける)
+#   devspace deploy -p replay   # replay だけ
+#   devspace dev -p web         # shinasadame のソースをコンテナへ同期し、変更のたびに自動で再起動する
+#   devspace reset pods         # dev を強制終了したとき、元の Deployment に戻す
+#   devspace purge              # デプロイしたリソースを消す(namespace と PVC を含む)
+# 手順の詳細は shinasadame/README.md の「DevSpace で更新する」。
+#
+# 注意: `devspace purge` は、デプロイしたリソース(namespace と PVC を含む)を消す。デバッグ用途なので
+# 取り込み済みデータの消失は許容している。`devspace dev` を止めても purge はされない。
+# API キーは OpenBao から CSI で取得する(Driver は管理対象外。docs/openbao-csi/README.md)。
+version: v2beta1
+name: fifty-four
+
+images:
+  # マニフェストの `image: shinasadame:latest` が、ビルドしたタグに置き換わる
+  shinasadame:
+    image: shinasadame
+    dockerfile: ./shinasadame/Dockerfile
+    context: ./shinasadame
+    skipPush: true # レジストリへ push しない(registry-mirror 経由で pull する現在の運用のまま)
+    docker:
+      useCli: true # `docker build` をそのまま使う(認証などの扱いを docker CLI に任せる)
+  # ビルドコンテキストはリポジトリルート(lsp/Dockerfile.replay が data/ や extension/ を必要とする)
+  replay:
+    image: fifty-four-replay
+    dockerfile: ./lsp/Dockerfile.replay
+    context: ./
+    skipPush: true
+    docker:
+      useCli: true
+
+deployments:
+  fifty-four:
+    namespace: shinasadame # kustomization の namespace と合わせる
+    kubectl:
+      kustomize: true
+      manifests:
+        - shinasadame/k8s
+
+# どのパイプラインも、ビルドの前に各社の最新モデル一覧(shinasadame/src/shinasadame/models.json)を更新する。
+# 24 時間以内に更新済みなら取得しない。失敗(uv が無い、通信できない、など)してもビルドは止めない。
+# 更新された差分は、確認してから自分でコミットする。
+pipelines:
+  build: |-
+    (cd shinasadame && uv run python tools/update_models.py) || true
+    build_images --all
+  deploy: |-
+    (cd shinasadame && uv run python tools/update_models.py) || true
+    build_images --all
+    create_deployments --all
+  dev: |-
+    (cd shinasadame && uv run python tools/update_models.py) || true
+    build_images --all
+    create_deployments --all
+    start_dev --all
+
+# `devspace dev` では、shinasadame の web コンテナへソースを同期して、uvicorn の自動再読み込みで反映する。
+# replay(Rust)は同期せず、変更したら `devspace deploy -p replay` でイメージを作り直す。
+# 注意: 同じ Pod の worker コンテナ(Huey)には同期しない。tasks.py などを変えたら `devspace deploy -p web`。
+dev:
+  web:
+    namespace: shinasadame
+    labelSelector:
+      app: shinasadame
+    container: web
+    command: ["uvicorn", "shinasadame.app:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/src"]
+    sync:
+      - path: ./shinasadame/src:/app/src
+        excludePaths:
+          - __pycache__/
+          - "*.pyc"
+    ports:
+      - port: 8000
+    # イメージの /app/src は root の持ち物で、非 root(10001)の Pod には同期が書き込めない。
+    # dev の間だけ root で動かす(デプロイ用の Pod は 10001 のまま)。
+    patches:
+      - op: replace
+        path: spec.securityContext.runAsUser
+        value: 0
+      - op: replace
+        path: spec.securityContext.runAsGroup
+        value: 0
+
+# プロファイルは「どのイメージをビルドするか」だけを絞る。イメージの定義は外さない
+# (外すと、そのイメージのタグ置き換えが効かず、Deployment が `image: xxx:latest` の古いイメージに巻き戻る)。
+# 絞られなかったイメージには、前回ビルドしたタグがそのまま使われる。
+profiles:
+  # 重い Rust イメージをビルドしない
+  - name: web
+    patches:
+      - op: replace
+        path: pipelines.build
+        value: |-
+          (cd shinasadame && uv run python tools/update_models.py) || true
+          build_images shinasadame
+      - op: replace
+        path: pipelines.deploy
+        value: |-
+          (cd shinasadame && uv run python tools/update_models.py) || true
+          build_images shinasadame
+          create_deployments --all
+      - op: replace
+        path: pipelines.dev
+        value: |-
+          (cd shinasadame && uv run python tools/update_models.py) || true
+          build_images shinasadame
+          create_deployments --all
+          start_dev --all
+  # shinasadame(Python)のイメージをビルドしない。shinasadame の dev(同期)も使わない
+  - name: replay
+    patches:
+      - op: replace
+        path: pipelines.build
+        value: build_images replay
+      - op: replace
+        path: pipelines.deploy
+        value: |-
+          build_images replay
+          create_deployments --all
+      - op: remove
+        path: dev.web

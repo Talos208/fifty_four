@@ -160,26 +160,38 @@ File System Access API の部分は自動テストできないので、次の手
 
 3. 配備する: `kubectl apply -k shinasadame/k8s`
 
-- 選択肢にするモデルは web コンテナの環境変数 `SHINASADAME_MODELS`(カンマ区切りの `provider/model`)。画面では自由入力もできる。
+- 選択肢にするモデルは `src/shinasadame/models.json`(各社の使えるモデルを新しい順に並べたもの)。画面では、モデル欄が会社 ▸ 系列 ▸ モデルと開く複数段のメニューになる。一覧に無いモデルは自由入力もできる。
+  - 一覧は `tools/update_models.py` が OpenRouter と LiteLLM の公開 JSON(キー不要)から作る。`devspace build` / `deploy` / `dev` の前に自動で回る。
+    24 時間以内に更新済みなら取得しない。手で更新するときは `cd shinasadame && uv run python tools/update_models.py --force`。
+  - 取得や整形に失敗しても、既存の `models.json` は残り、ビルドは止まらない。件数が既存の半分未満に減ったときも上書きしない。
+  - 更新された `models.json` は**自動ではコミットされない**。差分(モデルの増減)を確かめてからコミットする。
+  - キーを持たない会社のモデルも選べるが、実行すると認証エラーになる(replay が持つキーは OpenBao 側の分だけ。`docs/openbao-csi/README.md`)。
+  - 環境変数 `SHINASADAME_MODELS`(カンマ区切りの `provider/model`)を設定すると、`models.json` のかわりにそれを使う(上書き用)。
 - LM Studio(ホスト)は `lmstudio@host.docker.internal:1234/<model>` で指定する。
 - 「試す」の既定モデルは、記録の素のモデル名を replay が解釈できる形に直したもの(`gemini-` / `gpt-` / `claude-` / `grok-` は provider 接頭辞を補い、それ以外は LM Studio とみなして `lmstudio@<host>/<model>` にする)。`<host>` は環境変数 `REPLAY_LMSTUDIO_HOST`(既定 `host.docker.internal:1234`)。
 - ローカルで `fifty_four_lsp --replay` を直接動かすときは `.env` を読まない。API キーは環境変数で渡す(k8s では OpenBao から CSI で取得した Secret)。
 - tool(`character_info` / `plot_info`)は渡さない。元の実行とは条件が異なる。
 - 試行結果は保存しない。
 
-## Skaffold で更新する
+## DevSpace で更新する
 
-イメージのビルドから Pod の更新までを `skaffold` で 1 コマンドにできる(リポジトリ直下の `skaffold.yaml`)。
-タグは入力ファイルの内容から決まるので、`latest` 固定のように Pod が更新されないことはない。
+イメージのビルドから Pod の更新までを `devspace` で 1 コマンドにできる(リポジトリ直下の `devspace.yaml`)。
+ビルドしたイメージはレジストリへ push せず、そのままクラスタ(docker-desktop)が使う。タグはビルドごとに決まるので、
+`latest` 固定のように Pod が更新されないことはない(中身が変わらなければ再ビルドせず、Pod も更新しない)。
 
 ```bash
-winget install -e --id GoogleContainerTools.Skaffold   # 初回のみ(入手元は環境に合わせる)
-skaffold run              # 両方のイメージをビルドして apply する
-skaffold run -p web       # shinasadame だけ(重い Rust のビルドを避ける)
-skaffold run -p replay    # replay だけ
-skaffold dev              # ソース変更のたびに再ビルド→再デプロイ
+# 初回のみ: https://github.com/loft-sh/devspace/releases の devspace-windows-amd64.exe を devspace.exe にして、PATH の通った場所に置く
+devspace deploy             # 両方のイメージを(並列で)ビルドして apply する
+devspace deploy -p web      # shinasadame だけ(重い Rust のビルドを避ける)
+devspace deploy -p replay   # replay だけ
+devspace dev -p web         # shinasadame のソースをコンテナへ同期し、uvicorn の自動再読み込みで反映する
 ```
 
-- `skaffold dev` の終了時と `skaffold delete` は、デプロイしたものを namespace と PVC ごと消す。デバッグ用途ではそれを許容している。残したいときは `skaffold dev --cleanup=false`。
-- API キーは OpenBao から CSI で取得する。Driver と Provider は Skaffold の管理外(`docs/openbao-csi/README.md`)。
-- 設定の確認: `skaffold diagnose`(設定の検証)、`skaffold render`(置換後のマニフェストの表示。`image:` が新しいタグになっていること)。
+- `-p web` / `-p replay` は、**ビルドするイメージを絞るだけ**。絞られた側のイメージは、前回ビルドしたタグのまま据え置かれる(古い `latest` に戻ることはない)。
+- `devspace purge` は、デプロイしたものを namespace と PVC ごと消す。デバッグ用途ではそれを許容している。`devspace dev` を止めても purge はされない。
+- `devspace dev` は、元の Deployment を 0 にして、`shinasadame-devspace` という dev 用のコピーに入れ替えて動く。ターミナルを閉じるなどで**強制終了した場合は、`devspace reset pods` で元に戻す**。
+- `devspace dev` の間だけ、同期の書き込みのために Pod を root で動かす(デプロイ用の Pod は 10001 のまま)。ポートは `http://[::1]:8000/`(`localhost` や `127.0.0.1` だと、IPv4 側の別のものに当たることがある)。
+- `devspace dev` の同期先は web コンテナだけ。同じ Pod の worker コンテナ(Huey)には同期しないので、`tasks.py` などを変えたら `devspace deploy -p web`。replay(Rust)は同期せず、変えたら `devspace deploy -p replay`。
+- API キーは OpenBao から CSI で取得する。Driver と Provider は DevSpace の管理外(`docs/openbao-csi/README.md`)。
+- モデル一覧(`models.json`)の更新は、`devspace build` / `deploy` / `dev` の前に自動で回る(`devspace.yaml` の `pipelines`)。
+- 設定の確認: `devspace print -p web`(プロファイル適用後の設定)、`devspace render -p web`(置換後のマニフェストの表示。`image:` が新しいタグになっていること)。
