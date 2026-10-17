@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import insert, select
 
-from . import config, db, etl, records, tasks
+from . import config, db, etl, model_catalog, records, tasks
 from .analysis import acceptance as acc
 from .display import doc_name
 from .replay import ReplayClient, ReplayFailed, ReplayOk, ReplayUnavailable, replay_model_for
@@ -256,9 +256,12 @@ def record_detail(request: Request, sid: int, table: str, record_id: int):
     if detail is None:
         raise HTTPException(404, "レコードが見つかりません")
     # 「試す」のモデル選択肢: 記録のモデルを replay が解釈できる形にしたものを先頭に、
-    # SHINASADAME_MODELS の候補を重複なしで並べる
+    # 候補(環境変数 SHINASADAME_MODELS、無ければ models.json)を会社・系列にまとめて並べる。
+    # `provider/` の形でない候補(LM Studio など)は「その他」に入れる
     default_model = replay_model_for(str(detail["row"].get("model_name") or ""))
-    model_options = [default_model, *(m for m in config.model_choices() if m != default_model)]
+    candidates = [m for m in config.model_choices() if m != default_model]
+    model_groups = model_catalog.group_models(candidates)
+    other_models = [m for m in dict.fromkeys(candidates) if not model_catalog.is_provider_model(m)]
     return _render(
         request,
         "record_detail.html",
@@ -268,7 +271,8 @@ def record_detail(request: Request, sid: int, table: str, record_id: int):
         spec=spec,
         record_id=record_id,
         can_try=table in records.PROMPT_TABLES,
-        model_options=model_options,
+        model_groups=model_groups,
+        other_models=other_models,
         default_model=default_model,
         **detail,
     )

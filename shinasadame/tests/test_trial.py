@@ -2,7 +2,7 @@ import re
 import pytest
 from fastapi.testclient import TestClient
 
-from shinasadame import db, etl, records
+from shinasadame import config, db, etl, records
 from shinasadame.app import app, get_replay_client
 from shinasadame.replay import ReplayFailed, ReplayOk, ReplayUnavailable
 
@@ -89,6 +89,48 @@ def test_model_options_put_default_first_without_duplicates(client, sid, monkeyp
     )
     page = client.get(f"/s/{sid}/records/completions/1").text
     assert page.count('<option value="lmstudio@host.docker.internal:1234/model-a"') == 1
+
+
+def test_model_select_groups_options_by_provider_with_series(client, sid, monkeypatch):
+    monkeypatch.setenv("SHINASADAME_MODELS", "google/gemini-4-argon,openai/gpt-6.1-sol")
+    page = client.get(f"/s/{sid}/records/completions/1").text
+
+    assert re.search(r'<select name="model"[^>]*data-cascade', page)
+    assert '<optgroup label="google">' in page
+    assert '<optgroup label="openai">' in page
+    assert '<option value="openai/gpt-6.1-sol" data-series="gpt-6.1">' in page
+
+
+def test_model_select_uses_catalog_when_env_unset(client, sid, monkeypatch):
+    monkeypatch.delenv("SHINASADAME_MODELS", raising=False)
+    monkeypatch.setattr(
+        config.model_catalog, "load_catalog", lambda path=None: ["google/from-catalog", "xai/grok-4.7"]
+    )
+    page = client.get(f"/s/{sid}/records/completions/1").text
+
+    assert '<option value="google/from-catalog"' in page
+    assert '<option value="xai/grok-4.7" data-series="grok-4.7">' in page
+
+
+def test_page_renders_when_catalog_is_empty(client, sid, monkeypatch):
+    monkeypatch.delenv("SHINASADAME_MODELS", raising=False)
+    monkeypatch.delenv("REPLAY_LMSTUDIO_HOST", raising=False)
+    monkeypatch.setattr(config.model_catalog, "load_catalog", lambda path=None: [])
+    resp = client.get(f"/s/{sid}/records/completions/1")
+
+    assert resp.status_code == 200
+    assert '<option value="lmstudio@host.docker.internal:1234/model-a" selected>' in resp.text
+    assert 'name="model_custom"' in resp.text
+    assert "<optgroup" not in resp.text
+
+
+def test_default_model_is_first_even_when_not_in_catalog(client, sid, monkeypatch):
+    monkeypatch.delenv("REPLAY_LMSTUDIO_HOST", raising=False)
+    monkeypatch.setenv("SHINASADAME_MODELS", "google/gemini-4-argon")
+    page = client.get(f"/s/{sid}/records/completions/1").text
+
+    default = page.index('<option value="lmstudio@host.docker.internal:1234/model-a" selected>')
+    assert default < page.index("<optgroup")
 
 
 def test_try_prefers_custom_model_over_selected(client, sid):

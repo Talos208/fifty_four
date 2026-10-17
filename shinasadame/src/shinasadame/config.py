@@ -3,6 +3,8 @@
 import os
 from pathlib import Path
 
+from . import model_catalog
+
 # アップロード上限(FlightRecorder の DB 1 ファイル分)
 MAX_UPLOAD_BYTES = 256 * 1024 * 1024
 
@@ -59,6 +61,11 @@ def lmstudio_host() -> str:
 
 
 def model_choices() -> list[str]:
-    """画面の選択肢にする `provider/model`。`SHINASADAME_MODELS` をカンマ区切りで読む。"""
+    """画面の選択肢にする `provider/model`。
+
+    環境変数 `SHINASADAME_MODELS`(カンマ区切り)があればそれを優先する(明示的な上書き)。
+    無ければ `models.json`(tools/update_models.py が作る)。
+    """
     raw = os.environ.get("SHINASADAME_MODELS", "")
-    return [m.strip() for m in raw.split(",") if m.strip()]
+    chosen = [m.strip() for m in raw.split(",") if m.strip()]
+    return chosen or model_catalog.load_catalog()

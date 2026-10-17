@@ -36,8 +36,6 @@ spec:
               value: http://signoz-otel-collector.signoz.svc.cluster.local:4317
             - name: REPLAY_URL
               value: http://replay:8080
-            - name: SHINASADAME_MODELS
-              value: "google/gemini-3.8-flash-latest,anthropic/claude-sonnet-5-5,xai/grok-4.7"
           volumeMounts:
             - name: data
               mountPath: /data
