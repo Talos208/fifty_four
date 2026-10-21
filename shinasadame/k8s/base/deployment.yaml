@@ -5,6 +5,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: shinasadame
+automountServiceAccountToken: false
 spec:
   replicas: 1
   strategy:
@@ -48,6 +49,16 @@ spec:
               path: /healthz
               port: 8000
             initialDelaySeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
         - name: worker
           image: shinasadame:latest
           imagePullPolicy: IfNotPresent
@@ -60,6 +71,16 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
       volumes:
         - name: data
           persistentVolumeClaim:

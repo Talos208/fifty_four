@@ -1,5 +1,5 @@
 {
- "generated_at": "2026-10-17T05:10:11Z",
+ "generated_at": "2026-10-21T00:51:06Z",
  "models": [
   {"id": "google/gemini-4-argon", "created": 1791907477},
   {"id": "anthropic/claude-haiku-5-5", "created": 1791397883},

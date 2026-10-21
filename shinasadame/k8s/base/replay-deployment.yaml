@@ -1,9 +1,9 @@
 # replay サービス(fifty_four_lsp --replay)。shinasadame の Pod とは別の Pod にする。
-# API キーは OpenBao から CSI 経由で取得し、Secret `replay-keys` に同期する(SecretProviderClass fifty-four-llm)。
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: replay
+automountServiceAccountToken: false
 spec:
   replicas: 1
   selector:
@@ -43,6 +43,17 @@ spec:
               path: /healthz
               port: 8080
             initialDelaySeconds: 10
+          # lindera の辞書(embed-ipadic)をメモリに載せるため、web より多めに取る
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
       volumes:
         - name: llm-keys
           csi:
