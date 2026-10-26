@@ -13,7 +13,7 @@ use dashmap::DashMap;
 #[allow(unused_imports)]
 use log::{debug, error, warn};
 use tower_lsp_server::Client;
-use tower_lsp_server::lsp_types::*;
+use tower_lsp_server::ls_types::*;
 use tracing::instrument;
 
 use crate::types::LineData;
@@ -299,7 +299,6 @@ async fn rename_chapter_file(
     new_path: &std::path::Path,
     supports_rename_op: bool,
 ) -> bool {
-    use tower_lsp_server::UriExt;
     let Some(old_uri) = Uri::from_file_path(old_path) else {
         error!("plot_sync: failed to build uri for {:?}", old_path);
         return false;

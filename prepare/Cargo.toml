@@ -4,5 +4,5 @@ version = "0.0.1"
 edition = "2024"
 
 [dependencies]
-wasmparser = "0.239"
-wasm-encoder = "0.239"
+wasmparser = "0.262"
+wasm-encoder = "0.262"

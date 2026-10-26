@@ -259,9 +259,13 @@ fn strip_custom_sections(input: &[u8]) -> Result<Vec<u8>, String> {
             continue;
         }
         if let Some((id, range)) = payload.as_section() {
+            // wasmparser 0.262 からセクション範囲は Range<u64>。スライスには usize が要る。
+            let to_index = |v: u64| {
+                usize::try_from(v).map_err(|_| format!("wasm セクションの範囲が大きすぎます: {v}"))
+            };
             RawSection {
                 id,
-                data: &input[range],
+                data: &input[to_index(range.start)?..to_index(range.end)?],
             }
             .append_to(&mut output);
         }

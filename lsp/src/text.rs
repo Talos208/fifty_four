@@ -5,7 +5,7 @@
 
 use crate::types::LineData;
 use std::str::FromStr;
-use tower_lsp_server::lsp_types::Range;
+use tower_lsp_server::ls_types::Range;
 use tracing::instrument;
 
 /// completion の候補に付ける `filter_text` を組み立てる。
@@ -126,7 +126,7 @@ mod tests {
     use crate::highlight::Highlighter;
     use crate::types::TokenStatus;
     use indoc::indoc;
-    use tower_lsp_server::lsp_types::Position;
+    use tower_lsp_server::ls_types::Position;
 
     fn range(sl: u32, sc: u32, el: u32, ec: u32) -> Range {
         Range {

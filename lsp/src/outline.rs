@@ -8,7 +8,7 @@ use crate::types::utf16_len;
 use comrak::arena_tree::NodeEdge;
 use comrak::nodes::{AstNode, NodeValue};
 use comrak::{Arena, parse_document};
-use tower_lsp_server::lsp_types::{DocumentSymbol, Position, Range, SymbolKind};
+use tower_lsp_server::ls_types::{DocumentSymbol, Position, Range, SymbolKind};
 use tracing::instrument;
 
 /// Markdown 全文から見出し(レベル, 名前, 0-based 行番号, 名前の UTF-16 終端 character)を

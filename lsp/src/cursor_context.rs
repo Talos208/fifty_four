@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use log::{debug, error, trace};
 use std::cmp::max;
 use std::cmp::min;
-use tower_lsp_server::lsp_types::{Position, Range};
+use tower_lsp_server::ls_types::{Position, Range};
 use tracing::instrument;
 
 /// ルビ記号(`｜`/`《`/`》`)は台詞の括弧・文末とは無関係なので、台詞内外・文境界の
@@ -530,7 +530,7 @@ mod tests {
     use crate::highlight::Highlighter;
     use crate::types::{CursorContext, LineData, TokenMeaning, TokenStatus};
     use dashmap::DashMap;
-    use tower_lsp_server::lsp_types::{Position, Range};
+    use tower_lsp_server::ls_types::{Position, Range};
     // use indoc::indoc;
     use regex::Regex;
     use std::str::FromStr;

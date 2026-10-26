@@ -13,7 +13,7 @@ use indoc::indoc;
 use log::debug;
 #[cfg(debug_assertions)]
 use std::path::{Path, PathBuf};
-use tower_lsp_server::lsp_types::TextDocumentContentChangeEvent;
+use tower_lsp_server::ls_types::TextDocumentContentChangeEvent;
 
 #[cfg(debug_assertions)]
 mod migrations {
