@@ -8,7 +8,7 @@
 use crate::types::CachedLinderaToken;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use tower_lsp_server::lsp_types::{Position, Range};
+use tower_lsp_server::ls_types::{Position, Range};
 use tracing::instrument;
 
 /// ワークスペース直下(非再帰)の `.txt` を列挙する(本文原稿のみ。

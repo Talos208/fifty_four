@@ -23,9 +23,9 @@ use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use tower_lsp_server::lsp_types::request::{GotoImplementationParams, GotoImplementationResponse};
-use tower_lsp_server::lsp_types::*;
-use tower_lsp_server::{Client, LanguageServer, UriExt};
+use tower_lsp_server::ls_types::request::{GotoImplementationParams, GotoImplementationResponse};
+use tower_lsp_server::ls_types::*;
+use tower_lsp_server::{Client, LanguageServer};
 use tracing::instrument;
 
 /// Zed が `didOpen` で送ってくる languageId。
@@ -897,6 +897,9 @@ impl LanguageServer for Backend {
         Ok(InitializeResult {
             capabilities,
             server_info: None,
+            // clangd 独自の UTF-8 オフセット拡張は使わない(標準の position_encoding=UTF16 で通す)。
+            // None は JSON に出力されないので、tower-lsp-server 0.22 までと通信内容は同じ。
+            offset_encoding: None,
         })
     }
 

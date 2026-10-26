@@ -3,7 +3,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: replay
-automountServiceAccountToken: false
 spec:
   replicas: 1
   selector:
@@ -15,6 +14,7 @@ spec:
         app: replay
     spec:
       serviceAccountName: replay
+      automountServiceAccountToken: false
       containers:
         - name: replay
           image: fifty-four-replay:latest

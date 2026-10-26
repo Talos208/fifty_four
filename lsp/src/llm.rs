@@ -140,7 +140,7 @@ impl Provider {
     #[instrument(skip(self), ret)]
     pub fn default_capabilities(&self, model: &str) -> ModelCapability {
         match self {
-            // Anthropic の構造化出力(output_config.format)は genai 0.6.5 の
+            // Anthropic の構造化出力(output_config.format)は genai 0.6.5 以降の
             // Anthropic adapter が ChatResponseFormat::JsonSpec を通じて対応済み。
             // reasoning_effort / stop はどちらも各社ドキュメント上サポート対象。
             Provider::Google(_) | Provider::OpenAI(_) | Provider::Anthropic(_) => {
@@ -262,7 +262,7 @@ impl Provider {
         };
         let n = norm.clamp(0.0, 1.0);
         if n <= 0.0 || ladder.is_empty() {
-            ReasoningEffort::None
+            ReasoningEffort::Zero
         } else {
             // 1.0 で必ず末尾(最上位)に到達するよう ceil でインデックス化
             let idx = ((n * ladder.len() as f64).ceil() as usize).clamp(1, ladder.len()) - 1;
@@ -991,9 +991,12 @@ impl LlmClientBuilder {
             },
         );
 
+        // genai 0.7 から build() は Result を返す(TLS/プロキシ初期化の失敗)。
+        // 起動時に一度だけ通る経路で、失敗しても回復手段が無いので expect にする。
         let inner_client = genai::Client::builder()
             .with_service_target_resolver(proc)
-            .build();
+            .build()
+            .expect("failed to build genai client");
 
         let mut capabilities = self
             .capabilities
@@ -1343,11 +1346,9 @@ impl LlmInterface for LlmClient {
 
         // genai の From 実装で組む(ToolCall の doc が示す慣用パターン
         //  append_message(tool_calls).append_message(tool_response))。
-        // From<Vec<ToolCall>> は先頭 ToolCall の thought_signatures を先頭の
-        // ThoughtSignature パートへ hoist する。Gemini 3 の送信シリアライザは
-        // functionCall の直前にある ThoughtSignature パートからしか署名を読まないため、
-        // これを通さないとモデルが返した署名が欠落し
-        //  "Function call is missing a thought_signature" の 400 になる。
+        // モデルが返した署名は ToolCall.thought_signatures に載ったまま残り、genai 0.7 の
+        // Gemini adapter が関数呼び出しごとに thoughtSignature として送り返す
+        // (署名が無い先頭の呼び出しには Gemini 3 向けの代替値も補う)。
         // From<Vec<ToolResponse>> は Tool ロールになるが、Gemini adapter は User/Tool
         // どちらも {"role":"user", functionResponse} に出力するため出力は不変。
         let chat_req = ChatRequest::from_messages(vec![])
@@ -1815,19 +1816,19 @@ mod tests_reasoning {
     fn test_zero_is_none() {
         assert!(matches!(
             openai().map_reasoning("gpt-5.3", 0.0),
-            ReasoningEffort::None
+            ReasoningEffort::Zero
         ));
         assert!(matches!(
             anthropic().map_reasoning("claude-opus-4-8", 0.0),
-            ReasoningEffort::None
+            ReasoningEffort::Zero
         ));
         assert!(matches!(
             google().map_reasoning("gemini-3.1-pro-preview", 0.0),
-            ReasoningEffort::None
+            ReasoningEffort::Zero
         ));
         assert!(matches!(
             lmstudio().map_reasoning("model", 0.0),
-            ReasoningEffort::None
+            ReasoningEffort::Zero
         ));
     }
 
@@ -1918,7 +1919,7 @@ mod tests_reasoning {
         // 負数 -> None
         assert!(matches!(
             anthropic().map_reasoning("claude-opus-4-8", -0.3),
-            ReasoningEffort::None
+            ReasoningEffort::Zero
         ));
     }
 
@@ -1930,7 +1931,7 @@ mod tests_reasoning {
         for v in [0.0, 0.5, 1.0, 2.0] {
             assert!(matches!(
                 lmstudio().map_reasoning("model", v),
-                ReasoningEffort::None
+                ReasoningEffort::Zero
             ));
         }
     }
@@ -1944,11 +1945,11 @@ mod tests_reasoning {
         for v in [0.0, 0.5, 1.0] {
             assert!(matches!(
                 xai().map_reasoning("grok-4.20-0309-reasoning", v),
-                ReasoningEffort::None
+                ReasoningEffort::Zero
             ));
             assert!(matches!(
                 xai().map_reasoning("grok-4.20-0309-non-reasoning", v),
-                ReasoningEffort::None
+                ReasoningEffort::Zero
             ));
         }
     }
@@ -1990,7 +1991,7 @@ mod tests_reasoning {
         ));
         assert!(matches!(
             xai().map_reasoning("grok-4.20-multi-agent-0309", 0.0),
-            ReasoningEffort::None
+            ReasoningEffort::Zero
         ));
     }
 
@@ -2015,7 +2016,7 @@ mod tests_reasoning {
         ));
         assert!(matches!(
             google().map_reasoning("gemini-3-pro-preview", 0.0),
-            ReasoningEffort::None
+            ReasoningEffort::Zero
         ));
     }
 
@@ -2382,11 +2383,11 @@ mod tests_lmstudio_probe {
     }
 
     /// テスト用に最小構成の LMStudio 向け LlmClient を組み立てる。
-    /// `genai::Client` は `Default` を実装しているので実際の HTTP 設定は不要。
+    /// テスト用の素の `genai::Client`(実際の HTTP 設定は不要)。
     fn lmstudio_test_client(capabilities: ModelCapability) -> LlmClient {
         LlmClient {
             provider: Provider::LMStudio("model".to_string(), None),
-            inner_client: genai::Client::default(),
+            inner_client: genai::Client::builder().build().expect("genai client"),
             options: ChatOptions::default(),
             model: "model".to_string(),
             cache: Vec::new(),
@@ -2771,9 +2772,11 @@ mod tests_tool_round {
 
     #[tokio::test]
     async fn test_respond_tool_preserves_thought_signature() {
-        // モデルが functionCall に付けて返した thought_signature を、送信用の
-        // Assistant メッセージの先頭 ThoughtSignature パートへ hoist すること
+        // モデルが functionCall に付けて返した thought_signature が、送信用の
+        // Assistant メッセージの ToolCall に載ったまま残ること
         // (Gemini 3 はこの署名を verbatim で戻さないと 400 を返す)。
+        // genai 0.6 は先頭の ThoughtSignature パートへ hoist していたが、0.7 は
+        // 関数呼び出しごとに署名を保持し、adapter が直接 thoughtSignature へ書き出す。
         let cl = client_with_echo_tool();
         let mut tc = tool_call("c1", "echo");
         tc.thought_signatures = Some(vec!["sig-abc".to_string()]);
@@ -2781,17 +2784,12 @@ mod tests_tool_round {
         let follow = cl.respond_tool(&[tc]).await.unwrap();
 
         let assistant = &follow.messages[0].content;
-        assert!(
-            assistant.contains_thought_signature(),
-            "Assistant メッセージに ThoughtSignature パートが含まれること"
-        );
-        assert_eq!(
-            assistant.first_thought_signature(),
-            Some("sig-abc"),
-            "モデルの署名が保持されること"
-        );
-        // 署名を hoist しても functionCall 自体は保持される
         assert_eq!(assistant.tool_calls().len(), 1);
+        assert_eq!(
+            assistant.tool_calls()[0].thought_signatures,
+            Some(vec!["sig-abc".to_string()]),
+            "モデルの署名が ToolCall に保持されること"
+        );
     }
 
     #[tokio::test]

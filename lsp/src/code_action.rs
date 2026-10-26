@@ -8,7 +8,7 @@ use crate::types::LineData;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 use tokio::task::AbortHandle;
-use tower_lsp_server::lsp_types::{Position, Range, Uri};
+use tower_lsp_server::ls_types::{Position, Range, Uri};
 use tracing::instrument;
 
 /// 「↻ 候補を作り直す」の `workspace/executeCommand` コマンド名。

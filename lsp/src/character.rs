@@ -393,8 +393,8 @@ impl CharacterStore {
         &self,
         workspace_root: &Path,
         surface: &str,
-    ) -> Vec<(PathBuf, tower_lsp_server::lsp_types::Range)> {
-        use tower_lsp_server::lsp_types::{Position, Range};
+    ) -> Vec<(PathBuf, tower_lsp_server::ls_types::Range)> {
+        use tower_lsp_server::ls_types::{Position, Range};
 
         if surface.is_empty() {
             return Vec::new();

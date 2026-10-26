@@ -3,7 +3,7 @@
 #[allow(unused_imports)]
 use log::debug;
 use tower_lsp_server::Client;
-use tower_lsp_server::lsp_types::*;
+use tower_lsp_server::ls_types::*;
 use tracing::instrument;
 
 /// completion 実行中に LSP WorkDoneProgress を表示するためのガード。
