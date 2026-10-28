@@ -1,6 +1,8 @@
 # Rust
 target/
-Cargo.lock
+# Cargo.lock はコミットする(CI・Docker・手元で同じ依存バージョンに揃えるため)。
+# extension/Cargo.lock は workspace メンバー単体の残骸で cargo は使わない(ルートの lock が正)
+/extension/Cargo.lock
 .cargo/*
 !.cargo/config.toml
 **/*.rs.bk

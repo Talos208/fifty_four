@@ -25,7 +25,8 @@ async-trait = "0.1.89"
 tower-lsp-server = "0.23"
 agent-client-protocol = { version = "3.5", features = ["stdio"] }
 anthropic-agent-sdk = "0.2"
-lindera = { version = "2.3.2", features = ["embed-ipadic"] }
+lindera = { version = "6.2", features = ["embed-ipadic"] }
+lindera-analysis = "6.2"
 log = "0.4.29"
 env_logger = "0.11.9"
 dashmap = "6.1"

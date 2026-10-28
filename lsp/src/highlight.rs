@@ -6,7 +6,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::atomic::Ordering::Relaxed;
 
 use lindera::mode::Mode;
-use lindera::tokenizer::TokenizerBuilder;
+use lindera_analysis::tokenizer::TokenizerBuilder;
 use parking_lot::RwLock;
 use strum_macros::EnumIter;
 use tracing::instrument;
@@ -145,7 +145,7 @@ pub struct Highlighter {
     /// `initialize` を即座に返せるようにする。実際にトークナイズが必要になった時点
     /// (`tokenizer()`)で初めて `get_or_init` が走り、未完了ならそこだけ待つ
     /// (通常運用ではバックグラウンド構築が先に終わっているためほぼ待たない)。
-    tokenizer: std::sync::Arc<std::sync::OnceLock<RwLock<lindera::tokenizer::Tokenizer>>>,
+    tokenizer: std::sync::Arc<std::sync::OnceLock<RwLock<lindera_analysis::tokenizer::Tokenizer>>>,
 }
 
 impl std::fmt::Debug for crate::highlight::Highlighter {
@@ -172,7 +172,7 @@ impl Highlighter {
     /// ことを前提としており、バックグラウンドスレッドと実利用側のどちらが先に
     /// 呼んでも二重構築は起きない(`OnceLock` が排他する)。
     #[instrument]
-    fn build_tokenizer() -> RwLock<lindera::tokenizer::Tokenizer> {
+    fn build_tokenizer() -> RwLock<lindera_analysis::tokenizer::Tokenizer> {
         // IPADIC を使用する設定でトークナイザを作成
         let tokenizer = TokenizerBuilder::new()
             .unwrap()
@@ -185,7 +185,7 @@ impl Highlighter {
     }
 
     /// トークナイザ本体を取得する。バックグラウンド構築が未完了ならここで待つ。
-    fn tokenizer(&self) -> &RwLock<lindera::tokenizer::Tokenizer> {
+    fn tokenizer(&self) -> &RwLock<lindera_analysis::tokenizer::Tokenizer> {
         self.tokenizer.get_or_init(Self::build_tokenizer)
     }
 
@@ -210,7 +210,7 @@ impl Highlighter {
     /// (`CharacterStore::all_allowed_names`。トークナイズ品質の担保だけが目的で、
     /// どのワークスペースの名前かを区別する必要はない)。
     ///
-    /// lindera 2.3.2 はCSVファイル経由でしかユーザー辞書を構築できないため、一時ファイルに
+    /// lindera はCSVファイル経由でしかユーザー辞書を新規構築できないため、一時ファイルに
     /// 書き出してロード後に削除する。`Tokenizer.segmenter.user_dictionary` が pub なので、
     /// 埋め込みIPADIC の再ロードなしに辞書だけを差し替えられる。
     #[instrument(skip(self), ret)]
@@ -303,16 +303,10 @@ impl Highlighter {
                         return None;
                     }
                 }
+                let details: [String; 7] = std::array::from_fn(|i| d[i].to_string());
 
                 Some(CachedLinderaToken {
-                    details: t
-                        .details()
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<String>>()
-                        .as_chunks::<7>()
-                        .0[0]
-                        .clone(),
+                    details,
                     byte_start: t.byte_start,
                     byte_end: t.byte_end,
                     meaning: TokenMeaning::Normal,

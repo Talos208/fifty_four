@@ -80,6 +80,12 @@ cargo prepare package --release --target aarch64-pc-windows-msvc
 
 `dist/fifty-four-aarch64/` に ARM64 ネイティブの `fifty_four_lsp.exe` を含む配布一式が生成される(拡張の wasm・`data/` は arch 非依存でホストビルドと共通)。引数なしの `cargo prepare package` は従来どおり host(x64)向けに `dist/fifty-four/` を生成し、動作は変わらない。
 
+### 依存バージョンの固定(Cargo.lock)
+
+- ルートの `Cargo.lock` はコミットする。CI(`.github/workflows/test.yml`)と `lsp/Dockerfile.replay` は `--locked` でビルドし、lock と `Cargo.toml` がずれていたら失敗する。
+- 依存を更新するときは `cargo update`(または `Cargo.toml` のバージョンを上げてビルド)で lock を更新し、差分ごとコミットする。
+- `extension/Cargo.lock` は workspace メンバー単体の残骸で cargo は使わない(gitignore 済み)。
+
 ### 既知の注意点
 
 - `aws-lc-sys`(rustls の暗号バックエンド、genai/opentelemetry-otlp が推移的に依存)が clang・CMake・Ninja を要求する。これが無いと `cc-rs: failed to find tool "clang"` のようなエラーで `cargo build`/`cargo check` が失敗する。
