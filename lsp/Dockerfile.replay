@@ -6,7 +6,7 @@ WORKDIR /src
 
 # 依存だけ先にビルドしてレイヤーキャッシュを効かせる。
 # lindera の辞書埋め込み(embed-ipadic)と rusqlite(bundled)で初回は重い。
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock ./
 COPY lsp/Cargo.toml lsp/Cargo.toml
 COPY extension/Cargo.toml extension/Cargo.toml
 COPY prepare/Cargo.toml prepare/Cargo.toml
@@ -14,7 +14,7 @@ RUN mkdir -p lsp/src extension/src prepare/src \
     && echo 'fn main() {}' > lsp/src/main.rs \
     && echo '' > extension/src/lib.rs \
     && echo 'fn main() {}' > prepare/src/main.rs \
-    && cargo build --release -p fifty_four_lsp --features replay || true
+    && cargo build --locked --release -p fifty_four_lsp --features replay || true
 
 COPY lsp ./lsp
 COPY extension ./extension
@@ -23,7 +23,7 @@ COPY prepare ./prepare
 COPY data ./data
 # 依存のダミービルドより新しいと判定されるよう、ソースの更新時刻を進める
 RUN touch lsp/src/main.rs \
-    && cargo build --release -p fifty_four_lsp --features replay
+    && cargo build --locked --release -p fifty_four_lsp --features replay
 
 FROM debian:bookworm-slim
 # 各 provider へ HTTPS で接続するために CA 証明書が要る

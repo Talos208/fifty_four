@@ -56,7 +56,7 @@ pub enum TokenMeaning {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedLinderaToken {
     // 品詞情報（details[0]="品詞", [1]="細分類1", [2]="細分類2", [3]="細分類3", [4]="活用型", [5]="活用形", [6]="原形"）。
-    // 実測(lindera 2.3.2 + embed-ipadic)では [4] に「五段・ラ行」等の活用型、[5] に「未然形」等の
+    // 実測(lindera 6.2 + embed-ipadic)では [4] に「五段・ラ行」等の活用型、[5] に「未然形」等の
     // 活用形が入る(quality::sentence::STok::conj_form 参照)。よく見る「活用形→活用型」の順の
     // 資料もあるが、この実装が実際に受け取る並びはこちら。
     pub details: [String; 7],
