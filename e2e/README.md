@@ -47,8 +47,27 @@ docker exec ff-e2e fcitx5-remote -c
 docker exec ff-e2e xdotool key ctrl+space
 ```
 
+## 動作確認済みのこと(Zed v1.26.2)
+
+- lavapipe で描画できる(Zed のログに `Selected GPU adapter: "llvmpipe …" (Vulkan)`)。日本語は Noto CJK で表示される。
+- `installed/fifty-four` に置いた拡張が読み込まれ、`.txt` が `FiftyFour` 言語になり、`binary.path` の LSP が起動する。
+- IME: `fcitx5-remote -o` → ローマ字 → Space で変換 → Return で確定、の流れでバッファに確定文字列が入る。
+
+## 調べてわかったこと
+
+- **信頼確認**: ワークスペースが未信頼だと Restricted Mode になり、**LSP が起動しない**。
+  `session.trust_all_worktrees: true` で確認ダイアログを出さないようにしている。
+- **X11 の preedit はインライン表示されない**: XIM 経由では、変換中の文字は fcitx5 の小窓に出て、
+  Zed のバッファには確定時に初めて入る。つまり変換中は `didChange` が飛ばない。
+  Wayland(text-input-v3)ではインライン preedit になるはずなので、挙動を比べたくなったら Wayland 版も要る。
+- **D-Bus のアドレスは固定**(`unix:path=/tmp/e2e-dbus`)。`docker exec` で入ったプロセスからも
+  `fcitx5-remote` が効くようにするため。
+- fcitx5 の「en / あ」ポップアップは `docker/fcitx5-config` で消している(画面比較のノイズになる)。
+- ネットワークに出られない機能(拡張の自動インストール、ACP レジストリ、ログイン)はエラーをログに出すだけで、動作には影響しない。
+
 ## 既知の制約
 
+- ビルドには `Lindera.dev`(lindera の IPADIC 辞書の配布元)へのアクセスが要る。
 - `--acp`(debug ビルド限定、claude CLI 依存)は対象外。
 - LLM を使う機能は、今の settings では無効(`initialization_options` が空)。偽の LLM サーバを追加して決定的にする予定。
 - 待ち合わせの条件(LSP の span)と画面比較のハーネスは未実装。

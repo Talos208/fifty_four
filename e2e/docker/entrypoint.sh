@@ -20,9 +20,9 @@ wait_for() { # wait_for <秒> <説明> <コマンド...>
 Xvfb "$DISPLAY" -screen 0 "$E2E_SCREEN" -nolisten tcp >"$out/xvfb.log" 2>&1 &
 wait_for 10 Xvfb xdpyinfo
 
-# fcitx5 は D-Bus のセッションバスが要る。以降の子プロセスもこのバスを共有する
-eval "$(dbus-launch --sh-syntax)"
-export DBUS_SESSION_BUS_ADDRESS
+# fcitx5 は D-Bus のセッションバスが要る。`docker exec` で後から入るプロセス(fcitx5-remote など)も
+# 同じバスにつながるよう、アドレスは Dockerfile の ENV で固定しておき、そこに立てる
+dbus-daemon --session --address="$DBUS_SESSION_BUS_ADDRESS" --fork --nopidfile
 
 fcitx5 -d --replace >"$out/fcitx5.log" 2>&1
 wait_for 10 fcitx5 fcitx5-remote

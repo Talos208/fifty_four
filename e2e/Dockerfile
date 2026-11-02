@@ -60,7 +60,7 @@ FROM ubuntu:24.04
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
-        dbus dbus-x11 \
+        dbus \
         xvfb x11-utils x11-xserver-utils xdotool imagemagick \
         libvulkan1 mesa-vulkan-drivers \
         libasound2t64 libxkbcommon-x11-0 libxcb1 libx11-xcb1 libfontconfig1 libwayland-client0 libgl1 \
@@ -82,12 +82,14 @@ COPY --chown=e2e --from=build /src/target/wasm32-wasip2/release/fifty_four_exten
 
 COPY --chown=e2e e2e/docker/zed-settings.json /home/e2e/.config/zed/settings.json
 COPY --chown=e2e e2e/docker/fcitx5-profile /home/e2e/.config/fcitx5/profile
+COPY --chown=e2e e2e/docker/fcitx5-config /home/e2e/.config/fcitx5/config
 COPY --chown=e2e e2e/docker/workspace /home/e2e/workspace
 COPY e2e/docker/entrypoint.sh /usr/local/bin/e2e-entrypoint
 
 USER e2e
 WORKDIR /home/e2e
 ENV DISPLAY=:99 \
+    DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/e2e-dbus \
     LANG=C.UTF-8 \
     LC_CTYPE=C.UTF-8 \
     XMODIFIERS=@im=fcitx \
