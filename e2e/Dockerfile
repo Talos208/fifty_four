@@ -1,0 +1,100 @@
+# Zed + fifty_four_lsp + IME(fcitx5/mozc) を仮想ディスプレイ上で動かす E2E 用イメージ。
+# ビルドコンテキストはリポジトリルート(lsp/Dockerfile.replay と同じ):
+#   docker build -f e2e/Dockerfile -t fifty-four-e2e:latest .
+# 起動(仮想ディスプレイ・IME・Zed を立ち上げて待機する):
+#   docker run --rm -it -v "$PWD/e2e/out:/out" fifty-four-e2e:latest
+# 中で操作するときは e2e/README.md を参照。
+
+ARG ZED_VERSION=v1.26.2
+
+# ---- LSP と拡張(wasm)のビルド -------------------------------------------
+FROM rust:1-bookworm AS build
+WORKDIR /src
+RUN rustup target add wasm32-wasip2
+
+# 依存だけ先にビルドしてレイヤーキャッシュを効かせる(lsp/Dockerfile.replay と同じ手口)
+COPY Cargo.toml Cargo.lock ./
+COPY lsp/Cargo.toml lsp/Cargo.toml
+COPY extension/Cargo.toml extension/Cargo.toml
+COPY prepare/Cargo.toml prepare/Cargo.toml
+RUN mkdir -p lsp/src extension/src prepare/src \
+    && echo 'fn main() {}' > lsp/src/main.rs \
+    && echo '' > extension/src/lib.rs \
+    && echo 'fn main() {}' > prepare/src/main.rs \
+    && (cargo build --locked -p fifty_four_lsp || true) \
+    && (cargo build --locked -p fifty_four_extension --release --target wasm32-wasip2 || true)
+
+COPY lsp ./lsp
+COPY extension ./extension
+COPY prepare ./prepare
+COPY data ./data
+# E2E では FlightRecorder と stderr ミラーが欲しいので debug ビルドにする
+RUN touch lsp/src/main.rs extension/src/lib.rs \
+    && cargo build --locked -p fifty_four_lsp \
+    && cargo build --locked -p fifty_four_extension --release --target wasm32-wasip2
+
+# ---- Zed 本体 -------------------------------------------------------------
+FROM debian:trixie-slim AS zed
+ARG ZED_VERSION
+ARG TARGETARCH
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN case "$TARGETARCH" in \
+        amd64|"") arch=x86_64 ;; \
+        arm64) arch=aarch64 ;; \
+        *) echo "unsupported arch: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL -o /tmp/zed.tar.gz \
+        "https://github.com/zed-industries/zed/releases/download/${ZED_VERSION}/zed-linux-${arch}.tar.gz" \
+    && mkdir -p /opt \
+    && tar -xzf /tmp/zed.tar.gz -C /opt \
+    && rm /tmp/zed.tar.gz
+
+# ---- 実行環境 -------------------------------------------------------------
+FROM debian:trixie-slim
+# - xvfb / x11-utils / xdotool / imagemagick: 仮想ディスプレイ・キー入力・スクリーンショット
+# - mesa-vulkan-drivers: lavapipe(CPU 実装の Vulkan)。Zed の描画に Vulkan が必須
+# - fcitx5 / fcitx5-mozc: 日本語 IME。Zed は X11 では XIM で IME とつながる
+# - fonts-noto-cjk: 画面比較のため、フォントはイメージで固定する
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        dbus dbus-x11 \
+        xvfb x11-utils x11-xserver-utils xdotool imagemagick \
+        libvulkan1 mesa-vulkan-drivers \
+        libasound2t64 libxkbcommon-x11-0 libxcb1 libx11-xcb1 libfontconfig1 libwayland-client0 libgl1 \
+        fcitx5 fcitx5-mozc fcitx5-frontend-gtk3 \
+        fonts-noto-cjk \
+        git procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --create-home --shell /bin/bash e2e
+
+COPY --from=zed /opt/zed.app /opt/zed.app
+RUN ln -s /opt/zed.app/bin/zed /usr/local/bin/zed
+COPY --from=build /src/target/debug/fifty_four_lsp /usr/local/bin/fifty_four_lsp
+
+# 拡張は「インストール済み」として配置する(Zed は起動時に installed/ を走査して索引を作る)
+COPY --chown=e2e extension/extension.toml /home/e2e/.local/share/zed/extensions/installed/fifty-four/extension.toml
+COPY --chown=e2e extension/languages /home/e2e/.local/share/zed/extensions/installed/fifty-four/languages
+COPY --chown=e2e --from=build /src/target/wasm32-wasip2/release/fifty_four_extension.wasm \
+    /home/e2e/.local/share/zed/extensions/installed/fifty-four/extension.wasm
+
+COPY --chown=e2e e2e/docker/zed-settings.json /home/e2e/.config/zed/settings.json
+COPY --chown=e2e e2e/docker/fcitx5-profile /home/e2e/.config/fcitx5/profile
+COPY --chown=e2e e2e/docker/workspace /home/e2e/workspace
+COPY e2e/docker/entrypoint.sh /usr/local/bin/e2e-entrypoint
+
+USER e2e
+WORKDIR /home/e2e
+ENV DISPLAY=:99 \
+    LANG=C.UTF-8 \
+    LC_CTYPE=C.UTF-8 \
+    XMODIFIERS=@im=fcitx \
+    GTK_IM_MODULE=fcitx \
+    QT_IM_MODULE=fcitx \
+    ZED_ALLOW_EMULATED_GPU=1 \
+    E2E_SCREEN=1600x1000x24 \
+    E2E_OUT=/out
+ENTRYPOINT ["/usr/local/bin/e2e-entrypoint"]
+CMD ["sleep", "infinity"]
