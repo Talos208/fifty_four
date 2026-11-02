@@ -34,7 +34,7 @@ RUN touch lsp/src/main.rs extension/src/lib.rs \
     && cargo build --locked -p fifty_four_extension --release --target wasm32-wasip2
 
 # ---- Zed 本体 -------------------------------------------------------------
-FROM debian:trixie-slim AS zed
+FROM ubuntu:24.04 AS zed
 ARG ZED_VERSION
 ARG TARGETARCH
 RUN apt-get update \
@@ -52,7 +52,7 @@ RUN case "$TARGETARCH" in \
     && rm /tmp/zed.tar.gz
 
 # ---- 実行環境 -------------------------------------------------------------
-FROM debian:trixie-slim
+FROM ubuntu:24.04
 # - xvfb / x11-utils / xdotool / imagemagick: 仮想ディスプレイ・キー入力・スクリーンショット
 # - mesa-vulkan-drivers: lavapipe(CPU 実装の Vulkan)。Zed の描画に Vulkan が必須
 # - fcitx5 / fcitx5-mozc: 日本語 IME。Zed は X11 では XIM で IME とつながる
