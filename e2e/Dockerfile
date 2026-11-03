@@ -76,6 +76,8 @@ RUN apt-get update \
 COPY --from=zed /opt/zed.app /opt/zed.app
 RUN ln -s /opt/zed.app/bin/zed /usr/local/bin/zed
 COPY --from=build /src/target/debug/fifty_four_lsp /usr/local/bin/fifty_four_lsp
+# debug ビルドの LSP は、実行ファイルの隣の db/ に FlightRecorder の DB を作る。e2e ユーザーが書けるようにしておく
+RUN mkdir -p /usr/local/bin/db && chown e2e /usr/local/bin/db
 
 # 拡張は「インストール済み」として配置する(Zed は起動時に installed/ を走査して索引を作る)
 COPY --chown=e2e extension/extension.toml /home/e2e/.local/share/zed/extensions/installed/fifty-four/extension.toml

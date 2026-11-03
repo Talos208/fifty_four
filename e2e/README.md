@@ -71,6 +71,8 @@ docker exec ff-e2e e2e-key ctrl+space
   Wayland では Zed の起動直後にできる。
 - **Wayland は Zed 自身の判断で選ばれる**: `WAYLAND_DISPLAY` があり `DISPLAY` がなければ Wayland で起動する。
   sway は `xwayland disable` にしてあるので、誤って X11 で動くことはない。
+- **起動順の競合(遅い環境で起きる)**: `fcitx5-remote` が答えても、XIM サーバや mozc はまだ読み込み中のことがある。Zed が先に XIM へ繋ぐと失敗したままになり、「IME connection」待ちでタイムアウトする。そのため entrypoint は fcitx5 の全アドオン(最後は mozc)と、X11 なら XIM サーバの登録、Wayland なら sway の出力(HEADLESS-1)を待ってから Zed を起動する。Wayland で sway の出力が確定する前に Zed が繋ぐと、Zed が `wayland/client.rs` で panic した例もある。待ち時間は `E2E_FCITX5_TIMEOUT`(60 秒)・`E2E_ZED_WINDOW_TIMEOUT`(60 秒)・`E2E_IME_TIMEOUT`(30 秒)で変えられる。
+- **debug ビルドの LSP は実行ファイルの隣に `db/` を作る**(FlightRecorder)。権限がないと起動時に panic し、Zed に「Failed to run fifty-four」と出る。`/usr/local/bin/db` を e2e ユーザー所有で作ってある。
 - **D-Bus のアドレスは固定**(`unix:path=/tmp/e2e-dbus`)。`docker exec` で入ったプロセスからも
   `fcitx5-remote` が効くようにするため。
 - fcitx5 の「en / あ」ポップアップは `docker/fcitx5-config` で消している(画面比較のノイズになる)。

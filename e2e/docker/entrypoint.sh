@@ -82,6 +82,8 @@ wayland)
     WAYLAND_DISPLAY=$(basename "$(ls "$XDG_RUNTIME_DIR"/wayland-* | grep -v '\.lock$' | head -1)")
     SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.* | head -1)
     export WAYLAND_DISPLAY SWAYSOCK
+    # ソケットができただけでは出力(HEADLESS-1)の設定が終わっていない。Zed が先に繋ぐと落ちることがある
+    wait_for 10 "sway output" sh -c 'swaymsg -t get_outputs | grep -q "\"name\": \"HEADLESS-1\""'
     printf 'export E2E_DISPLAY=wayland WAYLAND_DISPLAY=%q SWAYSOCK=%q\nunset DISPLAY\n' \
         "$WAYLAND_DISPLAY" "$SWAYSOCK" >/tmp/e2e-env
     ;;
@@ -98,20 +100,26 @@ dbus-daemon --session --address="$DBUS_SESSION_BUS_ADDRESS" --fork --nopidfile
 
 fcitx5 -d --replace >"$out/fcitx5.log" 2>&1
 wait_for 10 fcitx5 fcitx5-remote
+# fcitx5-remote が答えても、IME の frontend(XIM など)と mozc はまだ読み込み中のことがある。
+# Zed が先に接続すると、XIM は一度失敗したまま IME に繋がらない(遅い環境で起きる)。最後に読む mozc まで待つ
+wait_for "${E2E_FCITX5_TIMEOUT:-60}" "fcitx5 addons" grep -q 'Loaded addon mozc' "$out/fcitx5.log"
+if [ "$mode" = x11 ]; then
+    wait_for "${E2E_FCITX5_TIMEOUT:-60}" "XIM server" sh -c 'xprop -root XIM_SERVERS | grep -q fcitx'
+fi
 
 # Zed は端末から切り離さず起動し、ログを残す
 step "Zed"
 zed --foreground "$HOME/workspace" "$HOME/workspace/test.txt" >"$out/zed.log" 2>&1 &
 zed_pid=$!
 echo "$zed_pid" >"$out/zed.pid"
-wait_for 60 "Zed window" e2e-window
+wait_for "${E2E_ZED_WINDOW_TIMEOUT:-60}" "Zed window" e2e-window
 step "IME connection"
 # X11(XIM)では、Zed は最初のキー入力で初めて IME の入力コンテキストを作る。
 # それまでに打ったキーは IME を素通りするので、無害な Shift を押して作らせてから待つ
 if [ "$mode" = x11 ]; then
-    wait_for 30 "IME connection" sh -c 'xdotool key shift && e2e-ime ready'
+    wait_for "${E2E_IME_TIMEOUT:-30}" "IME connection" sh -c 'xdotool key shift && e2e-ime ready'
 else
-    wait_for 30 "IME connection" e2e-ime ready
+    wait_for "${E2E_IME_TIMEOUT:-30}" "IME connection" e2e-ime ready
 fi
 
 status ready
