@@ -7,13 +7,13 @@
 
 | 層 | 使っているもの | 備考 |
 |---|---|---|
-| 表示 | Xvfb (`:99`, 1600x1000x24) | IME と入力注入がやりやすい X11 を選んだ |
+| 表示 | X11: Xvfb (`:99`) / Wayland: sway の headless バックエンド(pixman で CPU 合成) | `E2E_DISPLAY=x11\|wayland` で切り替える(既定 x11)。画面は 1600x1000 |
 | 描画 | Mesa lavapipe + `ZED_ALLOW_EMULATED_GPU=1` | GPU なしで Zed の Vulkan 描画を動かす |
-| IME | fcitx5 + fcitx5-mozc(XIM 経由) | `fcitx5-remote -o` / `-c` で ON/OFF |
+| IME | fcitx5 + fcitx5-mozc | X11 は XIM、Wayland は text-input-v3 ⇔ input-method-v2 でつながる |
 | エディタ | Zed(`ZED_VERSION` で固定、既定 `v1.26.2`) | GitHub Releases の Linux 版 tarball |
 | LSP | `fifty_four_lsp`(debug ビルド) | `/usr/local/bin`。settings.json の `binary.path` で指定 |
 | 拡張 | `extension/` を wasm32-wasip2 でビルドし、`installed/fifty-four` に配置 | |
-| 入力・撮影 | xdotool / ImageMagick `import` | |
+| 入力・撮影 | `e2e-*` コマンド(下記) | 中身は X11 なら xdotool / ImageMagick、Wayland なら wtype / grim |
 | フォント | Noto CJK | 画面比較のため、テーマ・フォント・サイズを `docker/zed-settings.json` で固定 |
 
 ## ビルドと起動
@@ -26,25 +26,28 @@ docker build -f e2e/Dockerfile --build-arg ZED_VERSION=v1.25.3 -t fifty-four-e2e
 
 mkdir -p e2e/out
 docker run --rm -d --name ff-e2e -v "$PWD/e2e/out:/out" fifty-four-e2e:latest
+# Wayland で動かす
+docker run --rm -d --name ff-e2e -e E2E_DISPLAY=wayland -v "$PWD/e2e/out:/out" fifty-four-e2e:latest
 ```
 
-起動時に `entrypoint.sh` が、Xvfb → D-Bus → fcitx5 → Zed(`~/workspace/test.txt` を開く)の順で立ち上げる。
-ログは `/out/{xvfb,fcitx5,zed}.log` に出る。
+起動時に `entrypoint.sh` が、表示サーバ → D-Bus → fcitx5 → Zed(`~/workspace/test.txt` を開く)の順で立ち上げ、
+Zed のウィンドウが出て IME とつながるまで待ってから `e2e: ready` を出す。
+ログは `/out/{xvfb,sway,fcitx5,zed}.log` に出る。
 
 ## 手で動かす
 
 ```bash
-# スクリーンショット
-docker exec ff-e2e import -window root /out/screen.png
+# どちらの表示サーバでも同じコマンドで操作できる(e2e/docker/e2e-tools.sh)
+docker exec ff-e2e e2e-shot /out/screen.png        # スクリーンショット
 
 # IME を ON にして、ローマ字で入力・変換・確定
-docker exec ff-e2e fcitx5-remote -o
-docker exec ff-e2e xdotool type --delay 50 'nekodearu'
-docker exec ff-e2e xdotool key space Return
-docker exec ff-e2e fcitx5-remote -c
+docker exec ff-e2e e2e-ime on
+docker exec ff-e2e e2e-type 'nekodearu'
+docker exec ff-e2e e2e-key space Return            # キー名は X の keysym 名。修飾キーは ctrl+End のように書く
+docker exec ff-e2e e2e-ime off
 
 # 補完を明示的に呼ぶ
-docker exec ff-e2e xdotool key ctrl+space
+docker exec ff-e2e e2e-key ctrl+space
 ```
 
 ## 動作確認済みのこと(Zed v1.26.2)
@@ -53,15 +56,21 @@ docker exec ff-e2e xdotool key ctrl+space
   Docker 固有の機能には依存していない。
 - lavapipe で描画できる(Zed のログに `Selected GPU adapter: "llvmpipe …" (Vulkan)`)。日本語は Noto CJK で表示される。
 - `installed/fifty-four` に置いた拡張が読み込まれ、`.txt` が `FiftyFour` 言語になり、`binary.path` の LSP が起動する。
-- IME: `fcitx5-remote -o` → ローマ字 → Space で変換 → Return で確定、の流れでバッファに確定文字列が入る。
+- IME: ON → ローマ字 → Space で変換 → Return で確定、の流れでバッファに確定文字列が入る(X11・Wayland とも)。
 
 ## 調べてわかったこと
 
 - **信頼確認**: ワークスペースが未信頼だと Restricted Mode になり、**LSP が起動しない**。
   `session.trust_all_worktrees: true` で確認ダイアログを出さないようにしている。
-- **X11 の preedit はインライン表示されない**: XIM 経由では、変換中の文字は fcitx5 の小窓に出て、
-  Zed のバッファには確定時に初めて入る。つまり変換中は `didChange` が飛ばない。
-  Wayland(text-input-v3)ではインライン preedit になるはずなので、挙動を比べたくなったら Wayland 版も要る。
+- **変換中の文字(preedit)の出方が X11 と Wayland で違う**:
+  - X11(XIM): fcitx5 の小窓に出て、Zed のバッファには確定時に初めて入る。
+  - Wayland(text-input-v3): Zed のバッファ内に下線付きでインライン表示される。
+  - Wayland では変換候補の窓が出ない。Ubuntu 24.04 の sway 1.9 が input-method のポップアップに未対応のため。
+- **X11 では、Zed は最初のキー入力で初めて IME の入力コンテキストを作る**。それより前に打ったキーは IME を素通りする。
+  entrypoint は Shift を押して作らせ、fcitx5 の `DebugInfo` に `focus:1` の入力コンテキストが出るまで待つ。
+  Wayland では Zed の起動直後にできる。
+- **Wayland は Zed 自身の判断で選ばれる**: `WAYLAND_DISPLAY` があり `DISPLAY` がなければ Wayland で起動する。
+  sway は `xwayland disable` にしてあるので、誤って X11 で動くことはない。
 - **D-Bus のアドレスは固定**(`unix:path=/tmp/e2e-dbus`)。`docker exec` で入ったプロセスからも
   `fcitx5-remote` が効くようにするため。
 - fcitx5 の「en / あ」ポップアップは `docker/fcitx5-config` で消している(画面比較のノイズになる)。

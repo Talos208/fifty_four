@@ -53,15 +53,18 @@ RUN case "$TARGETARCH" in \
 
 # ---- 実行環境 -------------------------------------------------------------
 FROM ubuntu:24.04
-# - xvfb / x11-utils / xdotool / imagemagick: 仮想ディスプレイ・キー入力・スクリーンショット
+# - xvfb / x11-utils / xdotool / imagemagick: X11 の仮想ディスプレイ・キー入力・スクリーンショット
+# - sway / wtype / grim: Wayland の仮想ディスプレイ(headless)・キー入力・スクリーンショット。
+#   Zed の IME は text-input-v3 なので、それを input-method-v2 につなぐ wlroots 系のコンポジタが要る
 # - mesa-vulkan-drivers: lavapipe(CPU 実装の Vulkan)。Zed の描画に Vulkan が必須
-# - fcitx5 / fcitx5-mozc: 日本語 IME。Zed は X11 では XIM で IME とつながる
+# - fcitx5 / fcitx5-mozc: 日本語 IME。Zed とは X11 では XIM、Wayland では text-input-v3 でつながる
 # - fonts-noto-cjk: 画面比較のため、フォントはイメージで固定する
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         dbus \
         xvfb x11-utils x11-xserver-utils xdotool imagemagick \
+        sway wtype grim \
         libvulkan1 mesa-vulkan-drivers \
         libasound2t64 libxkbcommon-x11-0 libxcb1 libx11-xcb1 libfontconfig1 libwayland-client0 libgl1 \
         fcitx5 fcitx5-mozc fcitx5-frontend-gtk3 \
@@ -84,11 +87,17 @@ COPY --chown=e2e e2e/docker/zed-settings.json /home/e2e/.config/zed/settings.jso
 COPY --chown=e2e e2e/docker/fcitx5-profile /home/e2e/.config/fcitx5/profile
 COPY --chown=e2e e2e/docker/fcitx5-config /home/e2e/.config/fcitx5/config
 COPY --chown=e2e e2e/docker/workspace /home/e2e/workspace
+COPY --chown=e2e e2e/docker/sway-config.in /home/e2e/.config/sway/config.in
 COPY e2e/docker/entrypoint.sh /usr/local/bin/e2e-entrypoint
+COPY e2e/docker/e2e-tools.sh /usr/local/bin/e2e-tools
+RUN for c in e2e-key e2e-type e2e-shot e2e-ime e2e-window; do ln -s e2e-tools "/usr/local/bin/$c"; done
 
 USER e2e
 WORKDIR /home/e2e
-ENV DISPLAY=:99 \
+# E2E_DISPLAY: x11 | wayland(entrypoint.sh 参照)
+ENV E2E_DISPLAY=x11 \
+    DISPLAY=:99 \
+    XDG_RUNTIME_DIR=/tmp/e2e-runtime \
     DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/e2e-dbus \
     LANG=C.UTF-8 \
     LC_CTYPE=C.UTF-8 \
