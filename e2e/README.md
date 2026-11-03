@@ -49,6 +49,8 @@ docker exec ff-e2e xdotool key ctrl+space
 
 ## 動作確認済みのこと(Zed v1.26.2)
 
+- 本物の `fifty_four_lsp` を含む完全なイメージのビルドと実行を、WSL のコンテナ(`wslc`)で確認した。
+  Docker 固有の機能には依存していない。
 - lavapipe で描画できる(Zed のログに `Selected GPU adapter: "llvmpipe …" (Vulkan)`)。日本語は Noto CJK で表示される。
 - `installed/fifty-four` に置いた拡張が読み込まれ、`.txt` が `FiftyFour` 言語になり、`binary.path` の LSP が起動する。
 - IME: `fcitx5-remote -o` → ローマ字 → Space で変換 → Return で確定、の流れでバッファに確定文字列が入る。
@@ -68,6 +70,7 @@ docker exec ff-e2e xdotool key ctrl+space
 ## 既知の制約
 
 - ビルドには `Lindera.dev`(lindera の IPADIC 辞書の配布元)へのアクセスが要る。
+  これに届かない環境(Claude Code のクラウド環境など)では、LSP を偽物に差し替えた版でしか確かめられない。
 - `--acp`(debug ビルド限定、claude CLI 依存)は対象外。
 - LLM を使う機能は、今の settings では無効(`initialization_options` が空)。偽の LLM サーバを追加して決定的にする予定。
 - 待ち合わせの条件(LSP の span)と画面比較のハーネスは未実装。
