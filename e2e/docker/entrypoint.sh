@@ -29,12 +29,17 @@ on_exit() {
     local rc=$?
     [ "$rc" -eq 0 ] && return
     status "failed: $(tail -1 "$out/e2e.log")"
+    # Zed 本体が panic していれば、待ちのタイムアウトより根本の理由なので、状態にも書く
+    if zed_panicked; then
+        status "failed: Zed が panic した: $(grep -h -A1 panicked "$HOME/.local/share/zed/logs/Zed.log" | head -2 | tr '
+' ' ' | cut -c1-200)"
+    fi
     log "failed (exit $rc). collecting logs"
     cp "$HOME/.local/share/zed/logs/Zed.log" "$out/Zed.log" 2>/dev/null || true
     {
         echo "---- processes"
         ps -eo pid,stat,etime,args | grep -vE ' (ps|grep) ' || true
-        for f in xvfb.log sway.log fcitx5.log zed.log Zed.log; do
+        for f in xvfb.log sway.log fcitx5.log zed-cli.log Zed.log; do
             [ -s "$out/$f" ] || continue
             echo "---- $f (last 20 lines)"
             tail -20 "$out/$f"
@@ -47,12 +52,17 @@ on_exit() {
 }
 trap on_exit EXIT
 
+zed_died=0
+zed_panicked() { grep -q panicked "$HOME/.local/share/zed/logs/Zed.log" 2>/dev/null; }
 wait_for() { # wait_for <秒> <説明> <コマンド...>
     local timeout=$1 what=$2; shift 2
     for _ in $(seq 1 $((timeout * 10))); do
         "$@" >/dev/null 2>&1 && return 0
-        # Zed がもう起動しているなら、落ちていないかも見る(落ちていたら待つだけ無駄)
-        if [ -n "${zed_pid:-}" ] && ! kill -0 "$zed_pid" 2>/dev/null; then
+        # Zed がもう起動しているなら、落ちていないかも見る(落ちていたら待つだけ無駄)。
+        # CLI(zed --foreground)は、エディタ本体が panic したあとも残ることがあるので、pid だけでなく
+        # Zed 本体のログの panic 行も見る
+        if [ -n "${zed_pid:-}" ] && { ! kill -0 "$zed_pid" 2>/dev/null || zed_panicked; }; then
+            zed_died=1
             log "Zed exited while waiting for $what"
             return 1
         fi
@@ -107,20 +117,49 @@ if [ "$mode" = x11 ]; then
     wait_for "${E2E_FCITX5_TIMEOUT:-60}" "XIM server" sh -c 'xprop -root XIM_SERVERS | grep -q fcitx'
 fi
 
-# Zed は端末から切り離さず起動し、ログを残す
-step "Zed"
-zed --foreground "$HOME/workspace" "$HOME/workspace/test.txt" >"$out/zed.log" 2>&1 &
-zed_pid=$!
-echo "$zed_pid" >"$out/zed.pid"
-wait_for "${E2E_ZED_WINDOW_TIMEOUT:-60}" "Zed window" e2e-window
-step "IME connection"
-# X11(XIM)では、Zed は最初のキー入力で初めて IME の入力コンテキストを作る。
-# それまでに打ったキーは IME を素通りするので、無害な Shift を押して作らせてから待つ
-if [ "$mode" = x11 ]; then
-    wait_for "${E2E_IME_TIMEOUT:-30}" "IME connection" sh -c 'xdotool key shift && e2e-ime ready'
-else
-    wait_for "${E2E_IME_TIMEOUT:-30}" "IME connection" e2e-ime ready
-fi
+# Zed は端末から切り離さず起動し、ログを残す。
+# 起動の途中で Zed が落ちる(Wayland で wayland/client.rs の unwrap が panic する。イメージをビルドした直後の
+# 初回や、他のコンテナと同時に起動して負荷が高いときに出る。原因は未特定)ことがあるので、
+# 落ちたら E2E_ZED_START_ATTEMPTS 回まで起動し直す。起動し直した事実は /out/zed-attempts に残す
+# (試験 A07 が警告する。黙って直して不安定さを隠さない)。待ちのタイムアウトは起動し直さない(失敗にする)。
+bring_up_zed() {
+    step "Zed (attempt $attempt)"
+    zed --foreground "$HOME/workspace" "$HOME/workspace/test.txt" >"$out/zed-cli.log" 2>&1 &
+    zed_pid=$!
+    echo "$zed_pid" >"$out/zed.pid"
+    wait_for "${E2E_ZED_WINDOW_TIMEOUT:-60}" "Zed window" e2e-window || return 1
+    step "IME connection"
+    # X11(XIM)では、Zed は最初のキー入力で初めて IME の入力コンテキストを作る。
+    # それまでに打ったキーは IME を素通りするので、無害な Shift を押して作らせてから待つ
+    if [ "$mode" = x11 ]; then
+        wait_for "${E2E_IME_TIMEOUT:-30}" "IME connection" sh -c 'xdotool key shift && e2e-ime ready'
+    else
+        wait_for "${E2E_IME_TIMEOUT:-30}" "IME connection" e2e-ime ready
+    fi
+}
+
+attempt=1
+max_attempts=${E2E_ZED_START_ATTEMPTS:-3}
+until zed_died=0; bring_up_zed; do
+    if [ "$zed_died" != 1 ] || [ "$attempt" -ge "$max_attempts" ]; then
+        exit 1 # タイムアウト、または起動し直しの上限
+    fi
+    log "Zed exited during startup (attempt $attempt/$max_attempts). restarting"
+    # 残っているプロセス(CLI やエディタ本体)を止めてから、落ちた回のログを退避する
+    pkill -f 'zed-editor|zed --foreground' 2>/dev/null || true
+    sleep 1
+    # 止まらなかったものが残ると、次の起動が残った本体に引き継がれてしまう(Zed は単一インスタンス)ので、強制終了する
+    pkill -9 -f 'zed-editor|zed --foreground' 2>/dev/null || true
+    # panic したのが「Zed が keymap を受け取る前に Modifiers が届いた」ことによるもの(下記)なら、
+    # 起動し直しても同じ状態のまま落ち続けることがある。仮想キーボードを 1 回作って seat のキーボードを
+    # 作り直させてから起動し直す(効果は統計的にしか確かめられていない)
+    [ "$mode" = wayland ] && { e2e-key shift || true; sleep 1; }
+    cp "$out/zed-cli.log" "$out/zed-cli.attempt$attempt.log" 2>/dev/null || true
+    # 落ちた回の Zed.log は退避して、次の回のログに panic が混ざらないようにする(A04 が拾ってしまう)
+    mv "$HOME/.local/share/zed/logs/Zed.log" "$out/Zed.attempt$attempt.log" 2>/dev/null || true
+    attempt=$((attempt + 1))
+done
+echo "$attempt" >"$out/zed-attempts"
 
 status ready
 log "ready (E2E_DISPLAY=$mode, out=$out)"

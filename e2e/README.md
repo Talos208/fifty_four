@@ -3,6 +3,8 @@
 キー入力 → 画面変化の対応を確かめるための実行環境。まずはコンテナとして作り、
 同じイメージを microVM(krunvm / smolvm / Firecracker など)でも起動できるようにする方針。
 
+確かめたいこと(テスト項目)の一覧は [TEST-ITEMS.md](TEST-ITEMS.md)。
+
 ## 中身
 
 | 層 | 使っているもの | 備考 |
@@ -32,7 +34,42 @@ docker run --rm -d --name ff-e2e -e E2E_DISPLAY=wayland -v "$PWD/e2e/out:/out" f
 
 起動時に `entrypoint.sh` が、表示サーバ → D-Bus → fcitx5 → Zed(`~/workspace/test.txt` を開く)の順で立ち上げ、
 Zed のウィンドウが出て IME とつながるまで待ってから `e2e: ready` を出す。
-ログは `/out/{xvfb,sway,fcitx5,zed}.log` に出る。
+ログは `/out/{xvfb,sway,fcitx5,zed-cli}.log` に出る(Zed 本体のログは `/out/Zed.log`。Windows のフォルダでは大文字小文字が区別されず、`zed.log` と `Zed.log` が同じファイルになるので、名前を分けてある)。
+
+## テストの実行
+
+試験は Rust(`e2e/` の独立したクレート)で書き、**ホストからコンテナを `exec` で操作**する。
+ルートのワークスペースには入れていないので、`cargo test` がコンテナを要求することはない。
+
+```bash
+# リポジトリのルートから(.cargo/config.toml の alias。引数は試験の絞り込みになる)
+cargo e2e                          # 全表示サーバ(x11・wayland)で、全試験を実行
+cargo e2e A04                      # ID で絞る(使う表示サーバのコンテナだけ起動する)
+cargo e2e wayland                  # 表示サーバで絞る
+E2E_MODES=x11 cargo e2e            # 表示サーバを選ぶ
+E2E_PARALLEL=6 cargo e2e A06       # 6 本を同時に起動して、全部が通るか(TEST-ITEMS.md の A06)
+```
+
+先にイメージをビルドしておく(`docker build -f e2e/Dockerfile -t fifty-four-e2e:latest .`、wslc なら `wslc build`)。
+コンテナは表示サーバごとに 1 つ、最初に使う試験が起動して、全試験で共有する(終わると止める)。
+名前は `A04::x11` の形。
+
+| 環境変数 | 意味 |
+|---|---|
+| `E2E_RUNTIME` | 実行系(`wslc` / `docker`)。既定は wslc が動けば wslc |
+| `E2E_IMAGE` | イメージ(既定 `fifty-four-e2e:latest`) |
+| `E2E_OUT_ROOT` | 結果の置き場(既定 `e2e/out`)。実行ごとに `run-<時刻>-<pid>/<表示サーバ>/` を新しく作り、既存のものは消さない |
+| `E2E_MODES` | `x11,wayland` のうち実行するもの |
+| `E2E_START_TIMEOUT` | コンテナが ready になるまでの待ち(既定 180 秒) |
+| `E2E_STRICT_A07` | `1` なら、Zed を起動し直した(A07)ことを失敗にする(既定は警告) |
+| `E2E_*`(上記以外) | コンテナにそのまま渡す(`E2E_ZED_WINDOW_TIMEOUT` など。entrypoint の待ち時間) |
+
+結果(`e2e.log`・`e2e-status`・`Zed.log`・`*.png`)は結果の置き場に残る。
+コンテナは `run --rm` で起動し、試験が終われば(panic しても)止める。Ctrl-C で中断した場合は
+`e2e-run-…` という名前のコンテナが残ることがあるので、`kill` で止める。
+
+**kache を使っている環境で `cargo` が固まるとき**: `RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= CC_KNOWN_WRAPPER_CUSTOM=__none__ cargo e2e …`
+のように kache を迂回すると、ビルドできることがある(このクレートの依存は Rust のみで、C は要らない)。
 
 ## 手で動かす
 
@@ -73,6 +110,15 @@ docker exec ff-e2e e2e-key ctrl+space
   sway は `xwayland disable` にしてあるので、誤って X11 で動くことはない。
 - **起動順の競合(遅い環境で起きる)**: `fcitx5-remote` が答えても、XIM サーバや mozc はまだ読み込み中のことがある。Zed が先に XIM へ繋ぐと失敗したままになり、「IME connection」待ちでタイムアウトする。そのため entrypoint は fcitx5 の全アドオン(最後は mozc)と、X11 なら XIM サーバの登録、Wayland なら sway の出力(HEADLESS-1)を待ってから Zed を起動する。Wayland で sway の出力が確定する前に Zed が繋ぐと、Zed が `wayland/client.rs` で panic した例もある。待ち時間は `E2E_FCITX5_TIMEOUT`(60 秒)・`E2E_ZED_WINDOW_TIMEOUT`(60 秒)・`E2E_IME_TIMEOUT`(30 秒)で変えられる。
 - **debug ビルドの LSP は実行ファイルの隣に `db/` を作る**(FlightRecorder)。権限がないと起動時に panic し、Zed に「Failed to run fifty-four」と出る。`/usr/local/bin/db` を e2e ユーザー所有で作ってある。
+- **Wayland で Zed が起動直後に panic することがある(Zed の不具合と思われる。未解決)**:
+  `crates/gpui_linux/src/linux/wayland/client.rs:2124` の `state.keymap_state.as_mut().unwrap()`(v1.26.2、
+  `wl_keyboard::Event::Modifiers` の処理)。Zed が keymap を受け取る前に Modifiers が届くと落ちる。
+  sway の headless には物理キーボードが無く、seat のキーボードは fcitx5 の仮想キーボードなどに頼るため、
+  その順序が揺れるのが原因と見ている(確証は無い)。ホストが忙しいとき(イメージのビルド直後、他のコンテナと同時起動)に出やすく、
+  6 並列の起動で 36 回中 1 回〜18 回中 9 回ほど(時間帯でばらつく)。**同じコンテナで起動し直しても落ち続けることがある**。
+  entrypoint は落ちたら最大 `E2E_ZED_START_ATTEMPTS`(3)回まで起動し直し、回数を `/out/zed-attempts` に残す
+  (試験 A07 が WARN にする)。常駐の仮想キーボード(`wtype -`)を先に置く案は、有意な差が出なかったので採っていない。
+  X11 では起きない。
 - **D-Bus のアドレスは固定**(`unix:path=/tmp/e2e-dbus`)。`docker exec` で入ったプロセスからも
   `fcitx5-remote` が効くようにするため。
 - fcitx5 の「en / あ」ポップアップは `docker/fcitx5-config` で消している(画面比較のノイズになる)。
