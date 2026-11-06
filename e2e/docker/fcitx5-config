@@ -1,0 +1,4 @@
+# 入力メソッドを切り替えたときの「en」「あ」のポップアップを出さない(画面比較のノイズになる)
+[Behavior]
+ShowInputMethodInformation=False
+ShowInputMethodInformationWhenFocusIn=False
