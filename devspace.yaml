@@ -39,6 +39,13 @@ deployments:
       manifests:
         - shinasadame/k8s
 
+# ビルドのたびに devspace が新しいタグを付け、古いタグは手元の docker に積もる(skipPush のため)。
+# リポジトリごとに新しい 3 個だけ残して、古いタグを外す(使用中のイメージは消えない)。失敗してもビルドは止めない。
+# 手で試すとき: `(cd shinasadame && uv run python tools/prune_images.py --dry-run)`
+functions:
+  prune_images: |-
+    (cd shinasadame && uv run python tools/prune_images.py) || true
+
 # どのパイプラインも、ビルドの前に各社の最新モデル一覧(shinasadame/src/shinasadame/models.json)を更新する。
 # 24 時間以内に更新済みなら取得しない。失敗(uv が無い、通信できない、など)してもビルドは止めない。
 # 更新された差分は、確認してから自分でコミットする。
@@ -46,14 +53,17 @@ pipelines:
   build: |-
     (cd shinasadame && uv run python tools/update_models.py) || true
     build_images --all
+    prune_images
   deploy: |-
     (cd shinasadame && uv run python tools/update_models.py) || true
     build_images --all
     create_deployments --all
+    prune_images
   dev: |-
     (cd shinasadame && uv run python tools/update_models.py) || true
     build_images --all
     create_deployments --all
+    prune_images
     start_dev --all
 
 # `devspace dev` では、shinasadame の web コンテナへソースを同期して、uvicorn の自動再読み込みで反映する。
@@ -95,29 +105,35 @@ profiles:
         value: |-
           (cd shinasadame && uv run python tools/update_models.py) || true
           build_images shinasadame
+          prune_images
       - op: replace
         path: pipelines.deploy
         value: |-
           (cd shinasadame && uv run python tools/update_models.py) || true
           build_images shinasadame
           create_deployments --all
+          prune_images
       - op: replace
         path: pipelines.dev
         value: |-
           (cd shinasadame && uv run python tools/update_models.py) || true
           build_images shinasadame
           create_deployments --all
+          prune_images
           start_dev --all
   # shinasadame(Python)のイメージをビルドしない。shinasadame の dev(同期)も使わない
   - name: replay
     patches:
       - op: replace
         path: pipelines.build
-        value: build_images replay
+        value: |-
+          build_images replay
+          prune_images
       - op: replace
         path: pipelines.deploy
         value: |-
           build_images replay
           create_deployments --all
+          prune_images
       - op: remove
         path: dev.web
