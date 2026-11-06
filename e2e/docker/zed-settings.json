@@ -1,0 +1,25 @@
+// E2E 用の Zed 設定。画面比較のため、見た目に関わるものは固定する。
+{
+  "telemetry": { "diagnostics": false, "metrics": false },
+  "auto_update": false,
+  "show_whats_new": false,
+  "theme": { "mode": "light", "light": "One Light", "dark": "One Dark" },
+  "ui_font_family": "Noto Sans CJK JP",
+  "buffer_font_family": "Noto Sans Mono CJK JP",
+  "buffer_font_size": 18,
+  "ui_font_size": 16,
+  "cursor_blink": false,
+  "restore_on_startup": "none",
+  // 信頼確認のダイアログが出ると LSP が起動しない(Restricted Mode)
+  "session": { "restore_unsaved_buffers": false, "trust_all_worktrees": true },
+  "auto_install_extensions": { "html": false },
+  "lsp": {
+    "fifty-four": {
+      "binary": {
+        "path": "/usr/local/bin/fifty_four_lsp",
+        "env": { "RUST_LOG": "fifty_four_lsp=debug" }
+      },
+      "initialization_options": {}
+    }
+  }
+}
