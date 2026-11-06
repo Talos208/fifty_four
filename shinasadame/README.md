@@ -194,4 +194,8 @@ devspace dev -p web         # shinasadame のソースをコンテナへ同期�
 - `devspace dev` の同期先は web コンテナだけ。同じ Pod の worker コンテナ(Huey)には同期しないので、`tasks.py` などを変えたら `devspace deploy -p web`。replay(Rust)は同期せず、変えたら `devspace deploy -p replay`。
 - API キーは OpenBao から CSI で取得する。Driver と Provider は DevSpace の管理外(`docs/openbao-csi/README.md`)。
 - モデル一覧(`models.json`)の更新は、`devspace build` / `deploy` / `dev` の前に自動で回る(`devspace.yaml` の `pipelines`)。
+- **古いイメージのタグは、ビルドのあとに自動で外す**(`devspace.yaml` の `functions.prune_images` → `tools/prune_images.py`)。
+  タグはビルドごとに増え、`skipPush` なので手元の docker に積もる(Rust のイメージは 1 つ 150〜200MB)。
+  `fifty-four-replay` と `shinasadame` のそれぞれで、新しい 3 個のイメージだけ残す(使用中のものは、古くても消えない)。
+  残す数は `--keep N`、確認だけなら `(cd shinasadame && uv run python tools/prune_images.py --dry-run)`。失敗してもビルドは止まらない。
 - 設定の確認: `devspace print -p web`(プロファイル適用後の設定)、`devspace render -p web`(置換後のマニフェストの表示。`image:` が新しいタグになっていること)。
