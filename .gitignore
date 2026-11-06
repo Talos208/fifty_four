@@ -36,3 +36,6 @@ docs/plans/
 
 # DevSpace のローカルのキャッシュ(ビルドしたイメージのタグなど)
 .devspace/
+
+# E2E の実行結果(cargo e2e)
+e2e/out/

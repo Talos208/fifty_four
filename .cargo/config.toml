@@ -1,2 +1,4 @@
 [alias]
 prepare = "run -p prepare --"
+# E2E(e2e/ は独立したクレート)。`cargo e2e A04`・`cargo e2e wayland` のように、引数は試験の絞り込みになる
+e2e = "test --manifest-path e2e/Cargo.toml --tests --"
