@@ -1,0 +1,26 @@
+# E2E(Zed + IME + fifty_four_lsp をコンテナで動かし、ホストから操作して確かめる)。
+# ルートのワークスペースには入れない(`cargo test` がコンテナを要求しないように、独立した [workspace] にする)。
+[package]
+name = "fifty_four_e2e"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+# スクリーンショットの判定用。PNG だけ読めればよい
+image = { version = "0.25", default-features = false, features = ["png"] }
+libtest-mimic = "0.8"
+
+# 画像のデコードが遅いと待ち合わせが伸びるので、dev でも最適化する
+[profile.dev]
+opt-level = 2
+
+[[test]]
+name = "a_startup"
+harness = false
+
+[[test]]
+name = "e_harness"
+harness = false

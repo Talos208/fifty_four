@@ -1,7 +1,22 @@
 # replay サービス(fifty_four_lsp --replay)用のイメージ。
 # ビルドコンテキストはリポジトリルート:
 #   docker build -f lsp/Dockerfile.replay -t fifty-four-replay:latest .
-FROM rust:1-bookworm AS build
+#
+# ビルド段は ubuntu:24.04 + rustup。公式の rust:1-bookworm イメージは Debian 12 が元で、既知の CVE が多いため使わない。
+# 最終段は distroless(シェルもパッケージマネージャも無い。入っているのは glibc・libgcc・CA 証明書・tzdata だけ)。
+# FROM ubuntu:24.04 AS build
+FROM rust:1-slim AS build
+# 依存の C コード(rusqlite の bundled、aws-lc-sys など)と、openssl-sys のビルドに要るもの
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates cmake curl git libssl-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain stable
+# reqwest(native-tls)が openssl-sys を引く。最終段の distroless には libssl が無いので、OpenSSL を静的にリンクする
+# (libssl-dev に libssl.a / libcrypto.a が入っている)
+ENV OPENSSL_STATIC=1
 WORKDIR /src
 
 # 依存だけ先にビルドしてレイヤーキャッシュを効かせる。
@@ -24,15 +39,14 @@ COPY data ./data
 # 依存のダミービルドより新しいと判定されるよう、ソースの更新時刻を進める
 RUN touch lsp/src/main.rs \
     && cargo build --locked --release -p fifty_four_lsp --features replay
+# 最終段に持ち込めない共有ライブラリが残っていないか確かめる(libssl が動的リンクのままだと、distroless で起動時に落ちる)
+RUN ldd target/release/fifty_four_lsp \
+    && ! ldd target/release/fifty_four_lsp | grep -E 'libssl|libcrypto|not found'
 
-FROM debian:bookworm-slim
-# 各 provider へ HTTPS で接続するために CA 証明書が要る
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --uid 10001 --no-create-home replay
+# 各 provider へ HTTPS で接続するための CA 証明書は、distroless に入っている。
+# nonroot は UID 65532(k8s の runAsNonRoot は数値の UID なので、そのまま満たす)
+FROM gcr.io/distroless/cc-debian13:nonroot
 COPY --from=build /src/target/release/fifty_four_lsp /usr/local/bin/fifty_four_lsp
-USER 10001
 ENV REPLAY_LISTEN=0.0.0.0:8080
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/fifty_four_lsp", "--replay"]

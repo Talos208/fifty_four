@@ -1,0 +1,9 @@
+# E2E 用の sway 設定。entrypoint.sh が @SIZE@ を画面サイズに置き換えて使う。
+# 背景は紺色にしてある。撮った画面が紺一色なら「Zed の窓が出ていない」、真っ黒なら「撮影か合成の問題」と切り分けられる。
+output HEADLESS-1 resolution @SIZE@ scale 1 bg #203050 solid_color
+xwayland disable
+default_border none
+default_floating_border none
+focus_follows_mouse no
+# キーボード配列は us に固定する(wtype が送るキーの解釈を一定にする)
+input * xkb_layout us
