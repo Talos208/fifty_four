@@ -15,6 +15,8 @@ mod character;
 mod character_ast;
 mod character_updater;
 mod chat_context;
+#[cfg(debug_assertions)]
+mod claude_models;
 mod code_action;
 mod cursor_context;
 mod flight_recorder;

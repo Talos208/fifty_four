@@ -113,11 +113,11 @@ mod tests {
     fn test_append_then_read_roundtrip_preserves_order() {
         let _tmp = fresh_root("roundtrip");
         let root = _tmp.path();
-        append_turn(&root, "s1", &turn(Speaker::Author, "1ターン目")).unwrap();
-        append_turn(&root, "s1", &turn(Speaker::Agent, "応答1")).unwrap();
-        append_turn(&root, "s1", &turn(Speaker::Author, "2ターン目")).unwrap();
+        append_turn(root, "s1", &turn(Speaker::Author, "1ターン目")).unwrap();
+        append_turn(root, "s1", &turn(Speaker::Agent, "応答1")).unwrap();
+        append_turn(root, "s1", &turn(Speaker::Author, "2ターン目")).unwrap();
 
-        let got = read_turns(&root, "s1");
+        let got = read_turns(root, "s1");
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].speaker, Speaker::Author);
         assert_eq!(got[0].text, "1ターン目");
@@ -130,14 +130,14 @@ mod tests {
     fn test_read_missing_file_returns_empty() {
         let _tmp = fresh_root("missing");
         let root = _tmp.path();
-        assert!(read_turns(&root, "no-such-session").is_empty());
+        assert!(read_turns(root, "no-such-session").is_empty());
     }
 
     #[test]
     fn test_read_skips_corrupted_line_but_keeps_others() {
         let _tmp = fresh_root("corrupted");
         let root = _tmp.path();
-        append_turn(&root, "s1", &turn(Speaker::Author, "壊れていない発話1")).unwrap();
+        append_turn(root, "s1", &turn(Speaker::Author, "壊れていない発話1")).unwrap();
 
         // 壊れた1行(有効なgzipメンバーだが中身がJSONとして不正)を手動で追記する。
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -145,13 +145,13 @@ mod tests {
         let member = encoder.finish().unwrap();
         let mut file = OpenOptions::new()
             .append(true)
-            .open(log_path(&root, "s1"))
+            .open(log_path(root, "s1"))
             .unwrap();
         file.write_all(&member).unwrap();
 
-        append_turn(&root, "s1", &turn(Speaker::Agent, "壊れていない発話2")).unwrap();
+        append_turn(root, "s1", &turn(Speaker::Agent, "壊れていない発話2")).unwrap();
 
-        let got = read_turns(&root, "s1");
+        let got = read_turns(root, "s1");
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].text, "壊れていない発話1");
         assert_eq!(got[1].text, "壊れていない発話2");
@@ -171,9 +171,9 @@ mod tests {
         let root = _tmp.path();
         let long_text = "同じ話題について長めに話す。".repeat(50);
         for _ in 0..5 {
-            append_turn(&root, "s1", &turn(Speaker::Author, &long_text)).unwrap();
+            append_turn(root, "s1", &turn(Speaker::Author, &long_text)).unwrap();
         }
-        let compressed_len = std::fs::metadata(log_path(&root, "s1")).unwrap().len() as usize;
+        let compressed_len = std::fs::metadata(log_path(root, "s1")).unwrap().len() as usize;
         let plain_len = long_text.len() * 5;
         assert!(
             compressed_len < plain_len,
@@ -181,6 +181,6 @@ mod tests {
             compressed_len,
             plain_len
         );
-        assert_eq!(read_turns(&root, "s1").len(), 5);
+        assert_eq!(read_turns(root, "s1").len(), 5);
     }
 }

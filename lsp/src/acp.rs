@@ -9,7 +9,7 @@
 //! `scrub_anthropic_credentials` により資格情報混線を防いでいる)の詳細は
 //! `docs/acp-agent.md` 参照。
 
-use crate::acp_config::{self, SessionConfig};
+use crate::acp_config::{self, ModelCatalog, SessionConfig};
 use crate::writing_agent::{AgentError, ClaudeAgent, WritingAgent};
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthMethodTerminal, AuthenticateRequest,
@@ -108,9 +108,47 @@ struct AgentState {
     /// 組み立てに失敗した場合は `None` のままにし、[`update_digest`] が
     /// `LlmError::NotInitialized` で警告を出して終わる(要約が出ないだけで会話は成立する)。
     digest_llm: tokio::sync::Mutex<Option<Box<dyn crate::llm::LlmInterface>>>,
+    /// モデルセレクタの選択肢。最初の `session/new`/`session/load` で `claude` CLI に
+    /// 1度だけ問い合わせ、プロセスが終わるまで使い回す([`AgentState::model_catalog`])。
+    models: tokio::sync::OnceCell<Arc<ModelCatalog>>,
 }
 
 impl AgentState {
+    /// モデルの選択肢を返す。初回だけ `cwd` で `claude` CLI に問い合わせる。
+    ///
+    /// 取得に失敗したときは静的な一覧を返し、それもキャッシュする(失敗を繰り返すと
+    /// `session/new` のたびに最大で [`crate::claude_models`] のタイムアウト分待たされるため)。
+    /// 一覧が古いと感じたら、エージェントを起動し直せば取り直される。
+    #[instrument(skip(self))]
+    async fn model_catalog(&self, cwd: &std::path::Path) -> Arc<ModelCatalog> {
+        self.models
+            .get_or_init(|| async {
+                let catalog = match crate::claude_models::fetch(cwd).await {
+                    Ok(models) => ModelCatalog::from_cli(models),
+                    Err(e) => {
+                        warn!(
+                            "acp: claude CLI からモデル一覧を取れないため、静的な一覧を使います: {}",
+                            e
+                        );
+                        ModelCatalog::fallback()
+                    }
+                };
+                Arc::new(catalog)
+            })
+            .await
+            .clone()
+    }
+
+    /// 取得済みのモデルの選択肢を返す。まだ無ければ(セッションより先に設定変更が
+    /// 来るという、通常は起きない順序のとき)静的な一覧を返す。
+    #[instrument(skip(self))]
+    fn cached_model_catalog(&self) -> Arc<ModelCatalog> {
+        self.models
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(ModelCatalog::fallback()))
+    }
+
     /// 新しいセッションIDを採番する。UUID v4形式にする必要がある
     /// (`claude` CLI の `--session-id`/`--resume` がUUIDを要求するため)。
     /// このIDをそのまま ACP の `SessionId` として使い回すので、`session/load` が
@@ -193,6 +231,7 @@ pub(crate) async fn run() -> Result<(), String> {
         digest_llm: tokio::sync::Mutex::new(Some(
             crate::llm::build_client_async(&digest_llm_config(), "system_chat_digest.md").await,
         )),
+        models: tokio::sync::OnceCell::new(),
     });
 
     info!("start acp agent");
@@ -255,11 +294,14 @@ pub(crate) async fn run() -> Result<(), String> {
                     .pending
                     .clone()
                     .unwrap_or_else(|| session.config.clone());
-                if let Err(e) = acp_config::apply(&mut next, req.config_id.0.as_ref(), &req.value) {
+                let models = config_state.cached_model_catalog();
+                if let Err(e) =
+                    acp_config::apply(&mut next, req.config_id.0.as_ref(), &req.value, &models)
+                {
                     warn!("acp session/set_config_option: {}", e);
                     return responder.respond_with_internal_error(e);
                 }
-                let options = acp_config::to_config_options(&next);
+                let options = acp_config::to_config_options(&next, &models);
                 session.pending = Some(next);
                 responder.respond(SetSessionConfigOptionResponse::new(options))
             },
@@ -284,8 +326,12 @@ pub(crate) async fn run() -> Result<(), String> {
                     Err(e) => return responder.respond_with_internal_error(e),
                 };
                 let config = SessionConfig::default();
-                let agent = match ClaudeAgent::start(&req.cwd, prompt, &id.0, false, &config).await
-                {
+                // モデル一覧の問い合わせは別プロセスなので、本体の起動と並行させて待ち時間を重ねる。
+                let (started, models) = tokio::join!(
+                    ClaudeAgent::start(&req.cwd, prompt, &id.0, false, &config),
+                    new_session.model_catalog(&req.cwd),
+                );
+                let agent = match started {
                     Ok(a) => Arc::new(a) as Arc<dyn WritingAgent>,
                     Err(e) => {
                         error!("failed to start writing agent: {}", e);
@@ -296,7 +342,7 @@ pub(crate) async fn run() -> Result<(), String> {
                     }
                 };
 
-                let config_options = acp_config::to_config_options(&config);
+                let config_options = acp_config::to_config_options(&config, &models);
                 new_session.sessions.lock().await.insert(
                     id.clone(),
                     Session {
@@ -336,19 +382,20 @@ pub(crate) async fn run() -> Result<(), String> {
                 // 設定はプロセスのメモリ上にしか無いため、再開時は既定へ戻る
                 // (docs/acp-agent.md の「セッションの再開」参照)。
                 let config = SessionConfig::default();
-                let agent =
-                    match ClaudeAgent::start(&req.cwd, prompt, &req.session_id.0, true, &config)
-                        .await
-                    {
-                        Ok(a) => Arc::new(a) as Arc<dyn WritingAgent>,
-                        Err(e) => {
-                            error!("failed to resume writing agent: {}", e);
-                            return responder.respond_with_internal_error(format!(
-                                "セッションを再開できません: {}",
-                                e
-                            ));
-                        }
-                    };
+                let (started, models) = tokio::join!(
+                    ClaudeAgent::start(&req.cwd, prompt, &req.session_id.0, true, &config),
+                    load_session.model_catalog(&req.cwd),
+                );
+                let agent = match started {
+                    Ok(a) => Arc::new(a) as Arc<dyn WritingAgent>,
+                    Err(e) => {
+                        error!("failed to resume writing agent: {}", e);
+                        return responder.respond_with_internal_error(format!(
+                            "セッションを再開できません: {}",
+                            e
+                        ));
+                    }
+                };
 
                 // session_log へ逐次追記してきた過去ターンを読み戻す。無ければ
                 // (初回・旧セッション・削除済み)空のまま従来通りに始める。
@@ -421,7 +468,7 @@ pub(crate) async fn run() -> Result<(), String> {
                     }
                 }
 
-                let config_options = acp_config::to_config_options(&config);
+                let config_options = acp_config::to_config_options(&config, &models);
                 load_session.sessions.lock().await.insert(
                     req.session_id.clone(),
                     Session {

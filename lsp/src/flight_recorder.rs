@@ -239,13 +239,13 @@ impl FlightRecorder {
     /// `max_tokens` の見積もりが妥当かを後から検証するため
     /// (`length(response)` が上限に張り付いていないかを見る)。
     pub(crate) fn record_code_action_response(&self, code_action_id: i64, response: &str) {
-        if let Some(db) = self.conn.try_lock_for(std::time::Duration::from_secs(1)) {
-            if let Err(e) = db.execute(
+        if let Some(db) = self.conn.try_lock_for(std::time::Duration::from_secs(1))
+            && let Err(e) = db.execute(
                 "UPDATE code_actions SET response = ? WHERE id = ?;",
                 rusqlite::params![response, code_action_id],
-            ) {
-                debug!("record_code_action_response failed: {}", e);
-            }
+            )
+        {
+            debug!("record_code_action_response failed: {}", e);
         }
     }
 
@@ -257,17 +257,17 @@ impl FlightRecorder {
         candidate: &str,
         confidence: Option<f64>,
     ) {
-        if let Some(db) = self.conn.try_lock_for(std::time::Duration::from_secs(1)) {
-            if let Err(e) = db.execute(
+        if let Some(db) = self.conn.try_lock_for(std::time::Duration::from_secs(1))
+            && let Err(e) = db.execute(
                 indoc!(
                     "INSERT INTO code_action_candidates
                     (code_action_id, rank, candidate, confidence)
                     VALUES (?,?,?,?);"
                 ),
                 rusqlite::params![code_action_id, rank as i64, candidate, confidence],
-            ) {
-                debug!("record_code_action_candidate failed: {}", e);
-            }
+            )
+        {
+            debug!("record_code_action_candidate failed: {}", e);
         }
     }
 
@@ -339,13 +339,13 @@ impl FlightRecorder {
 
     /// quality_reviews.response へ LLM の生応答(パース前)を書き込む。
     pub(crate) fn record_quality_review_response(&self, review_id: i64, response: &str) {
-        if let Some(db) = self.conn.try_lock_for(std::time::Duration::from_secs(1)) {
-            if let Err(e) = db.execute(
+        if let Some(db) = self.conn.try_lock_for(std::time::Duration::from_secs(1))
+            && let Err(e) = db.execute(
                 "UPDATE quality_reviews SET response = ? WHERE id = ?;",
                 rusqlite::params![response, review_id],
-            ) {
-                debug!("record_quality_review_response failed: {}", e);
-            }
+            )
+        {
+            debug!("record_quality_review_response failed: {}", e);
         }
     }
 
@@ -391,11 +391,8 @@ mod tests {
     use super::*;
 
     fn temp_db(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "fifty_four_fr_test_{}_{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("fifty_four_fr_test_{}_{}", tag, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test.db");
         let _ = std::fs::remove_file(&path);

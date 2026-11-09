@@ -151,7 +151,7 @@ pub(crate) fn progress_hint(chars_before_cursor: usize, average_chars: usize) ->
     if percent < 100 {
         format!("章のおよそ{percent}%あたりを執筆している。プロットを参照するとき参考にせよ。")
     } else {
-        format!("章の終盤を執筆している。プロットを参照するとき参考にせよ。")
+        "章の終盤を執筆している。プロットを参照するとき参考にせよ。".to_string()
     }
 }
 

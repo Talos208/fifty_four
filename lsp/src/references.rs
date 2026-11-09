@@ -97,7 +97,7 @@ mod tests {
         std::fs::create_dir_all(root.join("memo")).unwrap();
         std::fs::write(root.join("memo").join("nested.txt"), "").unwrap();
 
-        let mut files: Vec<String> = discover_reference_files(&root)
+        let mut files: Vec<String> = discover_reference_files(root)
             .into_iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();

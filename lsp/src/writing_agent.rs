@@ -189,8 +189,13 @@ impl ClaudeAgent {
         if let Some(model) = &config.model {
             options.model = Some(model.clone());
         }
-        if let Some(tokens) = config.thinking_tokens {
-            options.max_thinking_tokens = Some(tokens);
+        // effort は環境変数で渡す(`--effort` は SDK の `extra_args` 許可リストに無く、
+        // `--max-thinking-tokens` は CLI の effort に反映されない。`crate::acp_config` 参照)。
+        if let Some(effort) = &config.effort {
+            options.env.insert(
+                crate::acp_config::EFFORT_ENV_VAR.to_string(),
+                effort.clone(),
+            );
         }
 
         let cli_path = resolve_cli_path();
@@ -292,7 +297,7 @@ fn tool_names() -> Vec<anthropic_agent_sdk::ToolName> {
 /// インストール先を明示的にチェックする。どちらも失敗したら `None` を返し、
 /// SDK自身の探索(従来通りの挙動)に委ねる — 新たな失敗モードを増やさない。
 #[instrument]
-fn resolve_cli_path() -> Option<PathBuf> {
+pub(crate) fn resolve_cli_path() -> Option<PathBuf> {
     if let Ok(path) = which::which("claude") {
         return Some(path);
     }
@@ -321,7 +326,7 @@ fn windows_npm_fallback() -> Option<PathBuf> {
 /// 「Windows での注意」参照。起動を試みる前に検出し、分かりやすい理由で早期に失敗させる。
 #[cfg(windows)]
 #[instrument]
-fn unsupported_cli_reason(path: &Path) -> Option<AgentError> {
+pub(crate) fn unsupported_cli_reason(path: &Path) -> Option<AgentError> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     if ext != "cmd" && ext != "bat" {
         return None;
@@ -340,7 +345,7 @@ fn unsupported_cli_reason(path: &Path) -> Option<AgentError> {
 }
 
 #[cfg(not(windows))]
-fn unsupported_cli_reason(_path: &Path) -> Option<AgentError> {
+pub(crate) fn unsupported_cli_reason(_path: &Path) -> Option<AgentError> {
     None
 }
 
@@ -568,7 +573,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("npm")).unwrap();
         std::fs::write(dir.join("npm").join("claude.cmd"), "@echo off\n").unwrap();
 
-        let _env = EnvGuard::set("APPDATA", &*dir);
+        let _env = EnvGuard::set("APPDATA", dir);
 
         let found = windows_npm_fallback();
 
@@ -586,7 +591,7 @@ mod tests {
         let dir = _tmp.path();
         // `npm/claude.cmd` を作らない。
 
-        let _env = EnvGuard::set("APPDATA", &*dir);
+        let _env = EnvGuard::set("APPDATA", dir);
 
         let found = windows_npm_fallback();
 

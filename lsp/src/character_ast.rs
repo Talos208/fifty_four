@@ -54,10 +54,10 @@ fn find_char_heading<'a>(root: &'a AstNode<'a>, char_name: &str) -> Option<(&'a 
 fn next_heading_at_or_above<'a>(start: &'a AstNode<'a>, max_level: u8) -> Option<&'a AstNode<'a>> {
     let mut cur = start.next_sibling();
     while let Some(n) = cur {
-        if let Some(lv) = heading_level(n) {
-            if lv <= max_level {
-                return Some(n);
-            }
+        if let Some(lv) = heading_level(n)
+            && lv <= max_level
+        {
+            return Some(n);
         }
         cur = n.next_sibling();
     }
@@ -74,10 +74,10 @@ fn siblings_between<'a>(
     let mut out = Vec::new();
     let mut cur = start.next_sibling();
     while let Some(n) = cur {
-        if let Some(e) = end {
-            if std::ptr::eq(n, e) {
-                break;
-            }
+        if let Some(e) = end
+            && std::ptr::eq(n, e)
+        {
+            break;
         }
         out.push(n);
         cur = n.next_sibling();

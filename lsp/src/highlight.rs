@@ -290,7 +290,8 @@ impl Highlighter {
     #[instrument(skip(self), ret)]
     pub fn text_to_lindera_token(&self, text: &str) -> Vec<CachedLinderaToken> {
         let tokenizer = self.tokenizer().read();
-        let tmp2 = tokenizer
+
+        tokenizer
             .tokenize(text)
             .expect("failed to tokenize text")
             .into_iter()
@@ -312,8 +313,7 @@ impl Highlighter {
                     meaning: TokenMeaning::Normal,
                 })
             })
-            .collect();
-        tmp2
+            .collect()
     }
 
     #[instrument(ret)]
@@ -324,7 +324,7 @@ impl Highlighter {
     ) -> TokenStatus {
         let surface = car.details[6].as_str();
         if is_kanji_all(surface) {
-            let mut next_base = base.iter().map(|i| i.clone()).collect::<Vec<_>>();
+            let mut next_base = base.to_vec();
             next_base.push(car);
             TokenStatus::RubyBaseKanji(next_base)
         } else if surface == "｜" {
@@ -355,7 +355,7 @@ impl Highlighter {
         if surface == "《" {
             TokenStatus::Ruby(base.to_vec(), vec![car.meaning(TokenMeaning::RubyBracket)])
         } else {
-            let mut next_base = base.iter().map(|i| i.clone()).collect::<Vec<_>>();
+            let mut next_base = base.to_vec();
             next_base.push(car);
             TokenStatus::RubyBaseBracket(next_base)
         }
@@ -424,8 +424,7 @@ impl Highlighter {
                         }
                         _ => {
                             // TODO: 括弧内のルビの処理
-                            let mut next_inner =
-                                inner.iter().map(|i| i.clone()).collect::<Vec<_>>();
+                            let mut next_inner = inner.to_vec();
                             next_inner.push(car.meaning(TokenMeaning::InnerBracket));
                             TokenStatus::InBracket(brkt, next_inner)
                         }
@@ -452,13 +451,13 @@ impl Highlighter {
 
                         let mut iter = ruby.iter();
                         results.push(iter.next().unwrap().meaning(TokenMeaning::RubyBracket));
-                        while let Some(tkn) = iter.next() {
+                        for tkn in iter {
                             results.push(tkn.meaning(TokenMeaning::Ruby));
                         }
                         results.push(car.meaning(TokenMeaning::RubyBracket));
                         TokenStatus::Normal
                     } else {
-                        let mut next_ruby = ruby.iter().map(|i| i.clone()).collect::<Vec<_>>();
+                        let mut next_ruby = ruby.to_vec();
                         next_ruby.push(car);
                         TokenStatus::Ruby(base, next_ruby)
                     }
