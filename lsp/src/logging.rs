@@ -169,7 +169,7 @@ fn network_target() -> Option<String> {
                             std::net::ToSocketAddrs::to_socket_addrs(authority.as_str())
                         {
                             for addr in addrs {
-                                let ip = std::net::SocketAddr::from(addr);
+                                let ip = addr;
                                 if let Ok(conn) = std::net::TcpStream::connect_timeout(
                                     &ip,
                                     Duration::from_secs(5),

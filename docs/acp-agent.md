@@ -419,7 +419,7 @@ Agent Panel にモデルと思考レベル(effort)のセレクタが出る。中
 `session/load` のレスポンスに載せている(`lsp/src/acp_config.rs`)。
 
 **選択の反映は次のターンの頭から。** `anthropic-agent-sdk` はセッション途中の
-モデル/thinking切替を非対応(`set_model()` はローカルに保存するだけで `claude` CLI
+モデル/effort切替を非対応(`set_model()` はローカルに保存するだけで `claude` CLI
 へは届かない)なので、`session/set_config_option` では設定を保留するだけに留め、
 次に `session/prompt` を受けたタイミングで同じセッションID(UUID)を使って
 `--resume` し、`claude` プロセスを起こし直している(「セッションの再開」節と
@@ -431,14 +431,35 @@ Agent Panel にモデルと思考レベル(effort)のセレクタが出る。中
 IDの会話記録がまだ無いため、無条件に `--resume` すると「No conversation found」
 で失敗する。
 
-モデル候補は `default`(既定・CLI任せ)/ `opus` / `sonnet` / `haiku` / `fable` の
-エイリアスに加え、`anthropic-agent-sdk` の `supported_models()` が返す
-バージョン固定IDを並べている。エイリアスは `claude` CLI 側で常に最新の
-バージョンへ解決されるため、`supported_models()` の静的リストが古くなっても
-実用上は困らない。
+モデル候補は `claude` CLI 自身に問い合わせて決める(`lsp/src/claude_models.rs`)。
+最初の `session/new`/`session/load` のときに、本体とは別の短命な `claude` プロセスを
+`-p --input-format stream-json --output-format stream-json --no-session-persistence`
+で起こし、`initialize` の control request を1行送って、応答の `models` を読む
+(TS 版 Agent SDK の `supportedModels()` と同じ情報源。プロンプトは送らないので
+課金は発生しない。所要時間は1秒程度で、本体の起動と並行させている)。
+結果はエージェントのプロセスが終わるまで使い回すので、CLI を更新して新しい
+モデルが増えたときは、Zed からエージェントを起動し直すと一覧に反映される。
 
-思考レベルは `off` / `low` / `medium` / `high` / `max` の5段階(既定=CLI任せを含め6つ)
-で、`--max-thinking-tokens` の値へ写す。
+`anthropic-agent-sdk` の `supported_models()` を使わないのは、SDK に埋め込まれた
+静的リストで、SDK のリリースが 0.2.75(2025-12)で止まっているため。CLI の一覧なら
+`claude-fable-5-1[1m]` のような1Mコンテキスト版や、表示名・説明(料金)も揃って出る。
+
+CLI から一覧を取れなかった場合(CLI が古い・起動できない・15秒以内に応答が無い)は、
+警告をログに出したうえで、従来の静的な一覧(`default` / `opus` / `sonnet` / `haiku` /
+`fable` のエイリアスと `supported_models()` のバージョン固定ID)に戻る。
+
+思考レベル(effort)の選択肢は、いま選んでいるモデルについて CLI が返す
+`supportedEffortLevels`(claude 2.1.300 ではどのモデルも `low` / `medium` / `high` /
+`xhigh` / `max`)に「既定(CLI 任せ)」を足したもの。`supportsEffort: false` のモデルでは
+既定しか出ない。モデルを変えて、今の effort がそのモデルで使えなくなった場合は
+既定へ戻す。CLI から一覧を取れなかったときは、どのモデルにも上の5段階を出す。
+CLI が `supportsThinkingOff: false` を返すため、「考えない」(思考オフ)の選択肢は無い。
+
+選んだ effort は、`claude` プロセスの環境変数 `CLAUDE_CODE_EFFORT_LEVEL` で渡す。
+`--effort` フラグは `anthropic-agent-sdk` が `extra_args` に許可していないため渡せない。
+以前は `--max-thinking-tokens` に写していたが、この値を変えても CLI 側の effort は
+変わらなかった(claude 2.1.300 で `get_settings` の `applied.effort` を見て確認した。
+環境変数・`--effort`・settings の `effortLevel` はいずれも反映される)。そのため使うのをやめた。
 
 ### サブスク枠の残量メーター
 

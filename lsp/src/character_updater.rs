@@ -1494,24 +1494,24 @@ async fn apply_ops_to_file(
 
     let any_write = outcomes.iter().any(|o| o.wrote);
     if any_write {
-        if let Some(parent) = file.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                error!(
-                    "character_updater: failed to create characters directory {:?}: {}",
-                    parent, e
+        if let Some(parent) = file.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            error!(
+                "character_updater: failed to create characters directory {:?}: {}",
+                parent, e
+            );
+            for o in &outcomes {
+                record_all(
+                    recorder,
+                    update_id,
+                    &o.records,
+                    o.old.as_deref(),
+                    false,
+                    Some("failed to create characters directory"),
                 );
-                for o in &outcomes {
-                    record_all(
-                        recorder,
-                        update_id,
-                        &o.records,
-                        o.old.as_deref(),
-                        false,
-                        Some("failed to create characters directory"),
-                    );
-                }
-                return;
             }
+            return;
         }
         // character_store.write がメモリ更新(＋自己書き込みハッシュの記録)とディスクdumpを
         // まとめて行う(メモリがSSoT、ディスクはload/dump先でしかないという設計の帰結)。
@@ -2354,7 +2354,7 @@ mod tests {
         assert_eq!(groups.len(), 1);
 
         let store = CharacterStore::new();
-        store.reconcile(&dir, &file, PLAN_MD.to_string());
+        store.reconcile(dir, &file, PLAN_MD.to_string());
 
         let recorder = FlightRecorder::new(&dir.join("flight.db"));
         let update_id = recorder.record_character_update("test://uri", "test-model", "prompt");
@@ -2362,7 +2362,7 @@ mod tests {
             plan,
             Some(&HashMap::new()),
             update_id,
-            &dir,
+            dir,
             &store,
             &recorder,
         )
@@ -2399,22 +2399,14 @@ mod tests {
         std::fs::write(dir.join("hoge/高柳.md"), takayanagi_md).unwrap();
 
         let store = CharacterStore::new();
-        store.reconcile(&dir, &dir.join("characters.md"), characters_md.to_string());
+        store.reconcile(dir, &dir.join("characters.md"), characters_md.to_string());
 
         let recorder = FlightRecorder::new(&dir.join("flight.db"));
         let update_id = recorder.record_character_update("test://uri", "test-model", "prompt");
         let updates = plan_input(&[("高柳", "role", "戦艦「飛騨」の艦長。")]);
         let mut llm_client = FakeLlmClient::with_responses(&[]);
 
-        apply_updates(
-            &updates,
-            update_id,
-            &store,
-            &dir,
-            &recorder,
-            &mut llm_client,
-        )
-        .await;
+        apply_updates(&updates, update_id, &store, dir, &recorder, &mut llm_client).await;
 
         let takayanagi_after = std::fs::read_to_string(dir.join("hoge/高柳.md")).unwrap();
         assert!(
@@ -2451,22 +2443,14 @@ mod tests {
         std::fs::write(dir.join("hoge/ijn.md"), ijn_md).unwrap();
 
         let store = CharacterStore::new();
-        store.reconcile(&dir, &dir.join("characters.md"), characters_md.to_string());
+        store.reconcile(dir, &dir.join("characters.md"), characters_md.to_string());
 
         let recorder = FlightRecorder::new(&dir.join("flight.db"));
         let update_id = recorder.record_character_update("test://uri", "test-model", "prompt");
         let updates = plan_input(&[("原顕三郎", "role", "遣泰艦隊司令。")]);
         let mut llm_client = FakeLlmClient::with_responses(&[]);
 
-        apply_updates(
-            &updates,
-            update_id,
-            &store,
-            &dir,
-            &recorder,
-            &mut llm_client,
-        )
-        .await;
+        apply_updates(&updates, update_id, &store, dir, &recorder, &mut llm_client).await;
 
         let ijn_after = std::fs::read_to_string(dir.join("hoge/ijn.md")).unwrap();
         assert!(

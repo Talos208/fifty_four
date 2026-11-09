@@ -343,7 +343,7 @@ impl CharacterStore {
             return None;
         }
         // `HashMap` の走査順は不定なので、表示順を (定義元, 見出し) で安定させる。
-        hits.sort_by(|(a, _), (b, _)| a.cmp(b));
+        hits.sort_by_key(|(a, _)| *a);
         Some(
             hits.into_iter()
                 .map(|(_, md)| md)
@@ -976,7 +976,7 @@ mod tests {
             let path = root.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, md).unwrap();
-            store.reconcile(&root, &path, md.to_string());
+            store.reconcile(root, &path, md.to_string());
         }
         (store, tmp)
     }
@@ -1000,7 +1000,7 @@ mod tests {
             ],
         );
         let root = _tmp.path();
-        let names = store.allowed_names(&root);
+        let names = store.allowed_names(root);
         assert!(names.contains("チャーチル"), "{:?}", names);
         assert!(names.contains("原顕三郎"), "1段目のリンク先: {:?}", names);
         assert!(
@@ -1031,7 +1031,7 @@ mod tests {
             )],
         );
         let root = _tmp.path();
-        let names = store.allowed_names(&root);
+        let names = store.allowed_names(root);
         assert!(names.contains("ジェフ・クライン"), "{:?}", names);
         assert!(names.contains("エルミア"), "{:?}", names);
     }
@@ -1054,10 +1054,10 @@ mod tests {
         );
         let root = _tmp.path();
         // lookup_definitions はcharactersベースなので、リンク先の名前では見つからない。
-        assert!(store.lookup_definitions(&root, "エルミア").is_empty());
+        assert!(store.lookup_definitions(root, "エルミア").is_empty());
         assert!(
             !store
-                .lookup_definitions(&root, "ジェフ・クライン")
+                .lookup_definitions(root, "ジェフ・クライン")
                 .is_empty()
         );
     }
@@ -1081,14 +1081,14 @@ mod tests {
             ],
         );
         let root = _tmp.path();
-        let markdown = store.lookup_markdown(&root, "高柳");
+        let markdown = store.lookup_markdown(root, "高柳");
         assert!(
             markdown.is_some(),
             "wikilink経由のキャラでもhoverが出ること"
         );
         assert!(markdown.unwrap().contains("飛騨艦長"));
         // 自ファイルの見出しも従来通り引ける(回帰確認)。
-        assert!(store.lookup_markdown(&root, "近藤").is_some());
+        assert!(store.lookup_markdown(root, "近藤").is_some());
     }
 
     #[test]
@@ -1099,7 +1099,7 @@ mod tests {
             &[("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n")],
         );
         let root = _tmp.path();
-        let names = store.lookup_names(&root, "高柳");
+        let names = store.lookup_names(root, "高柳");
         assert!(names.contains("高柳"), "{:?}", names);
         assert!(names.contains("飛騨艦長"), "{:?}", names);
     }
@@ -1115,7 +1115,7 @@ mod tests {
             )],
         );
         let root = _tmp.path();
-        let result = store.search(&root, "高柳", &[CharacterAttribute::Role]);
+        let result = store.search(root, "高柳", &[CharacterAttribute::Role]);
         assert!(result.is_ok(), "{:?}", result);
         assert!(result.unwrap().contains("艦長"));
     }
@@ -1137,7 +1137,7 @@ mod tests {
             ],
         );
         let root = _tmp.path();
-        let files = store.files_reachable_via_wikilink(&root);
+        let files = store.files_reachable_via_wikilink(root);
         assert!(files.contains_key(&root.join("characters.md")));
         assert!(files.contains_key(&root.join("hoge/ijn.md")));
         assert!(files.contains_key(&root.join("hoge/高柳.md")));
@@ -1157,7 +1157,7 @@ mod tests {
         let root = _tmp.path();
         assert!(
             store
-                .lookup_markdown(&root, "高柳")
+                .lookup_markdown(root, "高柳")
                 .unwrap()
                 .contains("飛騨艦長")
         );
@@ -1167,9 +1167,9 @@ mod tests {
             "# 高柳\n\n## 呼称\n\n- 更新後の呼称\n",
         )
         .unwrap();
-        store.refresh_included(&root);
+        store.refresh_included(root);
 
-        let markdown = store.lookup_markdown(&root, "高柳").unwrap();
+        let markdown = store.lookup_markdown(root, "高柳").unwrap();
         assert!(markdown.contains("更新後の呼称"), "{:?}", markdown);
         assert!(!markdown.contains("飛騨艦長"), "{:?}", markdown);
     }
@@ -1187,11 +1187,11 @@ mod tests {
         );
         let root = _tmp.path();
         let target = root.join("hoge/高柳.md");
-        assert!(!store.is_tracked(&root, &target), "初期状態では未追跡");
+        assert!(!store.is_tracked(root, &target), "初期状態では未追跡");
 
-        store.files_reachable_via_wikilink(&root);
+        store.files_reachable_via_wikilink(root);
         assert!(
-            store.is_tracked(&root, &target),
+            store.is_tracked(root, &target),
             "候補列挙で追跡対象へ昇格する"
         );
 
@@ -1199,13 +1199,13 @@ mod tests {
         let edited = "# 高柳\n\n## 呼称\n\n- ユーザーが書いた呼称\n";
         std::fs::write(&target, edited).unwrap();
         assert!(
-            store.reconcile(&root, &target, edited.to_string()),
+            store.reconcile(root, &target, edited.to_string()),
             "昇格後も外部変更として取り込めること"
         );
-        assert_eq!(store.content_of(&root, &target).as_deref(), Some(edited));
+        assert_eq!(store.content_of(root, &target).as_deref(), Some(edited));
 
         // 次サイクルの候補列挙が、古い内容へ巻き戻さないこと。
-        let snapshots = store.files_reachable_via_wikilink(&root);
+        let snapshots = store.files_reachable_via_wikilink(root);
         assert_eq!(
             snapshots.get(&target).map(String::as_str),
             Some(edited),
@@ -1225,7 +1225,7 @@ mod tests {
         std::fs::write(root.join("characters.md"), "# 近藤\n").unwrap();
         std::fs::write(root.join("characters/ジェフ.md"), "# ジェフ\n").unwrap();
 
-        let files = CharacterStore::discover_character_files(&root);
+        let files = CharacterStore::discover_character_files(root);
         assert_eq!(files, vec![root.join("characters.md")]);
     }
 
@@ -1241,7 +1241,7 @@ mod tests {
             &[("hoge/高柳.md", "# 高柳\n\n## 呼称\n\n- 飛騨艦長\n")],
         );
         let root = _tmp.path();
-        let markdown = store.lookup_markdown(&root, "高柳").unwrap();
+        let markdown = store.lookup_markdown(root, "高柳").unwrap();
         assert_eq!(
             markdown.matches("飛騨艦長").count(),
             1,
@@ -1800,21 +1800,21 @@ mod tests {
 
         let store = CharacterStore::new();
         store
-            .write(&dir, &path, CHARACTERS_MD.to_string())
+            .write(dir, &path, CHARACTERS_MD.to_string())
             .await
             .unwrap();
 
         assert!(
-            !store.reconcile(&dir, &path, CHARACTERS_MD.to_string()),
+            !store.reconcile(dir, &path, CHARACTERS_MD.to_string()),
             "自己書き込みと同一内容はエコーとして無視されるはず"
         );
 
         let changed = format!("{}\n追記。", CHARACTERS_MD);
         assert!(
-            store.reconcile(&dir, &path, changed.clone()),
+            store.reconcile(dir, &path, changed.clone()),
             "内容が異なれば真の外部変更として取り込まれるはず"
         );
-        assert_eq!(store.content_of(&dir, &path), Some(changed));
+        assert_eq!(store.content_of(dir, &path), Some(changed));
     }
 
     #[test]

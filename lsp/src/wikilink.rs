@@ -223,7 +223,7 @@ mod tests {
     fn test_resolve_target_infers_md_extension() {
         let _tmp = make_tree("resolve_infer_ext", &["ページA.md"]);
         let dir = _tmp.path();
-        let resolved = resolve_target(&dir, "ページA");
+        let resolved = resolve_target(dir, "ページA");
         assert_eq!(resolved, Some(dir.join("ページA.md")));
     }
 
@@ -231,7 +231,7 @@ mod tests {
     fn test_resolve_target_missing_returns_none() {
         let _tmp = make_tree("resolve_missing", &[]);
         let dir = _tmp.path();
-        let resolved = resolve_target(&dir, "存在しない");
+        let resolved = resolve_target(dir, "存在しない");
         assert_eq!(resolved, None);
     }
 
