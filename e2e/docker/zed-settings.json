@@ -21,5 +21,15 @@
       },
       "initialization_options": {}
     }
+  },
+  // ACP エージェント(Agent Panel の「+」メニューの External Agents に出る)。
+  // debug ビルド限定の `--acp`。会話は claude CLI(イメージに入れてある)を使う
+  "agent_servers": {
+    "fifty-four": {
+      "type": "custom",
+      "command": "/usr/local/bin/fifty_four_lsp",
+      "args": ["--acp"],
+      "env": { "RUST_LOG": "fifty_four_lsp=debug" }
+    }
   }
 }

@@ -432,21 +432,51 @@ IDの会話記録がまだ無いため、無条件に `--resume` すると「No 
 で失敗する。
 
 モデル候補は `claude` CLI 自身に問い合わせて決める(`lsp/src/claude_models.rs`)。
-最初の `session/new`/`session/load` のときに、本体とは別の短命な `claude` プロセスを
+本体とは別の短命な `claude` プロセスを
 `-p --input-format stream-json --output-format stream-json --no-session-persistence`
 で起こし、`initialize` の control request を1行送って、応答の `models` を読む
 (TS 版 Agent SDK の `supportedModels()` と同じ情報源。プロンプトは送らないので
-課金は発生しない。所要時間は1秒程度で、本体の起動と並行させている)。
-結果はエージェントのプロセスが終わるまで使い回すので、CLI を更新して新しい
-モデルが増えたときは、Zed からエージェントを起動し直すと一覧に反映される。
+課金は発生しない。所要時間は1秒程度)。
+
+**CLI の更新に追従する。** CLI は頻繁に自動更新され、選べるモデルも変わる(1日に何版も出る)。
+エージェントは長く動き続けるので、一覧は次のように取り直す(`acp.rs` の `ModelsState`):
+
+- 会話を開くとき(`session/new`/`session/load`)は、前回取れた一覧をすぐ見せ、応答のあとで
+  裏で取り直す。まだ一度も取れていなければ、その場で問い合わせる(本体の起動と並行)。
+- ターンの頭(`session/prompt`)でも、前回から10分以上空いていれば裏で取り直す。
+- 取り直した一覧が会話に見せている一覧と違えば、開いている全会話へ
+  `session/update` の `config_option_update` で新しい選択肢を送る。会話を開き直さなくても
+  セレクタが新しくなる。
+- 選択の検証は、その会話に見せている一覧で行う(他の会話の都合で一覧が変わっても、
+  見せたものと検証が食い違わないように)。
+- CLI の更新で、選んでいたモデルが一覧から消えることがある(2.1.318 の `claude-fable-5-2` が
+  2.1.322 では `fable` になった)。その会話では、選んでいた選択肢を一覧の末尾に残し、選ばれたままにする
+  (CLI はモデルIDをそのまま受け付ける)。新しい一覧でその effort が使えなくなった場合は既定へ戻し、
+  次のターンの頭で反映する。
+
+この追従は `lsp/tests/acp_model_refresh.rs` で確かめる。モデル一覧の違う実物の `claude` を
+2つ使い、動いているエージェントの下で実行ファイルを差し替える(自動更新と同じ手順)。
+ログイン済みの `claude` が要るので、通常の `cargo test` では走らない:
+
+```bash
+FF_TEST_OLD_CLAUDE=<一覧の違う旧版の claude> cargo test --test acp_model_refresh -- --ignored --nocapture
+```
+
+旧版には、たとえば Zed の `claude-acp` が同梱している `claude` が使える
+(`%LOCALAPPDATA%\Zed\external_agents\registry\npx\claude-acp\node_modules\@anthropic-ai\claude-agent-sdk-win32-x64\claude.exe`)。
+新旧で一覧が同じだと判別できないので、その場合は試験がそう言って失敗する。
 
 `anthropic-agent-sdk` の `supported_models()` を使わないのは、SDK に埋め込まれた
 静的リストで、SDK のリリースが 0.2.75(2025-12)で止まっているため。CLI の一覧なら
 `claude-fable-5-1[1m]` のような1Mコンテキスト版や、表示名・説明(料金)も揃って出る。
 
 CLI から一覧を取れなかった場合(CLI が古い・起動できない・15秒以内に応答が無い)は、
-警告をログに出したうえで、従来の静的な一覧(`default` / `opus` / `sonnet` / `haiku` /
-`fable` のエイリアスと `supported_models()` のバージョン固定ID)に戻る。
+警告をログに出したうえで、前回取れた一覧を使い続ける。一度も取れていなければ、
+従来の静的な一覧(`default` / `opus` / `sonnet` / `haiku` / `fable` のエイリアスと
+`supported_models()` のバージョン固定ID)に戻る。
+
+なお、一覧はログインしているアカウントでも変わる。ログインしていない `claude` は
+エイリアス5件だけを返し、表示名にもバージョンが付かない(「Fable」のように)。
 
 思考レベル(effort)の選択肢は、いま選んでいるモデルについて CLI が返す
 `supportedEffortLevels`(claude 2.1.300 ではどのモデルも `low` / `medium` / `high` /

@@ -20,7 +20,8 @@
 //! 両方が同じものを見る。表示と検証で一覧が食い違うと、表示した候補を選んだ瞬間に
 //! 「未知のモデル」で弾かれてしまうため。
 //! 通常は `claude` CLI に問い合わせた一覧([`crate::claude_models`])を使い、取得に
-//! 失敗したときだけ静的な一覧([`ModelCatalog::fallback`])に戻る。
+//! 失敗したら前回取れた一覧、それも無ければ静的な一覧([`ModelCatalog::fallback`])に戻る
+//! ([`resolve_catalog`])。いつ取り直すかは `crate::acp` の `ModelsState` 参照。
 //!
 //! 思考レベル(effort)の段階はモデルごとに違いうる(CLI の `supportedEffortLevels`)ので、
 //! いま選ばれているモデルの段階だけを出す。モデルを変えて今の effort がそのモデルで
@@ -208,6 +209,72 @@ impl ModelCatalog {
     }
 }
 
+/// `claude` CLI への問い合わせ結果から、表示する一覧を決める。
+///
+/// 取れればそれを、取れなければ前回取れた一覧を、それも無ければ静的な一覧を使う。
+/// 戻り値の `bool` は「いま取れた一覧か」(呼び出し側が「前回取れた一覧」として覚えるかの判断に使う)。
+#[instrument(skip(fetched, last_good))]
+pub(crate) fn resolve_catalog(
+    fetched: Result<Vec<CliModel>, String>,
+    last_good: Option<&std::sync::Arc<ModelCatalog>>,
+) -> (std::sync::Arc<ModelCatalog>, bool) {
+    match fetched {
+        Ok(models) => (std::sync::Arc::new(ModelCatalog::from_cli(models)), true),
+        Err(e) => {
+            tracing::warn!("acp: claude CLI からモデル一覧を取れませんでした: {}", e);
+            let kept = last_good
+                .cloned()
+                .unwrap_or_else(|| std::sync::Arc::new(ModelCatalog::fallback()));
+            (kept, false)
+        }
+    }
+}
+
+/// 取り直した一覧 `fresh` を、ある会話に見せる一覧にする。
+///
+/// その会話で選ばれているモデル(`selected`)が新しい一覧から消えていたら、前に見せていた
+/// 一覧(`shown`)にあったその選択肢を末尾に残す。CLI の更新で値の名前が変わることがあり
+/// (例: 2.1.318 の `claude-fable-5-2` が、2.1.322 では `fable` になった)、選んだものが
+/// 一覧から消えると、表示も思考レベルの選択も壊れるため。CLI はモデルIDをそのまま受け付ける。
+#[instrument(skip(fresh, shown))]
+pub(crate) fn catalog_for_session(
+    fresh: &std::sync::Arc<ModelCatalog>,
+    shown: &ModelCatalog,
+    selected: &[Option<&str>],
+) -> std::sync::Arc<ModelCatalog> {
+    let mut choices: Option<Vec<ModelChoice>> = None;
+    for id in selected.iter().flatten() {
+        if fresh.contains(id)
+            || choices
+                .as_ref()
+                .is_some_and(|c| c.iter().any(|x| x.id == *id))
+        {
+            continue;
+        }
+        if let Some(kept) = shown.choices.iter().find(|c| c.id == *id) {
+            choices
+                .get_or_insert_with(|| fresh.choices.clone())
+                .push(kept.clone());
+        }
+    }
+    match choices {
+        Some(choices) => std::sync::Arc::new(ModelCatalog { choices }),
+        None => fresh.clone(),
+    }
+}
+
+/// `config` の effort が、そのモデルについて `models` で使えなければ既定へ戻す。戻したら `true`。
+pub(crate) fn drop_unsupported_effort(config: &mut SessionConfig, models: &ModelCatalog) -> bool {
+    let levels = models.effort_levels_for(config.model.as_deref());
+    match &config.effort {
+        Some(effort) if !levels.iter().any(|l| l == effort) => {
+            config.effort = None;
+            true
+        }
+        _ => false,
+    }
+}
+
 fn fallback_effort_levels() -> Vec<String> {
     FALLBACK_EFFORT_LEVELS
         .iter()
@@ -308,12 +375,7 @@ pub(crate) fn apply(
                 Some(value_id.to_string())
             };
             // 新しいモデルで使えない effort が残っていたら既定へ戻す。
-            let levels = models.effort_levels_for(config.model.as_deref());
-            if let Some(effort) = &config.effort
-                && !levels.iter().any(|l| l == effort)
-            {
-                config.effort = None;
-            }
+            drop_unsupported_effort(config, models);
             Ok(())
         }
         CONFIG_ID_EFFORT => {
@@ -633,6 +695,85 @@ mod tests {
             config.effort, None,
             "haiku は effort 非対応なので既定へ戻す"
         );
+    }
+
+    /// 取れた一覧 → 前回取れた一覧 → 静的な一覧、の順に使うこと。
+    #[test]
+    fn test_resolve_catalog_prefers_fresh_then_last_good_then_fallback() {
+        let last = std::sync::Arc::new(ModelCatalog::from_cli(vec![cli_model("opus", None)]));
+
+        let (fresh, is_fresh) = resolve_catalog(
+            Ok(vec![cli_model("default", None), cli_model("fable", None)]),
+            Some(&last),
+        );
+        assert!(is_fresh);
+        assert_eq!(ids(&fresh), ["default", "fable"]);
+
+        let (kept, is_fresh) = resolve_catalog(Err("boom".to_string()), Some(&last));
+        assert!(!is_fresh);
+        assert!(
+            std::sync::Arc::ptr_eq(&kept, &last),
+            "前回の一覧をそのまま使う"
+        );
+
+        let (fallback, is_fresh) = resolve_catalog(Err("boom".to_string()), None);
+        assert!(!is_fresh);
+        assert_eq!(*fallback, ModelCatalog::fallback());
+    }
+
+    /// 選んでいたモデルが新しい一覧から消えたら、前の選択肢(表示名・effort ごと)を末尾に残すこと。
+    /// 消えていなければ、新しい一覧をそのまま使うこと。
+    #[test]
+    fn test_catalog_for_session_keeps_vanished_selection() {
+        // 2.1.318 → 2.1.322 で実際に起きた入れ替わり
+        let shown = ModelCatalog::from_cli(vec![
+            cli_model("default", None),
+            cli_model_with_effort("claude-fable-5-2", Some(true), &["low", "high"]),
+            cli_model("fable", Some("Fable 5.1")),
+        ]);
+        let fresh = std::sync::Arc::new(ModelCatalog::from_cli(vec![
+            cli_model("default", None),
+            cli_model("fable", Some("Fable 5.2")),
+            cli_model("claude-fable-5-1", Some("Fable 5.1")),
+        ]));
+
+        let kept = catalog_for_session(&fresh, &shown, &[Some("claude-fable-5-2")]);
+        assert_eq!(
+            ids(&kept),
+            ["default", "fable", "claude-fable-5-1", "claude-fable-5-2"]
+        );
+        assert_eq!(
+            kept.effort_levels_for(Some("claude-fable-5-2")),
+            ["low", "high"],
+            "残した選択肢の effort もそのまま選べる"
+        );
+
+        for selected in [None, Some("fable")] {
+            let same = catalog_for_session(&fresh, &shown, &[selected]);
+            assert!(std::sync::Arc::ptr_eq(&same, &fresh), "{selected:?}");
+        }
+    }
+
+    /// effort がそのモデルで使えなければ既定へ戻し、使えれば残すこと。
+    #[test]
+    fn test_drop_unsupported_effort() {
+        let models = ModelCatalog::from_cli(vec![
+            cli_model_with_effort("default", Some(true), &["low", "high"]),
+            cli_model_with_effort("haiku", Some(false), &[]),
+        ]);
+        let mut kept = SessionConfig {
+            model: None,
+            effort: Some("high".to_string()),
+        };
+        assert!(!drop_unsupported_effort(&mut kept, &models));
+        assert_eq!(kept.effort.as_deref(), Some("high"));
+
+        let mut dropped = SessionConfig {
+            model: Some("haiku".to_string()),
+            effort: Some("high".to_string()),
+        };
+        assert!(drop_unsupported_effort(&mut dropped, &models));
+        assert_eq!(dropped.effort, None);
     }
 
     /// フォールバックの一覧にエイリアス5件が含まれ、`supported_models()` 由来のIDと重複しないこと。

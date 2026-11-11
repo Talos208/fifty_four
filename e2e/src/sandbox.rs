@@ -79,7 +79,16 @@ const HOST_ONLY_ENV: &[&str] = &[
     "E2E_OUT_ROOT",
     "E2E_MODES",
     "E2E_START_TIMEOUT",
+    "E2E_OCR_MODELS",
+    // 認証情報。値を `-e KEY=値` でコマンドラインに載せないよう、下の `CLAUDE_TOKEN_*` で別に渡す
+    CLAUDE_TOKEN_HOST_ENV,
 ];
+
+/// ホストでこの環境変数に入れた `claude setup-token` のトークンを、コンテナの
+/// [`CLAUDE_TOKEN_CONTAINER_ENV`] として渡す(無ければ、コンテナの `claude` は未ログインで動く)
+pub const CLAUDE_TOKEN_HOST_ENV: &str = "E2E_CLAUDE_OAUTH_TOKEN";
+/// claude CLI が読む、長期トークンの環境変数
+const CLAUDE_TOKEN_CONTAINER_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 
 /// 結果(ログ・スクリーンショット)を残すフォルダ。実行ごとに新しく作り、既存のものは消さない。
 pub fn new_run_dir() -> PathBuf {
@@ -143,6 +152,14 @@ impl Sandbox {
         }
         for (k, v) in extra_env {
             cmd.args(["-e", &format!("{k}={v}")]);
+        }
+        // トークンは、値をコマンドラインに載せない(プロセス一覧やログに出ないように)。
+        // 子プロセスの環境にだけ入れ、`-e 名前` でそれをコンテナへ引き継ぐ
+        if let Ok(token) = std::env::var(CLAUDE_TOKEN_HOST_ENV)
+            && !token.is_empty()
+        {
+            cmd.env(CLAUDE_TOKEN_CONTAINER_ENV, token)
+                .args(["-e", CLAUDE_TOKEN_CONTAINER_ENV]);
         }
         cmd.args(["-v", &format!("{}:/out", mount_path(&out))])
             .arg(&image);
@@ -244,6 +261,33 @@ impl Sandbox {
             return Err("e2e-shot に失敗".into());
         }
         Ok(self.out.join(file))
+    }
+
+    /// キーを押す(`e2e-key`。例: `["Down", "Return"]`)
+    pub fn keys(&self, keys: &[&str]) -> Result<(), String> {
+        let mut args = vec!["e2e-key"];
+        args.extend_from_slice(keys);
+        if self.exec_ok(&args) {
+            Ok(())
+        } else {
+            Err(format!("{args:?} に失敗"))
+        }
+    }
+
+    /// コマンドパレットで `action`(例: `agent: toggle focus`)を実行する
+    pub fn run_action(&self, action: &str) -> Result<(), String> {
+        let step = |args: &[&str]| -> Result<(), String> {
+            if self.exec_ok(args) {
+                Ok(())
+            } else {
+                Err(format!("{args:?} に失敗"))
+            }
+        };
+        step(&["e2e-key", "ctrl+shift+p"])?;
+        std::thread::sleep(Duration::from_millis(800)); // パレットが開くのを待つ
+        step(&["e2e-type", action])?;
+        std::thread::sleep(Duration::from_millis(800)); // 候補が絞られるのを待つ
+        step(&["e2e-key", "Return"])
     }
 }
 

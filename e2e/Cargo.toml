@@ -12,6 +12,9 @@ publish = false
 # スクリーンショットの判定用。PNG だけ読めればよい
 image = { version = "0.25", default-features = false, features = ["png"] }
 libtest-mimic = "0.8"
+# 画面の文字認識(`src/ocr.rs`)。どちらも純粋な Rust なので、C のビルドは要らない
+ocrs = "0.14"
+rten = "0.28"
 
 # 画像のデコードが遅いと待ち合わせが伸びるので、dev でも最適化する
 [profile.dev]
@@ -23,4 +26,8 @@ harness = false
 
 [[test]]
 name = "e_harness"
+harness = false
+
+[[test]]
+name = "m_models"
 harness = false
