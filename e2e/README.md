@@ -14,6 +14,7 @@
 | IME | fcitx5 + fcitx5-mozc | X11 は XIM、Wayland は text-input-v3 ⇔ input-method-v2 でつながる |
 | エディタ | Zed(`ZED_VERSION` で固定、既定 `v1.26.2`) | GitHub Releases の Linux 版 tarball |
 | LSP | `fifty_four_lsp`(debug ビルド) | `/usr/local/bin`。settings.json の `binary.path` で指定 |
+| ACP | 同じ `fifty_four_lsp --acp` + `claude` CLI | settings.json の `agent_servers` に登録。`claude` は公式のネイティブ版(`~/.local/bin`)。debug ビルドは `data/` を実行ファイルの隣から読むので `/usr/local/bin/data` を置いてある |
 | 拡張 | `extension/` を wasm32-wasip2 でビルドし、`installed/fifty-four` に配置 | |
 | 入力・撮影 | `e2e-*` コマンド(下記) | 中身は X11 なら xdotool / ImageMagick、Wayland なら wtype / grim |
 | フォント | Noto CJK | 画面比較のため、テーマ・フォント・サイズを `docker/zed-settings.json` で固定 |
@@ -65,6 +66,8 @@ E2E_REPEAT=5 cargo e2e E04         # 5 本を続けて起動して、毎回 read
 | `E2E_START_TIMEOUT` | コンテナが ready になるまでの待ち(既定 180 秒) |
 | `E2E_PARALLEL` / `E2E_REPEAT` | A06(同時起動)/ E04(連続起動)の本数。未設定ならその試験は実行しない |
 | `E2E_STRICT_A07` | `1` なら、Zed を起動し直した(A07)ことを失敗にする(既定は警告) |
+| `E2E_CLAUDE_OAUTH_TOKEN` | `claude setup-token` の長期トークン。あればコンテナに `CLAUDE_CODE_OAUTH_TOKEN` として渡す(値は `-e 名前` で引き継ぎ、コマンドラインには載せない)。無ければコンテナの `claude` は未ログインで動き、M01 は 5 件の一覧で確かめる |
+| `E2E_OCR_MODELS` | 画面の文字認識(`ocrs`)のモデルの置き場(既定 `~/.cache/ocrs`。`ocrs-cli` と同じ)。無ければ初回に `curl` で約 12MB を取る |
 | `E2E_*`(上記以外) | コンテナにそのまま渡す(`E2E_ZED_WINDOW_TIMEOUT` など。entrypoint の待ち時間) |
 
 結果(`e2e.log`・`e2e-status`・`Zed.log`・`*.png`)は結果の置き場に残る。
@@ -72,7 +75,8 @@ E2E_REPEAT=5 cargo e2e E04         # 5 本を続けて起動して、毎回 read
 `e2e-run-…` という名前のコンテナが残ることがあるので、`kill` で止める。
 
 **kache を使っている環境で `cargo` が固まるとき**: `RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= CC_KNOWN_WRAPPER_CUSTOM=__none__ cargo e2e …`
-のように kache を迂回すると、ビルドできることがある(このクレートの依存は Rust のみで、C は要らない)。
+のように kache を迂回すると、ビルドできることがある(このクレートの依存は Rust のみで、C は要らない。
+画面の文字認識の `ocrs` / `rten` も純粋な Rust)。
 
 ## 手で動かす
 
@@ -142,6 +146,12 @@ docker exec ff-e2e e2e-key ctrl+space
 
 - ビルドには `Lindera.dev`(lindera の IPADIC 辞書の配布元)へのアクセスが要る。
   これに届かない環境(Claude Code のクラウド環境など)では、LSP を偽物に差し替えた版でしか確かめられない。
-- `--acp`(debug ビルド限定、claude CLI 依存)は対象外。
+- `--acp`(debug ビルド限定)は、モデルセレクタの一覧(M01)だけを見る。会話のやり取り(プロンプトを送る)は対象外
+  (課金が要り、結果も毎回変わるため)。
+- **Wayland では、マウスのクリックが Zed に届かない**。headless の sway の seat にはキーボードしか無く、ポインタ機器が無い
+  (`swaymsg -t get_seats` の `capabilities` が 2)。`swaymsg seat - cursor …` でカーソルを動かして押しても、
+  `wlrctl`(仮想ポインタ)を使っても、Zed には届かなかった(`wlrctl` は実行のたびに仮想ポインタを作って消すため)。
+  クリックが要る試験は、常駐する仮想ポインタを足すまでできない。今の試験はキーボードだけで操作する。
+- 画面の文字認識は `ocrs`(英数字だけ。日本語は読めない)。位置の取得は使っていない(キーボードで操作するため)。
 - LLM を使う機能は、今の settings では無効(`initialization_options` が空)。偽の LLM サーバを追加して決定的にする予定。
-- 待ち合わせの条件(LSP の span)と画面比較のハーネスは未実装。
+- 待ち合わせの条件(LSP の span)と、基準画像との差分による画面比較は未実装(画面の文字を読む `ocr` だけある)。

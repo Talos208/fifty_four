@@ -80,7 +80,7 @@ RUN apt-get update \
         libasound2t64 libxkbcommon-x11-0 libxcb1 libx11-xcb1 libfontconfig1 libwayland-client0 libgl1 \
         fcitx5 fcitx5-mozc fcitx5-frontend-gtk3 \
         fonts-noto-cjk \
-        git procps \
+        git procps curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --create-home --shell /bin/bash e2e
 
@@ -89,6 +89,9 @@ RUN ln -s /opt/zed.app/bin/zed /usr/local/bin/zed
 COPY --from=build /src/target/debug/fifty_four_lsp /usr/local/bin/fifty_four_lsp
 # debug ビルドの LSP は、実行ファイルの隣の db/ に FlightRecorder の DB を作る。e2e ユーザーが書けるようにしておく
 RUN mkdir -p /usr/local/bin/db && chown e2e /usr/local/bin/db
+# debug ビルドの LSP(と `--acp`)は、プロンプトなどの data/ を実行時に実行ファイルの隣から読む
+# (debug の rust-embed は埋め込まず、ビルド時の絶対パス /src/data を読みに行くため、このイメージには無い)
+COPY data /usr/local/bin/data
 
 # 拡張は「インストール済み」として配置する(Zed は起動時に installed/ を走査して索引を作る)
 COPY --chown=e2e extension/extension.toml /home/e2e/.local/share/zed/extensions/installed/fifty-four/extension.toml
@@ -103,12 +106,19 @@ COPY --chown=e2e e2e/docker/workspace /home/e2e/workspace
 COPY --chown=e2e e2e/docker/sway-config.in /home/e2e/.config/sway/config.in
 COPY e2e/docker/entrypoint.sh /usr/local/bin/e2e-entrypoint
 COPY e2e/docker/e2e-tools.sh /usr/local/bin/e2e-tools
-RUN for c in e2e-key e2e-type e2e-shot e2e-ime e2e-window; do ln -s e2e-tools "/usr/local/bin/$c"; done
+RUN for c in e2e-key e2e-type e2e-shot e2e-ime e2e-window e2e-claude-models; do ln -s e2e-tools "/usr/local/bin/$c"; done
 
 USER e2e
 WORKDIR /home/e2e
+# `fifty_four_lsp --acp` が会話本体に使う claude CLI(公式のネイティブ版。~/.local/bin/claude に入る)。
+# 版は固定しない: E2E で見るのは「セレクタの一覧が、このコンテナの claude の答えと一致するか」で、
+# 比べる相手(e2e-claude-models)も同じ claude なので、どの版でも成り立つ。
+# ログインはイメージに入れない。認証情報は起動時に環境変数で渡す(e2e/README.md の「ACP」参照)
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+    && /home/e2e/.local/bin/claude --version
 # E2E_DISPLAY: x11 | wayland(entrypoint.sh 参照)
 ENV E2E_DISPLAY=x11 \
+    PATH=/home/e2e/.local/bin:$PATH \
     DISPLAY=:99 \
     XDG_RUNTIME_DIR=/tmp/e2e-runtime \
     DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/e2e-dbus \

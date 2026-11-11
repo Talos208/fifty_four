@@ -4,6 +4,7 @@
 
 pub mod harness;
 pub mod image_check;
+pub mod ocr;
 pub mod sandbox;
 pub mod wait;
 

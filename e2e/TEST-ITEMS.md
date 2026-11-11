@@ -35,7 +35,8 @@ X11 は `E2E_MODES=x11`(両方なら `x11,wayland`)と明示したときだけ�
 2. **P1 ハイライト**(B): 起動直後の競合だけを見る。中身は単体テストで検証済み
 3. **P2 結線と Zed 依存**(C・D): Zed の設定・挙動に依存する部分だけ。準備するワークスペースが増える
 4. **ハーネス自身**(E): 失敗の診断と入力経路が壊れていないか
-5. **後回し**(F): 文章品質診断の経路(Q)と LLM 依存(L。偽 LLM が先に要る)
+5. **ACP**(M): モデルセレクタ(M01)。`claude` CLI を使うので、イメージが大きくなる
+6. **後回し**(F): 文章品質診断の経路(Q)と LLM 依存(L。偽 LLM が先に要る)
 
 IME・日本語入力そのものは Zed と fcitx5 の領域で、この LSP の試験対象ではない。
 ただし全項目が「キーを打って結果を見る」ので、入力経路が生きていることだけはハーネスの項目(E)で確かめる。
@@ -121,6 +122,28 @@ E06 はバッファを書き換えて保存するので最後に実行し、終�
 | E05 | X W | スクリーンショットが撮れる | 撮って、画面の大きさ(1600x1000)で読める(窓が映っているかの判定は A02) | 実装・確認済み |
 | E06 | X W | 入力経路が生きている(IME で日本語が入る) | `e2e-ime on` → `e2e-type wagahaiha` → `space` → `Return` のあと `ctrl+s` で保存し、`test.txt` に「吾輩は」が入っている(画面は読まない) | 実装・確認済み |
 | E07 | X W | IME の入力コンテキストが作られる | `e2e-ime ready`(fcitx5 の DebugInfo に `focus:1`)が通る | 実装・確認済み |
+
+## M. ACP エージェントのモデルセレクタ
+
+実装: `e2e/tests/m_models.rs`(`cargo e2e M01`)。`fifty_four_lsp --acp`(debug ビルド限定)を Zed の Agent Panel に
+`agent_servers` で登録してあり、会話本体の `claude` CLI はイメージに入っている(`e2e/Dockerfile`)。
+
+「選べるモデルがセレクタに出ない」の再発を見張る。エージェントが一覧を返しても、Zed が描かなければ画面には出ないので、
+**画面を読んで**確かめる。正解は、本体と同じ `claude` に `initialize` を送って得る(`e2e-claude-models`)。偽物の CLI は使わない。
+操作はキーボードだけ。Wayland の headless な sway にはポインタ機器が無く、クリックが Zed に届かないため。
+
+| ID | 表示 | 項目 | 判定方法 | 状態 |
+|---|---|---|---|---|
+| M01 | X W | セレクタの一覧が、コンテナの claude が答えるモデルの一覧と一致する | `agent: toggle focus` → `agent: toggle new thread menu` → Down×3・Return で fifty-four の会話を作り、`agent: toggle model selector` で一覧を開く。撮った画面をホストの OCR(`ocrs`)で読み、`e2e-claude-models` の表示名が全部あるか見る。静的な一覧に戻っていると、セレクタの既定の表示(`Default (recommended)`)が「既定(CLI 任せ)」になるので、そこで落ちる | 実装・確認済み(2026-11-11)。正解に無い名前を足すと FAIL になることを確認 |
+
+**この試験で見られないこと**: 開いている会話の最中に CLI が更新されたとき、Zed が `config_option_update` で描き直すか。
+コンテナの `claude` は途中で変わらないので、この試験は通らない。エージェントが更新を送ることは `lsp/tests/acp_model_refresh.rs`
+(実物の `claude` を2版使う ACP レベルの試験)で確かめている。Zed が描き直すかは未確認。
+
+認証: ホストの環境変数 `E2E_CLAUDE_OAUTH_TOKEN`(`claude setup-token` の長期トークン)があれば、コンテナに
+`CLAUDE_CODE_OAUTH_TOKEN` として渡す(値はコマンドラインに載せない)。無ければ未ログインで動く。
+未ログインでも会話は開け、一覧は 5 件(`Default (recommended)` / `Opus` / `Fable` / `Sonnet` / `Haiku`)になる。
+ログイン済みの一覧(版つきの名前や古い版を含む十数件)は、トークンを渡したときだけ確かめられる。
 
 ## F. 後回し(重いので当面やらない)
 
