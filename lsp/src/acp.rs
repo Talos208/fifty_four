@@ -13,13 +13,13 @@ use crate::acp_config::{self, ModelCatalog, SessionConfig};
 use crate::writing_agent::{AgentError, ClaudeAgent, WritingAgent};
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthMethodAgent, AuthMethodTerminal, AuthenticateRequest,
-    AuthenticateResponse, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
-    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse, Meta,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    AuthenticateResponse, CancelNotification, ClientCapabilities, ConfigOptionUpdate, ContentBlock,
+    ContentChunk, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    Meta, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
     /*SessionCapabilities,*/ SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, UsageUpdate,
 };
-use agent_client_protocol::{Agent, Stdio};
+use agent_client_protocol::{Agent, Client, ConnectionTo, Stdio};
 #[allow(unused_imports)]
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
@@ -95,6 +95,44 @@ struct Session {
     /// 「No conversation found」で失敗する。`session/load` は再開対象として
     /// 読み込む以上ここに会話がある前提で `true` から始める。
     has_replied: bool,
+    /// この会話に見せているモデルの選択肢。選択の検証にもこれを使う
+    /// (他の会話の都合で一覧が変わっても、見せたものと検証が食い違わないように)。
+    /// 一覧を取り直して変わったら、[`AgentState::publish_models`] が差し替えて Zed に知らせる。
+    models: Arc<ModelCatalog>,
+}
+
+/// `claude` CLI のモデル一覧の取得状態。
+///
+/// CLI は頻繁に自動更新され、選べるモデルも変わる(1日に何版も出る)。エージェントは
+/// 長く動き続けるので、会話を開くたびに裏で取り直し、変わっていたら開いている全会話へ
+/// `config_option_update` で知らせる([`AgentState::request_model_refresh`])。
+#[derive(Debug, Default)]
+struct ModelsState {
+    /// 最後に CLI から取れた一覧。会話を開くときはまずこれを見せる(待たせないため)。
+    last_good: Option<Arc<ModelCatalog>>,
+    /// 取り直しの実行中か。
+    refreshing: bool,
+    /// 実行中に取り直しを頼まれたか。終わったらもう一度取る(実行中に CLI が更新された場合に備える)。
+    rerun: bool,
+    /// 最後に取り直しを始めた時刻。`session/prompt` からの取り直しを間引くのに使う。
+    last_started: Option<std::time::Instant>,
+}
+
+/// `session/prompt` のたびに取り直さないよう、前回からこれだけ空いたときだけ取り直す
+/// (会話を開いたときは毎回取り直す)。
+const PROMPT_MODEL_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// 一覧の更新を Zed へ送る関数。ハンドラの `connection` を閉じ込めて渡す。
+type Notify = Arc<dyn Fn(SessionNotification) + Send + Sync>;
+
+/// ハンドラの `connection` から [`Notify`] を作る。送れなくても(切断済みなど)警告だけ出して続ける。
+fn notifier(connection: &ConnectionTo<Client>) -> Notify {
+    let connection = connection.clone();
+    Arc::new(move |notification| {
+        if let Err(e) = connection.send_notification(notification) {
+            warn!("acp: モデル一覧の更新を送れませんでした: {}", e);
+        }
+    })
 }
 
 /// ハンドラ間で共有する状態。
@@ -108,45 +146,131 @@ struct AgentState {
     /// 組み立てに失敗した場合は `None` のままにし、[`update_digest`] が
     /// `LlmError::NotInitialized` で警告を出して終わる(要約が出ないだけで会話は成立する)。
     digest_llm: tokio::sync::Mutex<Option<Box<dyn crate::llm::LlmInterface>>>,
-    /// モデルセレクタの選択肢。最初の `session/new`/`session/load` で `claude` CLI に
-    /// 1度だけ問い合わせ、プロセスが終わるまで使い回す([`AgentState::model_catalog`])。
-    models: tokio::sync::OnceCell<Arc<ModelCatalog>>,
+    /// モデル一覧の取得状態([`ModelsState`])。
+    models: std::sync::Mutex<ModelsState>,
 }
 
 impl AgentState {
-    /// モデルの選択肢を返す。初回だけ `cwd` で `claude` CLI に問い合わせる。
+    /// 会話を開くときに見せるモデルの選択肢。
     ///
-    /// 取得に失敗したときは静的な一覧を返し、それもキャッシュする(失敗を繰り返すと
-    /// `session/new` のたびに最大で [`crate::claude_models`] のタイムアウト分待たされるため)。
-    /// 一覧が古いと感じたら、エージェントを起動し直せば取り直される。
+    /// 前回取れた一覧があればそれをすぐ返す(新しさは、このあと裏で取り直して追いつく)。
+    /// まだ一度も取れていなければ、その場で `claude` CLI に問い合わせる。
+    /// 戻り値の `bool` は「いま問い合わせた」か(それなら続けて取り直す必要は無い)。
     #[instrument(skip(self))]
-    async fn model_catalog(&self, cwd: &std::path::Path) -> Arc<ModelCatalog> {
-        self.models
-            .get_or_init(|| async {
-                let catalog = match crate::claude_models::fetch(cwd).await {
-                    Ok(models) => ModelCatalog::from_cli(models),
-                    Err(e) => {
-                        warn!(
-                            "acp: claude CLI からモデル一覧を取れないため、静的な一覧を使います: {}",
-                            e
-                        );
-                        ModelCatalog::fallback()
-                    }
-                };
-                Arc::new(catalog)
-            })
-            .await
-            .clone()
+    async fn catalog_for_new_session(&self, cwd: &std::path::Path) -> (Arc<ModelCatalog>, bool) {
+        if let Some(last) = self.lock_models().last_good.clone() {
+            return (last, false);
+        }
+        let (catalog, fresh) =
+            acp_config::resolve_catalog(crate::claude_models::fetch(cwd).await, None);
+        let mut st = self.lock_models();
+        if fresh {
+            st.last_good = Some(catalog.clone());
+        }
+        st.last_started = Some(std::time::Instant::now());
+        (catalog, true)
     }
 
-    /// 取得済みのモデルの選択肢を返す。まだ無ければ(セッションより先に設定変更が
-    /// 来るという、通常は起きない順序のとき)静的な一覧を返す。
-    #[instrument(skip(self))]
-    fn cached_model_catalog(&self) -> Arc<ModelCatalog> {
+    /// 裏で `claude` CLI にモデル一覧を問い合わせ直し、変わっていたら開いている全会話へ知らせる。
+    ///
+    /// 前回の取り直しから `min_interval` 経っていなければ何もしない。実行中なら、
+    /// 終わったあとにもう一度取る(実行中に CLI が更新された場合も取りこぼさない)。
+    #[instrument(skip(self, notify))]
+    fn request_model_refresh(
+        self: &Arc<Self>,
+        cwd: &std::path::Path,
+        min_interval: std::time::Duration,
+        notify: Notify,
+    ) {
+        {
+            let mut st = self.lock_models();
+            if let Some(t) = st.last_started
+                && t.elapsed() < min_interval
+            {
+                return;
+            }
+            st.last_started = Some(std::time::Instant::now());
+            if st.refreshing {
+                st.rerun = true;
+                return;
+            }
+            st.refreshing = true;
+        }
+        let state = self.clone();
+        let cwd = cwd.to_path_buf();
+        tokio::spawn(async move {
+            loop {
+                let fetched = crate::claude_models::fetch(&cwd).await;
+                let last_good = state.lock_models().last_good.clone();
+                let (catalog, fresh) = acp_config::resolve_catalog(fetched, last_good.as_ref());
+                if fresh {
+                    state.publish_models(catalog, &notify).await;
+                }
+                let again = {
+                    let mut st = state.lock_models();
+                    if st.rerun {
+                        st.rerun = false;
+                        true
+                    } else {
+                        st.refreshing = false;
+                        false
+                    }
+                };
+                if !again {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// 取れた一覧を覚え、見せている一覧と違う会話それぞれへ `config_option_update` を送る。
+    ///
+    /// 会話で選んでいたモデルが新しい一覧から消えていたら、その選択肢は残す
+    /// ([`acp_config::catalog_for_session`])。新しい一覧で effort が使えなくなったら既定へ戻すが、
+    /// `config` は動いている `claude` に渡した内容なので書き換えず、`pending` に積んで
+    /// 次のターンの頭で反映する(モデルを選び直したときと同じ経路)。
+    #[instrument(skip(self, catalog, notify))]
+    async fn publish_models(&self, catalog: Arc<ModelCatalog>, notify: &Notify) {
+        self.lock_models().last_good = Some(catalog.clone());
+        let mut sessions = self.sessions.lock().await;
+        let mut updated = 0;
+        for (id, session) in sessions.iter_mut() {
+            // 画面に出ているのは、まだ反映していない選択(`pending`)の方。
+            let mut shown = session
+                .pending
+                .clone()
+                .unwrap_or_else(|| session.config.clone());
+            let models = acp_config::catalog_for_session(
+                &catalog,
+                &session.models,
+                &[session.config.model.as_deref(), shown.model.as_deref()],
+            );
+            let effort_dropped = acp_config::drop_unsupported_effort(&mut shown, &models);
+            if *session.models == *models && !effort_dropped {
+                continue;
+            }
+            session.models = models.clone();
+            if effort_dropped {
+                session.pending = Some(shown.clone());
+            }
+            let options = acp_config::to_config_options(&shown, &models);
+            notify(SessionNotification::new(
+                id.clone(),
+                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+            ));
+            updated += 1;
+        }
+        debug!(
+            "acp: モデル一覧を取り直し、{}件の会話へ更新を送りました",
+            updated
+        );
+    }
+
+    fn lock_models(&self) -> std::sync::MutexGuard<'_, ModelsState> {
+        // 中で panic するような処理は無いので、毒されていても中身はそのまま使える。
         self.models
-            .get()
-            .cloned()
-            .unwrap_or_else(|| Arc::new(ModelCatalog::fallback()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// 新しいセッションIDを採番する。UUID v4形式にする必要がある
@@ -231,7 +355,7 @@ pub(crate) async fn run() -> Result<(), String> {
         digest_llm: tokio::sync::Mutex::new(Some(
             crate::llm::build_client_async(&digest_llm_config(), "system_chat_digest.md").await,
         )),
-        models: tokio::sync::OnceCell::new(),
+        models: std::sync::Mutex::new(ModelsState::default()),
     });
 
     info!("start acp agent");
@@ -294,7 +418,7 @@ pub(crate) async fn run() -> Result<(), String> {
                     .pending
                     .clone()
                     .unwrap_or_else(|| session.config.clone());
-                let models = config_state.cached_model_catalog();
+                let models = session.models.clone();
                 if let Err(e) =
                     acp_config::apply(&mut next, req.config_id.0.as_ref(), &req.value, &models)
                 {
@@ -311,7 +435,7 @@ pub(crate) async fn run() -> Result<(), String> {
         // ここで採番するIDは `claude` CLI 自身のセッションIDでもある(`--session-id`)ので、
         // `session/load` が同じIDで来たとき素直に `--resume` できる。
         .on_receive_request(
-            async move |req: NewSessionRequest, responder, _cx| {
+            async move |req: NewSessionRequest, responder, connection| {
                 let id = new_session.new_session_id();
                 debug!("acp session/new: id={} cwd={:?}", id, req.cwd);
 
@@ -326,10 +450,11 @@ pub(crate) async fn run() -> Result<(), String> {
                     Err(e) => return responder.respond_with_internal_error(e),
                 };
                 let config = SessionConfig::default();
-                // モデル一覧の問い合わせは別プロセスなので、本体の起動と並行させて待ち時間を重ねる。
-                let (started, models) = tokio::join!(
+                // モデル一覧は前回取れたものをすぐ使う。まだ無ければ問い合わせるが、別プロセスなので
+                // 本体の起動と並行させて待ち時間を重ねる。
+                let (started, (models, fetched_now)) = tokio::join!(
                     ClaudeAgent::start(&req.cwd, prompt, &id.0, false, &config),
-                    new_session.model_catalog(&req.cwd),
+                    new_session.catalog_for_new_session(&req.cwd),
                 );
                 let agent = match started {
                     Ok(a) => Arc::new(a) as Arc<dyn WritingAgent>,
@@ -352,9 +477,20 @@ pub(crate) async fn run() -> Result<(), String> {
                         config,
                         pending: None,
                         has_replied: false,
+                        models,
                     },
                 );
-                responder.respond(NewSessionResponse::new(id).config_options(config_options))
+                let responded =
+                    responder.respond(NewSessionResponse::new(id).config_options(config_options));
+                // 応答のあとで取り直す(更新の通知が、Zed の知らない会話宛てに先に届かないように)。
+                if !fetched_now {
+                    new_session.request_model_refresh(
+                        &req.cwd,
+                        std::time::Duration::ZERO,
+                        notifier(&connection),
+                    );
+                }
+                responded
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -382,9 +518,9 @@ pub(crate) async fn run() -> Result<(), String> {
                 // 設定はプロセスのメモリ上にしか無いため、再開時は既定へ戻る
                 // (docs/acp-agent.md の「セッションの再開」参照)。
                 let config = SessionConfig::default();
-                let (started, models) = tokio::join!(
+                let (started, (models, fetched_now)) = tokio::join!(
                     ClaudeAgent::start(&req.cwd, prompt, &req.session_id.0, true, &config),
-                    load_session.model_catalog(&req.cwd),
+                    load_session.catalog_for_new_session(&req.cwd),
                 );
                 let agent = match started {
                     Ok(a) => Arc::new(a) as Arc<dyn WritingAgent>,
@@ -478,9 +614,19 @@ pub(crate) async fn run() -> Result<(), String> {
                         config,
                         pending: None,
                         has_replied: true,
+                        models,
                     },
                 );
-                responder.respond(LoadSessionResponse::new().config_options(config_options))
+                let responded =
+                    responder.respond(LoadSessionResponse::new().config_options(config_options));
+                if !fetched_now {
+                    load_session.request_model_refresh(
+                        &req.cwd,
+                        std::time::Duration::ZERO,
+                        notifier(&connection),
+                    );
+                }
+                responded
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -527,6 +673,14 @@ pub(crate) async fn run() -> Result<(), String> {
                     return responder
                         .respond_with_internal_error(format!("unknown session: {}", session_id));
                 };
+
+                // 会話を開いたまま長く使っている間に CLI が更新されることもあるので、
+                // ターンの頭でも(間引いて)裏で取り直す。ターンは待たせない。
+                prompt_state.request_model_refresh(
+                    &root,
+                    PROMPT_MODEL_REFRESH_INTERVAL,
+                    notifier(&connection),
+                );
 
                 // モデル/思考レベル切替はセッション途中は非対応なので、ここ(会話の切れ目)で `claude` プロセスを起こし直す。
                 // `has_replied` で `--resume`/`--session-id` を切り分ける理由は `docs/acp-agent.md` の「モデル・思考レベルの変更」参照

@@ -275,7 +275,7 @@ impl Highlighter {
     /// (500〜10000の範囲で両立を確認、IPADIC実在の人名エントリと同程度の常識的なコスト感)。
     /// -10000のような極端に低いコストは、字面が短い名前ほど一般語の部分文字列と衝突しやすく
     /// 誤分割を招くため避ける。
-    /// 原形=表層形とし(`text_to_lindera_token` の d[6]=="*" 除外フィルタを回避)、読み/発音は "*"。
+    /// 原形=表層形とし(`text_to_lindera_token` の `d[6]=="*"` 除外フィルタを回避)、読み/発音は "*"。
     /// 組織(固有名詞,組織,*)・地域(固有名詞,地域,一般)のサポート追加時は subcategory を変えて呼ぶ。
     #[instrument]
     fn user_dict_csv_row(surface: &str, subcategory2: &str, subcategory3: &str) -> String {

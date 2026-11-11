@@ -15,7 +15,7 @@ use crate::types::{LineData, TokenMeaning};
 /// コピーしたもの。ルール側は行をまたいだトークン列を単純な `&[STok]` として扱える。
 #[derive(Debug, Clone)]
 pub(crate) struct STok {
-    /// 品詞情報。[0]=品詞, [1]=細分類1, [2]=細分類2, [3]=細分類3, [4]=活用型, [5]=活用形, [6]=原形
+    /// 品詞情報。`[0]`=品詞, `[1]`=細分類1, `[2]`=細分類2, `[3]`=細分類3, `[4]`=活用型, `[5]`=活用形, `[6]`=原形
     /// (実測順。`CachedLinderaToken::details` のコメント参照)。
     pub details: [String; 7],
     pub meaning: TokenMeaning,
